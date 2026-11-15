@@ -42,6 +42,15 @@
 /* The lowest pages of a pthread stack belong to the guard area on some C libraries. */
 #define STACK_LOW_SKIP_BYTES 8192U
 
+/*
+ * One registered task. An entry is written by the task that registers, with interrupts
+ * enabled, and read by whoever asks for a report, possibly a task that preempted the writer in
+ * the middle. `ready` is therefore set last, when everything else is in place and the stack
+ * is painted, and a reader looks at nothing else before it has seen `ready`.
+ *
+ * There is no way to unregister: the tasks of this node are never deleted. A task that could
+ * be deleted would need one, because its stack must not be scanned after its thread is gone.
+ */
 typedef struct {
     char name[16];
     uint8_t *low;       /* lowest painted address */
@@ -49,11 +58,13 @@ typedef struct {
     uint8_t *entry;     /* stack position when the task registered */
     size_t size;
     uint32_t frozen_peak; /* peak depth recorded by posix_stack_freeze() */
+    _Atomic bool ready;
 } stack_entry_t;
 
 static stack_entry_t s_entries[STACK_REGISTRY_MAX];
 static _Atomic unsigned int s_count;
-static _Atomic bool s_frozen;
+static _Atomic bool s_freeze_started; /* posix_stack_freeze() has been called */
+static _Atomic bool s_frozen;         /* ... and every frozen_peak is in place */
 
 void posix_stack_init(void)
 {
@@ -125,6 +136,10 @@ void plat_task_enter(const char *name)
             entry->low = base + STACK_LOW_SKIP_BYTES;
             entry->paint_end = here - PAINT_MARGIN_BYTES;
             paint(entry->low, entry->paint_end);
+
+            /* Published only now: a report taken while the stack was half painted would
+             * have read the unpainted part as used. */
+            atomic_store(&entry->ready, true);
         }
     }
 }
@@ -150,14 +165,18 @@ static uint32_t scan_peak(const stack_entry_t *entry)
  * platform, just before the scheduler is told to end. */
 void posix_stack_freeze(void)
 {
-    if (!atomic_exchange(&s_frozen, true)) {
+    if (!atomic_exchange(&s_freeze_started, true)) {
         const unsigned int count = registered_count();
 
         for (unsigned int i = 0U; i < count; i++) {
-            if (s_entries[i].low != NULL) {
+            if (atomic_load(&s_entries[i].ready)) {
                 s_entries[i].frozen_peak = scan_peak(&s_entries[i]);
             }
         }
+
+        /* Only now do reports switch to the recorded values: a report taken while the loop
+         * above was still scanning must not find zeroes where peaks are yet to be stored. */
+        atomic_store(&s_frozen, true);
     }
 }
 
@@ -170,7 +189,7 @@ size_t plat_stack_report(plat_stack_info_t *out, size_t max_entries)
     for (unsigned int i = 0U; (i < count) && (written < max_entries); i++) {
         const stack_entry_t *entry = &s_entries[i];
 
-        if (entry->low != NULL) {
+        if (atomic_load(&entry->ready)) {
             (void)memcpy(out[written].name, entry->name, sizeof(out[written].name));
             out[written].peak_bytes = frozen ? entry->frozen_peak : scan_peak(entry);
             out[written].size_bytes = (uint32_t)entry->size;

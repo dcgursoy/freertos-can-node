@@ -21,6 +21,7 @@ function(fcn_add_platform_test name expected_status labels)
 endfunction()
 
 fcn_add_platform_test(tick_locked 0 "platform;timing" tick locked 3)
+fcn_add_platform_test(tick_suspended_scheduler 0 "platform;timing" suspend 20)
 fcn_add_platform_test(irq_signal 0 "platform" irq signal 250 3 1)
 fcn_add_platform_test(irq_poll 0 "platform" irq poll 250 3 1)
 # Period 0 is an interrupt storm: the line is raised in a tight loop.

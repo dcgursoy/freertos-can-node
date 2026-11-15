@@ -38,6 +38,8 @@ void vApplicationTickHook(void)
 {
     static uint32_t ticks = 0U;
 
+    posix_tick_taken();
+
     if (ticks < TICK_SOURCE_CHECK_AT) {
         ticks++;
 
@@ -63,14 +65,24 @@ static void fatal_message(const char *what, const char *detail, int number)
     }
 }
 
+/*
+ * The three fatal handlers mask interrupts before they do anything else. Reporting takes a
+ * system call; with interrupts still enabled, a tick or a simulated interrupt taken during it
+ * would switch to another task, which would then run on the state that has just been found
+ * broken, and the reset would only happen once the failing task is scheduled again. After a
+ * detected failure nothing else may run. (plat_reset() enters a critical section as well;
+ * they nest.)
+ */
 void plat_assert_failed(const char *file, int line)
 {
+    vPortEnterCritical();
     fatal_message("assertion failed", file, line);
     plat_reset(PLAT_RESET_ASSERT);
 }
 
 void vApplicationMallocFailedHook(void)
 {
+    vPortEnterCritical();
     fatal_message("pvPortMalloc failed", "free heap bytes", (int)xPortGetFreeHeapSize());
     plat_reset(PLAT_RESET_MALLOC_FAILED);
 }
@@ -80,6 +92,7 @@ void vApplicationMallocFailedHook(void)
 void vApplicationStackOverflowHook(TaskHandle_t task, char *name)
 {
     (void)task;
+    vPortEnterCritical();
     fatal_message("stack overflow in task", name, 0);
     plat_reset(PLAT_RESET_STACK_OVERFLOW);
 }

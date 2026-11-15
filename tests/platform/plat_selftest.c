@@ -5,6 +5,8 @@
  * the measurement scripts read the JSON that `tick` and `irq` print on stdout.
  *
  *   tick <locked|stock> <seconds>                  effective tick period, periodic wake-ups
+ *   suspend <milliseconds>                         the tick keeps time across a suspended
+ *                                                  scheduler
  *   irq <signal|poll> <period_us> <seconds> <load> simulated interrupts: latency, every raise
  *                                                  served, handlers never nested; period 0 is
  *                                                  an interrupt storm
@@ -211,6 +213,118 @@ static int cmd_tick(posix_tick_mode_t mode)
                       "the run); timing figures of this run are those of an overloaded host\n",
                       (unsigned long long)tick.dropped_ticks,
                       100.0 * (double)tick.dropped_ticks / span_ticks);
+    }
+
+    return status;
+}
+
+/* ------------------------------------------------------------------ suspended scheduler */
+
+/*
+ * A task keeps the scheduler suspended across several tick periods. The kernel takes its
+ * ticks all the same, notes them and adds them to the tick count on resume. The locked tick
+ * must not mistake those ticks for lost ones (docs/bug-log.md, entry 003): the tick count has
+ * to advance by the time that passed, during the suspension and after it.
+ */
+#define SUSPEND_SETTLE_MS 50U
+#define SUSPEND_AFTER_MS  100U
+#define SUSPEND_TOLERANCE 3U /* ticks: boundary effects at both ends of an interval */
+
+static uint32_t s_suspend_ms = 20U;
+static uint32_t s_suspend_ticks_during;
+static uint32_t s_suspend_ticks_after;
+static uint64_t s_suspend_wall_during_ns;
+static uint64_t s_suspend_wall_after_ns;
+
+static void busy_for_ms(uint32_t milliseconds)
+{
+    static volatile uint32_t sink;
+    const uint64_t until = plat_time_ns() + ((uint64_t)milliseconds * 1000000ULL);
+
+    while (plat_time_ns() < until) {
+        sink++;
+    }
+}
+
+static void suspend_task(void *arg)
+{
+    (void)arg;
+    plat_task_enter("suspend");
+    vTaskDelay(pdMS_TO_TICKS(SUSPEND_SETTLE_MS));
+
+    const TickType_t before = xTaskGetTickCount();
+    const uint64_t t0 = plat_time_ns();
+
+    vTaskSuspendAll();
+    busy_for_ms(s_suspend_ms);
+    (void)xTaskResumeAll();
+
+    const TickType_t resumed = xTaskGetTickCount();
+    const uint64_t t1 = plat_time_ns();
+
+    busy_for_ms(SUSPEND_AFTER_MS);
+
+    const TickType_t after = xTaskGetTickCount();
+    const uint64_t t2 = plat_time_ns();
+
+    s_suspend_ticks_during = (uint32_t)(resumed - before);
+    s_suspend_ticks_after = (uint32_t)(after - resumed);
+    s_suspend_wall_during_ns = t1 - t0;
+    s_suspend_wall_after_ns = t2 - t1;
+    plat_end_scheduler();
+
+    for (;;) {
+    }
+}
+
+/* True if `ticks` is the number of tick periods in `wall_ns`, give or take the tolerance and
+ * the ticks the run reports as dropped (an overloaded host drops ticks, and says so). */
+static bool ticks_match_wall(uint32_t ticks, uint64_t wall_ns, uint64_t dropped)
+{
+    const uint64_t period_ns = 1000000000ULL / (uint64_t)configTICK_RATE_HZ;
+    const uint64_t expected = wall_ns / period_ns;
+
+    return (((uint64_t)ticks + SUSPEND_TOLERANCE + dropped) >= expected) &&
+           ((uint64_t)ticks <= (expected + SUSPEND_TOLERANCE));
+}
+
+static int cmd_suspend(void)
+{
+    posix_tick_stats_t tick;
+    int status = EXIT_SUCCESS;
+
+    init_platform(POSIX_TICK_LOCKED, POSIX_IRQ_SIGNAL, NULL);
+    create_task(suspend_task, "suspend", 3U, NULL);
+    posix_platform_run();
+    posix_platform_shutdown();
+    posix_tick_get_stats(&tick);
+
+    (void)printf("{\"test\": \"suspend\", \"suspended_ms\": %u, "
+                 "\"ticks_during\": %u, \"wall_during_us\": %llu, "
+                 "\"ticks_after\": %u, \"wall_after_us\": %llu, "
+                 "\"catch_ups\": %llu, \"dropped_ticks\": %llu}\n",
+                 (unsigned int)s_suspend_ms, (unsigned int)s_suspend_ticks_during,
+                 (unsigned long long)(s_suspend_wall_during_ns / 1000ULL),
+                 (unsigned int)s_suspend_ticks_after,
+                 (unsigned long long)(s_suspend_wall_after_ns / 1000ULL),
+                 (unsigned long long)tick.catch_ups, (unsigned long long)tick.dropped_ticks);
+
+    if (!ticks_match_wall(s_suspend_ticks_during, s_suspend_wall_during_ns, tick.dropped_ticks)) {
+        (void)fprintf(stderr,
+                      "the tick count advanced by %u ticks while the scheduler was suspended "
+                      "for %llu us\n",
+                      (unsigned int)s_suspend_ticks_during,
+                      (unsigned long long)(s_suspend_wall_during_ns / 1000ULL));
+        status = EXIT_FAILURE;
+    }
+
+    if (!ticks_match_wall(s_suspend_ticks_after, s_suspend_wall_after_ns, tick.dropped_ticks)) {
+        (void)fprintf(stderr,
+                      "the tick count advanced by %u ticks in the %llu us after the scheduler "
+                      "was resumed\n",
+                      (unsigned int)s_suspend_ticks_after,
+                      (unsigned long long)(s_suspend_wall_after_ns / 1000ULL));
+        status = EXIT_FAILURE;
     }
 
     return status;
@@ -758,6 +872,7 @@ static int usage(void)
     (void)fprintf(
         stderr,
         "usage: plat_selftest tick <locked|stock> <seconds>\n"
+        "       plat_selftest suspend <milliseconds>\n"
         "       plat_selftest irq <signal|poll> <period_us, 0: storm> <seconds> <load 0|1>\n"
         "       plat_selftest stack | log <path> | assert | malloc-fail | reset | run\n");
     return 2;
@@ -772,6 +887,11 @@ int main(int argc, char **argv)
     if ((strcmp(argv[1], "tick") == 0) && (argc == 4)) {
         s_run_seconds = (uint32_t)strtoul(argv[3], NULL, 10);
         return cmd_tick((strcmp(argv[2], "stock") == 0) ? POSIX_TICK_STOCK : POSIX_TICK_LOCKED);
+    }
+
+    if ((strcmp(argv[1], "suspend") == 0) && (argc == 3)) {
+        s_suspend_ms = (uint32_t)strtoul(argv[2], NULL, 10);
+        return cmd_suspend();
     }
 
     if ((strcmp(argv[1], "irq") == 0) && (argc == 6)) {

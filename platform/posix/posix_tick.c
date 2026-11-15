@@ -60,6 +60,24 @@ static _Atomic bool s_tick_thread_seen;
 static _Atomic uint64_t s_signals_sent;
 static _Atomic uint64_t s_catch_ups;
 static _Atomic uint64_t s_dropped_ticks;
+static _Atomic uint64_t s_ticks_taken;
+
+/*
+ * Called from the tick hook: one more tick interrupt has reached the kernel.
+ *
+ * This count, not xTaskGetTickCount(), is what the wrapper below compares with the wall
+ * clock. The two differ while a task holds the scheduler suspended (vTaskSuspendAll): the
+ * kernel still takes every tick, but only notes it and adds all of them to the tick count
+ * when the scheduler resumes. A loop that watched the tick count would take each of those
+ * ticks for lost, raise replacements several times too fast, and after the resume find the
+ * count far ahead of the clock (docs/bug-log.md, entry 003). The tick hook runs once for
+ * every tick interrupt, suspended scheduler or not, and not again when the noted ticks are
+ * replayed.
+ */
+void posix_tick_taken(void)
+{
+    (void)atomic_fetch_add(&s_ticks_taken, 1U);
+}
 
 /* The names are fixed by the linker's --wrap convention. */
 int __real_usleep(useconds_t usec);
@@ -130,8 +148,14 @@ int __wrap_usleep(useconds_t usec)
         role = identify_caller();
 
         if (role == ROLE_TICK_THREAD) {
-            /* The default timer slack of 50 us would be added to every wake-up. */
-            (void)prctl(PR_SET_TIMERSLACK, 1UL);
+            /* The default timer slack of 50 us would be added to every wake-up. It is only
+             * removed in locked mode: the stock mode is the port as it comes, the baseline
+             * that the measurements compare against. The mode is set before the scheduler
+             * starts, so it is known here. */
+            if (atomic_load(&s_mode) == POSIX_TICK_LOCKED) {
+                (void)prctl(PR_SET_TIMERSLACK, 1UL);
+            }
+
             start_ns = posix_monotonic_ns();
             atomic_store(&s_tick_thread_seen, true);
         }
@@ -148,13 +172,14 @@ int __wrap_usleep(useconds_t usec)
     }
 
     /* The port has just raised a tick. `expected` is the number of ticks that should have
-     * been counted by now (the first one was raised at start_ns), `counted` the number the
-     * kernel has processed. The tick that was just raised may not have been processed yet,
-     * so the count is only behind if it trails by more than that one. */
+     * been taken by now (the first one was raised at start_ns), `counted` the number of tick
+     * interrupts the kernel has taken (see posix_tick_taken() for why that is not the tick
+     * count). The tick that was just raised may not have been taken yet, so the kernel is
+     * only behind if it trails by more than that one. */
     const uint64_t period_ns = (uint64_t)usec * 1000ULL;
     const uint64_t now_ns = posix_monotonic_ns();
     uint64_t expected = ((now_ns - start_ns) / period_ns) + 1ULL;
-    const uint64_t counted = (uint64_t)xTaskGetTickCount();
+    const uint64_t counted = atomic_load(&s_ticks_taken);
 
     if ((counted + 1ULL) < expected) {
         const uint64_t lag = expected - counted;

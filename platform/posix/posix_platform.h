@@ -121,6 +121,7 @@ uint32_t posix_log_dropped(void);
 void posix_clock_init(void);
 uint64_t posix_monotonic_ns(void);
 void posix_tick_configure(posix_tick_mode_t mode);
+void posix_tick_taken(void);
 void posix_irq_init(posix_irq_mode_t mode);
 void posix_log_start(const char *path);
 void posix_log_stop(void);

@@ -22,6 +22,7 @@ scripts/buglog-verify.sh
 |---|---|---|---|
 | [001](#001-the-stack-report-read-the-stack-of-a-task-that-no-longer-existed) | 0 | The stack report read the idle task's stack after the kernel had deleted the task | system test of the node's statistics |
 | [002](#002-interrupt-handlers-could-stack-up-until-the-task-stack-overflowed) | 0 | Simulated interrupt handlers could run on top of each other without bound; an interrupt storm overflowed the task's stack | interrupt-storm self-test written during the review of phase 0 |
+| [003](#003-a-suspended-scheduler-made-the-tick-run-fast-and-then-stand-still) | 0 | While a task held the scheduler suspended, the locked tick took the kernel's deferred ticks for lost ones: time ran several times too fast, then stood still | suspended-scheduler self-test written during the review of phase 0 |
 
 ---
 
@@ -111,3 +112,49 @@ left unserved; `results/platform_timing.json` (`interrupt_storm`) has the measur
 **Evidence.** [failing output](buglog/002-nested-interrupt-handlers/failing-output.txt),
 [patch that re-creates the bug](buglog/002-nested-interrupt-handlers/reintroduce.patch).
 The bug is in commits `323055e` to `68ba365`.
+
+---
+
+## 003 A suspended scheduler made the tick run fast and then stand still
+
+**Found** 2026-11-15, in the review of phase 0. The reviewer asked what the tick-locking code
+sees while a task holds the scheduler suspended, and measured it: a task that calls
+`vTaskSuspendAll()`, works for 20 ms and calls `xTaskResumeAll()`.
+
+```
+$ plat_selftest suspend 20
+the tick count advanced by 106 ticks while the scheduler was suspended for 20001 us
+the tick count advanced by 1 ticks in the 100000 us after the scheduler was resumed
+```
+
+Twenty milliseconds of work moved FreeRTOS time forward by 106 ms, every timeout in the
+system that lay within those 106 ms expired at the same instant, and then the tick stood
+still while the wall clock caught up: one tick in the following 100 ms. A 100 ms suspension
+gave 518 ticks. Nothing in phase 0 keeps the scheduler suspended that long, so no test had
+seen it.
+
+**Cause.** The platform keeps the tick locked to the wall clock by comparing the ticks that
+should have happened with the ticks the kernel has counted, and raising a replacement for
+each one that is missing ([posix_tick.c](../platform/posix/posix_tick.c)). It took "the ticks
+the kernel has counted" from `xTaskGetTickCount()`. While the scheduler is suspended that
+count does not move: the kernel takes every tick interrupt, notes it in `xPendedTicks`, and
+adds them all to the tick count when the scheduler resumes. So each tick taken during the
+suspension looked lost. The loop raised replacements, several per millisecond, the kernel
+faithfully noted every one of them, and on resume all of them were added to the tick count.
+From then on the count was ahead of the clock, and the loop waited for the clock to catch
+up.
+
+**Fix.** The loop now counts tick interrupts where the kernel takes them: the tick hook
+increments a counter (`posix_tick_taken()`), and that counter is what is compared with the
+wall clock. The kernel calls the tick hook once for every tick interrupt, whether the
+scheduler is suspended or not, and does not call it again when the noted ticks are replayed.
+A side effect: the tick thread no longer reads a kernel variable it has no business reading.
+
+**Regression test.** `plat_selftest suspend <ms>` suspends the scheduler for the given time
+and fails unless the tick count advanced by the time that passed, both during the suspension
+and in the 100 ms after it. CTest runs it with 20 ms (`platform_tick_suspended_scheduler`).
+With the fix: 20 ticks during, 100 after, no replacement tick raised.
+
+**Evidence.** [failing output](buglog/003-tick-count-while-suspended/failing-output.txt),
+[patch that re-creates the bug](buglog/003-tick-count-while-suspended/reintroduce.patch).
+The bug is in commits `323055e` to `e6db709`.
