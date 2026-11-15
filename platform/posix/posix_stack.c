@@ -1,0 +1,171 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Real stack depth of each task on the host.
+ *
+ * uxTaskGetStackHighWaterMark() is of no use under the POSIX port: the port creates every
+ * task as a pthread with default attributes, so the task runs on a stack that pthreads
+ * allocated, and the buffer FreeRTOS allocated for it only holds the port's per-thread
+ * record. The kernel's high-water mark reports that untouched buffer as almost entirely free
+ * whatever the task does.
+ *
+ * So the measurement is done on the stack the task really uses: when a task starts it paints
+ * the unused part of its pthread stack with a pattern, and the report scans from the low end
+ * for the first byte that no longer holds the pattern. The result is the depth on this host
+ * (x86-64 frames, the C library's own use, and the signal frames that the port's "interrupts"
+ * push onto whichever task is running), not what the same code needs on a Cortex-M.
+ */
+#include "posix_platform.h"
+
+#include <pthread.h>
+#include <stdatomic.h>
+#include <string.h>
+
+#define STACK_REGISTRY_MAX 16U
+#define PAINT_BYTE         0xA5U
+
+/* Stack given to every task thread. The port creates them with default attributes, so the
+ * process-wide default is what sets their size. */
+#define TASK_THREAD_STACK_BYTES ((size_t)512U * 1024U)
+
+/* Bytes just below the caller's frame that are left unpainted: they hold the frames of the
+ * painting code itself. Sanitizer builds have much larger frames. */
+#if defined(__SANITIZE_ADDRESS__)
+#define PAINT_MARGIN_BYTES 4096U
+#else
+#define PAINT_MARGIN_BYTES 512U
+#endif
+
+/* The lowest pages of a pthread stack belong to the guard area on some C libraries. */
+#define STACK_LOW_SKIP_BYTES 8192U
+
+typedef struct {
+    char name[16];
+    uint8_t *low;       /* lowest painted address */
+    uint8_t *paint_end; /* one past the highest painted address */
+    uint8_t *entry;     /* stack position when the task registered */
+    size_t size;
+    uint32_t frozen_peak; /* peak depth recorded by posix_stack_freeze() */
+} stack_entry_t;
+
+static stack_entry_t s_entries[STACK_REGISTRY_MAX];
+static _Atomic unsigned int s_count;
+static _Atomic bool s_frozen;
+
+void posix_stack_init(void)
+{
+    pthread_attr_t attr;
+
+    if (pthread_attr_init(&attr) == 0) {
+        (void)pthread_attr_setstacksize(&attr, TASK_THREAD_STACK_BYTES);
+        (void)pthread_setattr_default_np(&attr);
+        (void)pthread_attr_destroy(&attr);
+    }
+}
+
+/* These two functions read and write below the current stack frame by design, so they are
+ * kept out of line and are not instrumented by the sanitizers. */
+#define STACK_SCAN_FN __attribute__((noinline, no_sanitize("address"), no_sanitize("undefined")))
+
+/* A plain loop on purpose: a library call would put its own frames into the range being
+ * painted. */
+STACK_SCAN_FN static void paint(uint8_t *from, const uint8_t *to)
+{
+    for (volatile uint8_t *p = from; p < to; p++) {
+        *p = (uint8_t)PAINT_BYTE;
+    }
+}
+
+STACK_SCAN_FN static const uint8_t *first_used(const uint8_t *from, const uint8_t *to)
+{
+    const uint8_t *p = from;
+
+    while ((p < to) && (*p == (uint8_t)PAINT_BYTE)) {
+        p++;
+    }
+
+    return p;
+}
+
+void plat_task_enter(const char *name)
+{
+    const unsigned int index = atomic_fetch_add(&s_count, 1U);
+
+    if (index < STACK_REGISTRY_MAX) {
+        stack_entry_t *entry = &s_entries[index];
+        pthread_attr_t attr;
+        void *stack_addr = NULL;
+        size_t size = 0U;
+        uint8_t *const here = __builtin_frame_address(0);
+
+        if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+            (void)pthread_attr_getstack(&attr, &stack_addr, &size);
+            (void)pthread_attr_destroy(&attr);
+        }
+
+        uint8_t *const base = stack_addr; /* lowest address of the thread's stack */
+
+        (void)strncpy(entry->name, name, sizeof(entry->name) - 1U);
+        entry->name[sizeof(entry->name) - 1U] = '\0';
+        entry->size = size;
+        entry->entry = here;
+
+        if ((base != NULL) && (size > (STACK_LOW_SKIP_BYTES + PAINT_MARGIN_BYTES)) &&
+            (here > (base + STACK_LOW_SKIP_BYTES + PAINT_MARGIN_BYTES))) {
+            entry->low = base + STACK_LOW_SKIP_BYTES;
+            entry->paint_end = here - PAINT_MARGIN_BYTES;
+            paint(entry->low, entry->paint_end);
+        }
+    }
+}
+
+static unsigned int registered_count(void)
+{
+    const unsigned int count = atomic_load(&s_count);
+
+    return (count > STACK_REGISTRY_MAX) ? STACK_REGISTRY_MAX : count;
+}
+
+static uint32_t scan_peak(const stack_entry_t *entry)
+{
+    return (uint32_t)(entry->entry - first_used(entry->low, entry->paint_end));
+}
+
+/* Record every task's peak now and report those values from here on.
+ *
+ * A stack can only be scanned while its thread exists. Ending the scheduler makes the kernel
+ * delete the idle task, the port then cancels and joins its thread, and the C library is free
+ * to unmap that stack or hand its pages back to the system: a scan made afterwards would read
+ * zeroes (reported as a completely used stack) or fault. So the scan is done here, by the
+ * platform, just before the scheduler is told to end. */
+void posix_stack_freeze(void)
+{
+    if (!atomic_exchange(&s_frozen, true)) {
+        const unsigned int count = registered_count();
+
+        for (unsigned int i = 0U; i < count; i++) {
+            if (s_entries[i].low != NULL) {
+                s_entries[i].frozen_peak = scan_peak(&s_entries[i]);
+            }
+        }
+    }
+}
+
+size_t plat_stack_report(plat_stack_info_t *out, size_t max_entries)
+{
+    const unsigned int count = registered_count();
+    const bool frozen = atomic_load(&s_frozen);
+    size_t written = 0U;
+
+    for (unsigned int i = 0U; (i < count) && (written < max_entries); i++) {
+        const stack_entry_t *entry = &s_entries[i];
+
+        if (entry->low != NULL) {
+            (void)memcpy(out[written].name, entry->name, sizeof(out[written].name));
+            out[written].peak_bytes = frozen ? entry->frozen_peak : scan_peak(entry);
+            out[written].size_bytes = (uint32_t)entry->size;
+            written++;
+        }
+    }
+
+    return written;
+}

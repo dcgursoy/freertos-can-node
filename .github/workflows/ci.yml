@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Analyse, build, test (Ubuntu 24.04, real SocketCAN)
+    # Pinned on purpose: ubuntu-latest moves between releases, and the toolchain versions
+    # (gcc 13, cppcheck 2.13, clang-tidy 18) are part of what the results depend on.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FCN_BUILD_ROOT: ${{ github.workspace }}/build
+      FCN_VENV: ${{ github.workspace }}/.venv
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true # the two pinned submodules; not the kernel's own nested ones
+
+      - name: Scripts are executable in the repository
+        # The work tree is edited on Windows, where the file mode cannot be seen; a script
+        # committed without its executable bit would only fail here, on Linux.
+        run: |
+          bad="$(git ls-files -s 'scripts/*.sh' | grep -v '^100755' || true)"
+          if [ -n "$bad" ]; then echo "not executable in the index:"; echo "$bad"; exit 1; fi
+
+      - name: Install packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            ninja-build can-utils cppcheck clang-tidy clang-format
+          uname -r
+          gcc --version | head -1
+          cmake --version | head -1
+          cppcheck --version
+          clang-tidy --version | grep version
+          python3 --version
+
+      - name: Bring up vcan0 and verify that it carries a frame
+        # Real SocketCAN: this step fails the job unless a frame sent with cansend arrives in
+        # candump. The runner's kernel has vcan built as a module; the script falls back to
+        # linux-modules-extra only where an image keeps it there.
+        run: scripts/vcan-up.sh --verify --install-modules-extra
+
+      - name: Python environment
+        run: scripts/setup-python.sh
+
+      - name: Static analysis (clang-format, cppcheck, MISRA addon, clang-tidy, self-test)
+        run: scripts/static-analysis.sh
+
+      - name: Build debug and release with warnings as errors
+        run: scripts/build.sh debug release
+
+      - name: Unit tests and platform self-tests under ASan and UBSan
+        run: scripts/test-unit.sh asan
+
+      - name: Coverage of lib/ (gate on lines and branches)
+        run: scripts/coverage.sh
+
+      - name: System tests
+        run: scripts/test-system.sh
+
+      - name: Every bug-log entry can be re-created and is still caught
+        run: scripts/buglog-verify.sh
+
+      - name: Platform timing on this runner (reported, not gated)
+        run: |
+          "$FCN_VENV/bin/python" bench/platform_timing.py --seconds 5
+          mkdir -p build/runner-results
+          cp results/platform_timing.json results/platform_timing.png build/runner-results/
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-results
+          if-no-files-found: warn
+          path: |
+            build/asan/test-results/
+            build/coverage/coverage/
+            build/system-test/
+            build/analysis/*.log
+            build/buglog-verify/*.log
+            build/runner-results/
