@@ -28,6 +28,18 @@ HOST_TIMING_NOTE = (
 )
 
 
+def _load_average() -> float | None:
+    """The host's 1-minute load average, or None where the system does not report one."""
+    try:
+        return round(os.getloadavg()[0], 2)
+    except (AttributeError, OSError):
+        return None
+
+
+# Taken when a measurement script imports this module, that is before it measures anything.
+_LOAD_AT_START = _load_average()
+
+
 def _git(*args: str) -> str:
     """Output of a git command in the repository, without the trailing newline; "" on error."""
     try:
@@ -83,6 +95,10 @@ def provenance() -> dict:
             "cpu": _cpu_model(),
             "logical_cpus": os.cpu_count(),
             "python": platform.python_version(),
+            # What else the machine was doing: the 1-minute load average before the first
+            # measurement and after the last. A timing result from a loaded host says so.
+            "load_average_at_start": _LOAD_AT_START,
+            "load_average_at_end": _load_average(),
         },
     }
 

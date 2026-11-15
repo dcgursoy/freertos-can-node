@@ -50,8 +50,12 @@ if [[ ! -d "src-$base" ]]; then
     echo "==> downloading the kernel source"
     wget -q -O src.tar.gz \
         "https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/${tag}.tar.gz"
-    mkdir "src-$base"
-    tar xzf src.tar.gz -C "src-$base" --strip-components=1
+    # Unpacked under another name and renamed when complete: an extraction that was
+    # interrupted must not be mistaken for the source tree by the next run.
+    rm -rf "src-$base.partial"
+    mkdir "src-$base.partial"
+    tar xzf src.tar.gz -C "src-$base.partial" --strip-components=1
+    mv "src-$base.partial" "src-$base"
     rm src.tar.gz
 fi
 cd "src-$base"

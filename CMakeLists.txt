@@ -35,8 +35,11 @@ add_subdirectory(lib)
 
 # ---------------------------------------------------------------- FreeRTOS kernel (POSIX port)
 # The kernel's own CMake consumes a target named freertos_config that carries FreeRTOSConfig.h.
+# Both directories hold project code and are ordinary include directories on purpose: marked
+# SYSTEM, their headers would be exempt from the warning set and from clang-tidy in every
+# project file that includes them. tests/headers compiles each of them on its own as well.
 add_library(freertos_config INTERFACE)
-target_include_directories(freertos_config SYSTEM INTERFACE
+target_include_directories(freertos_config INTERFACE
     "${CMAKE_SOURCE_DIR}/config/posix"
     "${CMAKE_SOURCE_DIR}/platform/include") # FreeRTOSConfig.h includes platform.h
 set(FREERTOS_PORT GCC_POSIX CACHE STRING "FreeRTOS port")
@@ -60,5 +63,6 @@ enable_testing()
 add_library(unity STATIC third_party/Unity/src/unity.c)
 target_include_directories(unity SYSTEM PUBLIC third_party/Unity/src)
 target_compile_definitions(unity PUBLIC UNITY_INCLUDE_DOUBLE UNITY_SUPPORT_64)
+add_subdirectory(tests/headers)
 add_subdirectory(tests/unit)
 add_subdirectory(tests/platform)

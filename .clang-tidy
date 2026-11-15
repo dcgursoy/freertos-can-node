@@ -21,11 +21,15 @@
 #   readability-redundant-casting            a cast that is redundant on x86-64 is needed where
 #                                            the fixed-width and kernel types map to other base
 #                                            types (uint32_t is unsigned long on arm-none-eabi)
+#
+# clang-diagnostic-* is listed so that clang's own compiler warnings count: the build uses
+# gcc, and without this entry a warning that only clang has would be dropped as "filtered".
 Checks: >
   -*,
   bugprone-*,
   cert-*,
   clang-analyzer-*,
+  clang-diagnostic-*,
   concurrency-*,
   misc-*,
   performance-*,
