@@ -5,7 +5,9 @@
  * the measurement scripts read the JSON that `tick` and `irq` print on stdout.
  *
  *   tick <locked|stock> <seconds>                  effective tick period, periodic wake-ups
- *   irq <signal|poll> <period_us> <seconds> <load> simulated-interrupt latency, lost-wake check
+ *   irq <signal|poll> <period_us> <seconds> <load> simulated interrupts: latency, every raise
+ *                                                  served, handlers never nested; period 0 is
+ *                                                  an interrupt storm
  *   stack                                          stack painting measures real depth
  *   log <path>                                     lines from tasks and an external thread
  *                                                  arrive whole and in order
@@ -17,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <time.h>
 
 #include "FreeRTOS.h"
@@ -166,14 +169,25 @@ static int cmd_tick(posix_tick_mode_t mode)
     const double nominal_us = 1e6 / (double)configTICK_RATE_HZ;
     const double drift_us = (span_ns / 1e3) - (span_ticks * nominal_us);
 
+    /* What locked mode promises is an identity: every tick period of wall time is either
+     * counted by the kernel or reported as dropped, so (counted + dropped) periods equal the
+     * time that passed. On a host with a CPU to spare nothing is dropped and this is the plain
+     * statement that the tick keeps time. On an overloaded host ticks are dropped, the run is
+     * marked as such, and the identity still has to hold: time is never lost silently.
+     * The stock mode is only measured (it reports no dropped ticks, so there the figure is
+     * simply how far the tick count fell behind). */
+    const double accounted_us = (span_ticks + (double)tick.dropped_ticks) * nominal_us;
+    const double unaccounted = ((span_ns / 1e3) - accounted_us) / (span_ns / 1e3);
+
     (void)printf("{\"test\": \"tick\", \"mode\": \"%s\", \"seconds\": %u, "
                  "\"nominal_tick_period_us\": %.1f, \"effective_tick_period_us\": %.3f, "
                  "\"drift_us\": %.1f, \"tick_thread_seen\": %s, \"signals_sent\": %llu, "
-                 "\"catch_ups\": %llu, \"dropped_ticks\": %llu, ",
+                 "\"catch_ups\": %llu, \"dropped_ticks\": %llu, "
+                 "\"unaccounted_time_percent\": %.3f, ",
                  (mode == POSIX_TICK_LOCKED) ? "locked" : "stock", (unsigned int)s_run_seconds,
                  nominal_us, period_us, drift_us, tick.tick_thread_seen ? "true" : "false",
                  (unsigned long long)tick.signals_sent, (unsigned long long)tick.catch_ups,
-                 (unsigned long long)tick.dropped_ticks);
+                 (unsigned long long)tick.dropped_ticks, unaccounted * 100.0);
     dump_samples(interval_ns, n - 1U);
     print_stats_us("wake_interval_us", interval_ns, n - 1U);
     (void)printf("}\n");
@@ -183,12 +197,20 @@ static int cmd_tick(posix_tick_mode_t mode)
         status = EXIT_FAILURE;
     }
 
-    /* Locked mode has to hold the tick within 3 % of nominal; the stock mode is only measured. */
-    if ((mode == POSIX_TICK_LOCKED) &&
-        ((period_us < (nominal_us * 0.97)) || (period_us > (nominal_us * 1.03)))) {
-        (void)fprintf(stderr, "tick period %.1f us is outside 3 %% of %.1f us\n", period_us,
-                      nominal_us);
+    if ((mode == POSIX_TICK_LOCKED) && ((unaccounted < -0.005) || (unaccounted > 0.005))) {
+        (void)fprintf(stderr,
+                      "tick count and wall clock disagree by %.2f %% (tick period %.1f us, "
+                      "%llu ticks reported as dropped)\n",
+                      unaccounted * 100.0, period_us, (unsigned long long)tick.dropped_ticks);
         status = EXIT_FAILURE;
+    }
+
+    if ((mode == POSIX_TICK_LOCKED) && (tick.dropped_ticks != 0U)) {
+        (void)fprintf(stderr,
+                      "note: the host did not run the node for %llu tick periods (%.1f %% of "
+                      "the run); timing figures of this run are those of an overloaded host\n",
+                      (unsigned long long)tick.dropped_ticks,
+                      100.0 * (double)tick.dropped_ticks / span_ticks);
     }
 
     return status;
@@ -196,17 +218,24 @@ static int cmd_tick(posix_tick_mode_t mode)
 
 /* ---------------------------------------------------------------------------------- irq */
 
-#define IRQ_MAX_SAMPLES 200000U
+#define IRQ_MAX_SAMPLES 1000000U
 #define IRQ_TEST_LINE   0U
+/* No task of this test has a reason to go deeper than this. More means interrupt handlers
+ * were stacked on top of each other (docs/bug-log.md, entry 002). */
+#define IRQ_STACK_LIMIT_BYTES (48U * 1024U)
 
 static TaskHandle_t s_rx_task;
 static _Atomic uint64_t s_irq_t0; /* time of the oldest raise not yet seen by the task */
 static _Atomic uint32_t s_source_raised;
 static _Atomic uint32_t s_task_seen;
 static _Atomic bool s_source_run;
-static uint32_t s_irq_period_us = 1000U;
+static uint32_t s_irq_period_us = 1000U; /* 0: raise as fast as the source thread can */
+static uint64_t s_source_first_ns;
+static uint64_t s_source_last_ns;
 static uint64_t s_latency_ns[IRQ_MAX_SAMPLES];
 static volatile uint32_t s_latency_count;
+static volatile uint32_t s_latency_overflow;
+static volatile uint32_t s_task_wakeups;
 
 static void test_isr(void *context, BaseType_t *woken)
 {
@@ -221,13 +250,18 @@ static void rx_task(void *arg)
 
     for (;;) {
         (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        s_task_wakeups++;
 
         const uint32_t raised = atomic_load(&s_source_raised);
         const uint64_t t0 = atomic_exchange(&s_irq_t0, 0U);
 
-        if ((t0 != 0U) && (s_latency_count < IRQ_MAX_SAMPLES)) {
-            s_latency_ns[s_latency_count] = plat_time_ns() - t0;
-            s_latency_count++;
+        if (t0 != 0U) {
+            if (s_latency_count < IRQ_MAX_SAMPLES) {
+                s_latency_ns[s_latency_count] = plat_time_ns() - t0;
+                s_latency_count++;
+            } else {
+                s_latency_overflow++;
+            }
         }
 
         atomic_store(&s_task_seen, raised);
@@ -266,28 +300,49 @@ static void irq_stopper_task(void *arg)
     }
 }
 
-/* The "peripheral": a thread outside the scheduler raising the line at a jittered rate, so
- * that raises are never phase-locked to the tick. */
+/*
+ * The "peripheral": a thread outside the scheduler that raises the line.
+ *
+ * With a period it raises at absolute deadlines whose spacing is jittered by +-17 %, so that
+ * the mean rate is the nominal one and raises are never phase-locked to the tick. With period
+ * 0 it raises in a tight loop, millions of times per second: an interrupt storm, which is
+ * what shows whether handlers can pile up on a task's stack.
+ */
 static void *irq_source(void *arg)
 {
     uint32_t lfsr = 0xACE1U;
+    uint64_t deadline_ns;
 
     (void)arg;
     posix_external_thread_setup("irq-src");
+    (void)prctl(PR_SET_TIMERSLACK, 1UL); /* wake at the deadline, not up to 50 us after it */
+    deadline_ns = plat_time_ns();
 
     while (atomic_load(&s_source_run)) {
-        lfsr = (lfsr >> 1U) ^ ((0U - (lfsr & 1U)) & 0xB400U);
-
-        /* period * (0.83 .. 1.17) */
-        const uint64_t period_ns = ((uint64_t)s_irq_period_us * 833ULL) +
-                                   (((uint64_t)(lfsr % 1000U) * (uint64_t)s_irq_period_us) / 3ULL);
-        const struct timespec pause = {(time_t)(period_ns / 1000000000ULL),
-                                       (long)(period_ns % 1000000000ULL)};
         uint64_t none = 0U;
+        uint64_t now_ns;
 
-        (void)nanosleep(&pause, NULL);
-        (void)atomic_fetch_add(&s_source_raised, 1U);
-        (void)atomic_compare_exchange_strong(&s_irq_t0, &none, plat_time_ns());
+        if (s_irq_period_us != 0U) {
+            lfsr = (lfsr >> 1U) ^ ((0U - (lfsr & 1U)) & 0xB400U);
+
+            /* period * (0.83 .. 1.17) */
+            deadline_ns += ((uint64_t)s_irq_period_us * 833ULL) +
+                           (((uint64_t)(lfsr % 1000U) * (uint64_t)s_irq_period_us) / 3ULL);
+
+            const struct timespec deadline = {(time_t)(deadline_ns / 1000000000ULL),
+                                              (long)(deadline_ns % 1000000000ULL)};
+
+            (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL);
+        }
+
+        now_ns = plat_time_ns();
+
+        if (atomic_fetch_add(&s_source_raised, 1U) == 0U) {
+            s_source_first_ns = now_ns;
+        }
+
+        s_source_last_ns = now_ns;
+        (void)atomic_compare_exchange_strong(&s_irq_t0, &none, now_ns);
         posix_irq_raise(IRQ_TEST_LINE);
     }
 
@@ -296,9 +351,11 @@ static void *irq_source(void *arg)
 
 static int cmd_irq(posix_irq_mode_t mode, bool with_load)
 {
+    plat_stack_info_t stacks[8];
     posix_irq_stats_t irq;
     posix_tick_stats_t tick;
     pthread_t source;
+    uint32_t stack_peak = 0U;
     int status = EXIT_SUCCESS;
 
     init_platform(POSIX_TICK_LOCKED, mode, NULL);
@@ -322,32 +379,63 @@ static int cmd_irq(posix_irq_mode_t mode, bool with_load)
     posix_irq_get_stats(&irq);
     posix_tick_get_stats(&tick);
 
+    const size_t stack_count = plat_stack_report(stacks, sizeof(stacks) / sizeof(stacks[0]));
+
+    for (size_t i = 0U; i < stack_count; i++) {
+        if (stacks[i].peak_bytes > stack_peak) {
+            stack_peak = stacks[i].peak_bytes;
+        }
+    }
+
     const uint32_t raised = atomic_load(&s_source_raised);
     const uint32_t seen = atomic_load(&s_task_seen);
     const uint32_t samples = s_latency_count;
+    const double mean_period_us =
+        (raised > 1U)
+            ? ((double)(s_source_last_ns - s_source_first_ns) / (double)(raised - 1U) / 1e3)
+            : 0.0;
 
-    (void)printf("{\"test\": \"irq\", \"mode\": \"%s\", \"period_us\": %u, \"seconds\": %u, "
-                 "\"load\": %s, \"raised\": %u, \"seen_by_task\": %u, \"signals_sent\": %llu, "
-                 "\"serviced_by_signal\": %llu, \"serviced_by_tick\": %llu, "
-                 "\"tick_catch_ups\": %llu, \"tick_dropped\": %llu, ",
+    /* "raised" counts calls of the source; a line that is raised again before it was served
+     * stays one pending interrupt, as with a real interrupt flag, so the task wakes up less
+     * often than the source raises once the source is faster than the service.
+     * "unserved_at_end" is what must be zero: the task ran after the last raise. */
+    (void)printf("{\"test\": \"irq\", \"mode\": \"%s\", \"nominal_period_us\": %u, "
+                 "\"mean_raise_period_us\": %.3f, \"seconds\": %u, \"load\": %s, "
+                 "\"raised\": %u, \"task_wakeups\": %u, \"unserved_at_end\": %u, "
+                 "\"signals_sent\": %llu, \"serviced_by_signal\": %llu, "
+                 "\"serviced_by_tick\": %llu, \"max_handler_nesting\": %u, "
+                 "\"stack_peak_max_bytes\": %u, \"tick_catch_ups\": %llu, "
+                 "\"tick_dropped\": %llu, \"latency_samples_not_recorded\": %u, ",
                  (mode == POSIX_IRQ_SIGNAL) ? "signal" : "poll", (unsigned int)s_irq_period_us,
-                 (unsigned int)s_run_seconds, with_load ? "true" : "false", (unsigned int)raised,
-                 (unsigned int)seen, (unsigned long long)irq.signals_sent,
-                 (unsigned long long)irq.serviced_by_signal,
-                 (unsigned long long)irq.serviced_by_tick, (unsigned long long)tick.catch_ups,
-                 (unsigned long long)tick.dropped_ticks);
+                 mean_period_us, (unsigned int)s_run_seconds, with_load ? "true" : "false",
+                 (unsigned int)raised, (unsigned int)s_task_wakeups, (unsigned int)(raised - seen),
+                 (unsigned long long)irq.signals_sent, (unsigned long long)irq.serviced_by_signal,
+                 (unsigned long long)irq.serviced_by_tick, (unsigned int)irq.max_nesting,
+                 (unsigned int)stack_peak, (unsigned long long)tick.catch_ups,
+                 (unsigned long long)tick.dropped_ticks, (unsigned int)s_latency_overflow);
     dump_samples(s_latency_ns, samples);
     print_stats_us("latency_us", s_latency_ns, samples);
     (void)printf("}\n");
 
     if (seen != raised) {
-        (void)fprintf(stderr, "lost interrupt: raised %u, task saw %u\n", (unsigned int)raised,
-                      (unsigned int)seen);
+        (void)fprintf(stderr, "an interrupt was never served: raised %u, task saw %u\n",
+                      (unsigned int)raised, (unsigned int)seen);
         status = EXIT_FAILURE;
     }
 
     if (samples == 0U) {
         (void)fprintf(stderr, "no interrupt reached the task\n");
+        status = EXIT_FAILURE;
+    }
+
+    if (irq.max_nesting > 1U) {
+        (void)fprintf(stderr, "interrupt handlers nested %u deep\n", (unsigned int)irq.max_nesting);
+        status = EXIT_FAILURE;
+    }
+
+    if (stack_peak > IRQ_STACK_LIMIT_BYTES) {
+        (void)fprintf(stderr, "a task used %u bytes of stack, more than %u\n",
+                      (unsigned int)stack_peak, (unsigned int)IRQ_STACK_LIMIT_BYTES);
         status = EXIT_FAILURE;
     }
 
@@ -448,11 +536,13 @@ static int cmd_stack(void)
     (void)printf("], \"kernel_high_water_mark_is_meaningful\": false}\n");
 
     /* The deep task must show at least what it deliberately used, and clearly more than the
-     * task that used nothing. The slack covers signal frames and sanitizer overhead. */
+     * task that used nothing. The slack covers signal frames and sanitizer overhead. The
+     * shallow task must have been measured at all: an unregistered task is not in the report
+     * and leaves `shallow` at zero (a registered one reports at least the scan's floor). */
     const uint32_t burned = BURN_LEVELS * BURN_BLOCK_BYTES;
 
     if ((deep < burned) || (deep > (burned + (48U * 1024U))) || (shallow == 0U) ||
-        (deep < (shallow + (burned / 2U)))) {
+        (shallow > (16U * 1024U)) || (deep < (shallow + (burned / 2U)))) {
         (void)fprintf(stderr, "stack measurement implausible: deep %u, shallow %u, burned %u\n",
                       (unsigned int)deep, (unsigned int)shallow, (unsigned int)burned);
         status = EXIT_FAILURE;
@@ -665,10 +755,11 @@ static int cmd_single_task(TaskFunction_t code)
 
 static int usage(void)
 {
-    (void)fprintf(stderr,
-                  "usage: plat_selftest tick <locked|stock> <seconds>\n"
-                  "       plat_selftest irq <signal|poll> <period_us> <seconds> <load 0|1>\n"
-                  "       plat_selftest stack | log <path> | assert | malloc-fail | reset | run\n");
+    (void)fprintf(
+        stderr,
+        "usage: plat_selftest tick <locked|stock> <seconds>\n"
+        "       plat_selftest irq <signal|poll> <period_us, 0: storm> <seconds> <load 0|1>\n"
+        "       plat_selftest stack | log <path> | assert | malloc-fail | reset | run\n");
     return 2;
 }
 

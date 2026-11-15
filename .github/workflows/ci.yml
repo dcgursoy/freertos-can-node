@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   check:
-    name: Analyse, build, test (Ubuntu 24.04, real SocketCAN)
+    name: Analyse, build, test (Ubuntu 24.04)
     # Pinned on purpose: ubuntu-latest moves between releases, and the toolchain versions
     # (gcc 13, cppcheck 2.13, clang-tidy 18) are part of what the results depend on.
     runs-on: ubuntu-24.04
@@ -47,8 +47,8 @@ jobs:
           python3 --version
 
       - name: Bring up vcan0 and verify that it carries a frame
-        # Real SocketCAN: this step fails the job unless a frame sent with cansend arrives in
-        # candump. The runner's kernel has vcan built as a module; the script falls back to
+        # This step fails the job unless a frame sent with cansend arrives in candump. The
+        # runner's kernel has vcan built as a module; the script falls back to
         # linux-modules-extra only where an image keeps it there.
         run: scripts/vcan-up.sh --verify --install-modules-extra
 
@@ -74,6 +74,10 @@ jobs:
         run: scripts/buglog-verify.sh
 
       - name: Platform timing on this runner (reported, not gated)
+        # A shared runner keeps time poorly; a timing self-test that fails here is recorded
+        # in the step's log and does not fail the job. The gated timing tests are in the test
+        # steps above, where a failed one is repeated once before it counts.
+        continue-on-error: true
         run: |
           "$FCN_VENV/bin/python" bench/platform_timing.py --seconds 5
           mkdir -p build/runner-results

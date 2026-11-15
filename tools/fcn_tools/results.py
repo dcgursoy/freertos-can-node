@@ -19,14 +19,33 @@ import numpy as np
 from . import paths
 
 
+# Travels with every result, because a number that left its README is still read by someone.
+HOST_TIMING_NOTE = (
+    "Measured on the FreeRTOS POSIX port, where every task is a thread of a Linux process. "
+    "Times, jitter and latencies are those of the host's scheduler and are not what the same "
+    "code shows on a microcontroller; counts, orderings and sizes of protocol data are "
+    "independent of the host."
+)
+
+
 def _git(*args: str) -> str:
+    """Output of a git command in the repository, without the trailing newline; "" on error."""
     try:
         return subprocess.run(
             ["git", "-C", str(paths.REPO_ROOT), *args],
             capture_output=True, text=True, timeout=60, check=True,
-        ).stdout.strip()
+        ).stdout.rstrip("\n")
     except (OSError, subprocess.SubprocessError):
         return ""
+
+
+def _modified_files(porcelain: str) -> list[str]:
+    """Paths from `git status --porcelain` output, without results/ (rewritten by every run).
+
+    Each line is two status characters, a space and the path. The first status character is
+    often a space, so the text must not be stripped before it is cut."""
+    paths_ = [line[3:] for line in porcelain.splitlines() if len(line) > 3]
+    return [path for path in paths_ if not path.startswith("results/")]
 
 
 def _cpu_model() -> str:
@@ -41,11 +60,8 @@ def _cpu_model() -> str:
 
 def provenance() -> dict:
     """Who produced a result: command, commit, uncommitted source changes, host."""
-    status = _git("status", "--porcelain", "--untracked-files=no", "--ignore-submodules")
-    modified = [
-        line[3:] for line in status.splitlines()
-        if line[3:] and not line[3:].startswith("results/")
-    ]
+    modified = _modified_files(
+        _git("status", "--porcelain", "--untracked-files=no", "--ignore-submodules"))
     # The script's path relative to the repository it lives in, found by walking up from the
     # script itself (the package may be imported through a different mount of the same tree).
     script = Path(sys.argv[0]).resolve()
@@ -106,7 +122,8 @@ def write_result(name: str, data: dict) -> Path:
     out_dir = paths.results_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{name}.json"
-    payload = {"schema": f"fcn.result/{name}/1", "provenance": provenance(), **data}
+    payload = {"schema": f"fcn.result/{name}/1", "provenance": provenance(),
+               "host_timing_note": HOST_TIMING_NOTE, **data}
     with open(path, "w", encoding="utf-8", newline="\n") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")

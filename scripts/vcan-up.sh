@@ -2,7 +2,9 @@
 # Bring up a virtual SocketCAN interface and, with --verify, prove that it carries a frame.
 #   scripts/vcan-up.sh [--verify] [--install-modules-extra] [interface]     (default: vcan0)
 #
-# Needs root for the kernel module and the interface; uses sudo unless it already is root.
+# Needs root for the kernel module and the interface. Unless it already is root it uses sudo:
+# without a prompt where that works (CI, a sudo session that is still open), with sudo's own
+# password prompt on a terminal.
 #
 # Where the vcan module comes from, in this order:
 #   1. the running kernel (modprobe vcan): any normal Linux, and GitHub's runners
@@ -26,7 +28,18 @@ for arg in "$@"; do
 done
 
 sudo_cmd=()
-[[ "$(id -u)" -ne 0 ]] && sudo_cmd=(sudo -n)
+if [[ "$(id -u)" -ne 0 ]]; then
+    if sudo -n true 2>/dev/null; then
+        sudo_cmd=(sudo -n)
+    elif [[ -t 0 ]]; then
+        sudo_cmd=(sudo) # asks for the password once; later calls reuse the session
+        sudo -v
+    else
+        echo "error: this needs root, sudo asks for a password and there is no terminal to" >&2
+        echo "       ask on. Run 'sudo -v' first, or run this script from a terminal." >&2
+        exit 1
+    fi
+fi
 
 load_vcan() {
     "${sudo_cmd[@]}" modprobe vcan 2>/dev/null && return 0
@@ -54,7 +67,7 @@ if ! ip link show "$iface" >/dev/null 2>&1; then
     if ! grep -q '^vcan ' /proc/modules 2>/dev/null; then
         if ! load_vcan; then
             echo "error: no vcan module for kernel $(uname -r)." >&2
-            echo "       On WSL2 see docs/wsl-vcan.md; the UDP backend needs no kernel support." >&2
+            echo "       On WSL2 see docs/wsl-vcan.md." >&2
             exit 1
         fi
     fi

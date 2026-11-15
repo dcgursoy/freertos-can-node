@@ -4,24 +4,39 @@
 #
 # Each directory docs/buglog/<id>/ holds
 #   reintroduce.patch   puts the bug back into the current sources
-#   test.sh             runs the test that caught it (exit status 0 = the test passes);
-#                       it is started in the scratch source tree with BUILD set to the build
-#                       directory of the debug preset
-# For each entry this script applies the patch to a scratch copy of the sources, builds, runs
-# the test and requires it to FAIL. An entry whose bug can no longer be re-created, or whose
-# test no longer notices it, fails the script.
+#   test*.sh            one or more tests that detect it: the test that caught the bug and,
+#                       where one was added with the fix, the regression test
+#                       (exit status 0 = the test passes)
+#   build-fails         optional, empty: the re-created bug shows as a build failure
+#
+# For each entry this script works on a scratch copy of the sources and requires that
+#   1. every test PASSES without the patch (a test that fails anyway proves nothing),
+#   2. the patch applies and the sources still build (unless the entry has build-fails),
+#   3. every test FAILS with the patch.
+# Anything else, a build that breaks for another reason included, fails the script.
+#
+# A test script is started in the scratch tree with
+#   BUILD            build directory of the release preset of the scratch tree
+#   FCN_PYTHON       the project's Python interpreter
+#   FCN_BUILD_ROOT   set so that Python tests and tools use the scratch build
+#   PYTHONPATH       set so that they import the scratch tree's fcn_tools
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 work="$FCN_BUILD_ROOT/buglog-verify"
 src="$work/src"
-build="$work/build"
+build="$work/release"
+python="$(fcn_python)"
 rm -rf "$work"
 mkdir -p "$src"
 
-# Scratch copy of the project's own files; third-party code is linked, not copied.
-for item in CMakeLists.txt CMakePresets.json cmake config lib app platform hal dbc tests tools \
-    bench scripts pyproject.toml requirements.txt; do
-    [[ -e "$FCN_ROOT/$item" ]] && cp -a "$FCN_ROOT/$item" "$src/"
+# Scratch copy of everything that is source. The list names what is left out, so a directory
+# added to the project later is copied without this script having to know about it.
+# (Names starting with a dot, such as .git and .venv, are not matched by the pattern.)
+for item in "$FCN_ROOT"/*; do
+    case "$(basename "$item")" in
+    build | third_party | results | docs) continue ;;
+    *) cp -a "$item" "$src/" ;;
+    esac
 done
 ln -s "$FCN_ROOT/third_party" "$src/third_party"
 
@@ -32,32 +47,83 @@ if [[ ${#entries[@]} -eq 0 ]]; then
     exit 0
 fi
 
+build_scratch() { # build_scratch <log file>
+    { cmake --preset release -S "$src" -B "$build" && cmake --build "$build"; } >>"$1" 2>&1
+}
+
+run_test() { # run_test <test script> <log file>; returns the test's exit status
+    echo "---- $(basename "$1")" >>"$2"
+    (cd "$src" && BUILD="$build" FCN_BUILD_ROOT="$work" FCN_PYTHON="$python" \
+        PYTHONPATH="$src/tools" bash "$1") >>"$2" 2>&1
+}
+
+if ! build_scratch "$work/build.log"; then
+    echo "bug log: the scratch copy of the sources does not build (see $work/build.log)"
+    exit 1
+fi
+
 status=0
 for entry in "${entries[@]}"; do
     id="$(basename "$entry")"
-    if [[ ! -f "$entry/reintroduce.patch" || ! -f "$entry/test.sh" ]]; then
-        echo "$id: incomplete entry (needs reintroduce.patch and test.sh)"
-        status=1
-        continue
-    fi
-
-    if ! patch -p1 -s -d "$src" <"$entry/reintroduce.patch"; then
-        echo "$id: reintroduce.patch no longer applies to the sources"
-        status=1
-        continue
-    fi
-
     log="$work/$id.log"
-    if ! { cmake --preset debug -S "$src" -B "$build" && cmake --build "$build"; } >"$log" 2>&1; then
-        # A bug that only shows as a build failure is still caught.
-        echo "$id: caught (the build fails with the bug re-created)"
-    elif (cd "$src" && BUILD="$build" FCN_BUILD_ROOT="$work" bash "$entry/test.sh") >>"$log" 2>&1; then
-        echo "$id: NOT caught: the test passes with the bug re-created (see $log)"
+    tests=("$entry"test*.sh)
+    : >"$log"
+
+    if [[ ! -f "$entry/reintroduce.patch" || ${#tests[@]} -eq 0 ]]; then
+        echo "$id: incomplete entry (needs reintroduce.patch and at least one test*.sh)"
+        status=1
+        continue
+    fi
+
+    # 1. The control: without the bug every test passes.
+    control=0
+    echo "==== without the patch" >>"$log"
+    for t in "${tests[@]}"; do
+        if ! run_test "$t" "$log"; then
+            echo "$id: $(basename "$t") fails WITHOUT the bug, so it cannot show the bug (see $log)"
+            control=1
+        fi
+    done
+    if [[ "$control" -ne 0 ]]; then
+        status=1
+        continue
+    fi
+
+    # 2. The bug goes back in and the sources still build.
+    if ! patch -p1 -s --dry-run -d "$src" <"$entry/reintroduce.patch" >>"$log" 2>&1; then
+        echo "$id: reintroduce.patch no longer applies to the sources (see $log)"
+        status=1
+        continue
+    fi
+    patch -p1 -s -d "$src" <"$entry/reintroduce.patch"
+    echo "==== with the patch" >>"$log"
+
+    if ! build_scratch "$log"; then
+        if [[ -f "$entry/build-fails" ]]; then
+            echo "$id: caught (the build fails with the bug re-created, as the entry says)"
+        else
+            echo "$id: the sources do not build with reintroduce.patch applied (see $log)"
+            status=1
+        fi
+    elif [[ -f "$entry/build-fails" ]]; then
+        echo "$id: NOT caught: the entry expects a build failure, but the sources built"
         status=1
     else
-        echo "$id: caught (the test fails with the bug re-created)"
+        # 3. With the bug every test fails.
+        for t in "${tests[@]}"; do
+            if run_test "$t" "$log"; then
+                echo "$id: NOT caught: $(basename "$t") passes with the bug re-created (see $log)"
+                status=1
+            else
+                echo "$id: caught by $(basename "$t")"
+            fi
+        done
     fi
 
     patch -R -p1 -s -d "$src" <"$entry/reintroduce.patch"
+    if ! build_scratch "$work/build.log"; then
+        echo "bug log: the scratch copy no longer builds after removing the patch of $id"
+        exit 1
+    fi
 done
 exit "$status"

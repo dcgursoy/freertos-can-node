@@ -1,8 +1,9 @@
 # SocketCAN on WSL2: enabling `vcan` (optional)
 
-Nothing in this project needs this step. The node and every test run on the UDP backend,
-which needs no kernel support, and CI exercises real SocketCAN on GitHub's runners. This page
-is for running the SocketCAN backend on a Windows laptop as well.
+Nothing in this project needs this step. The CAN transports arrive with phase 1: one over UDP
+on the loopback interface, which needs no kernel support and is the default, and one on
+SocketCAN, which CI exercises on GitHub's runners. This page is for running the SocketCAN
+transport on a Windows laptop as well.
 
 ## The check
 
@@ -35,9 +36,11 @@ scripts/wsl/build-vcan-module.sh
 
 The script installs the kernel build prerequisites with apt, downloads the source of the
 running kernel release from `github.com/microsoft/WSL2-Linux-Kernel`, enables
-`CONFIG_CAN_VCAN=m` on top of `/proc/config.gz`, and builds `drivers/net/can` only. It needs
-about 250 MB of download and 1.5 GB of disk for the kernel source tree, took about a minute on
-the 8-core development laptop, and leaves `~/.local/share/fcn/vcan-<kernel release>.ko`.
+`CONFIG_CAN_VCAN=m` on top of `/proc/config.gz`, and builds `drivers/net/can` only. On the
+8-core development laptop a run with the source already downloaded took 54 seconds and left a
+kernel source tree of 1.5 GB in `~/.cache/fcn/wsl-kernel` (it can be deleted afterwards); the
+download is the kernel's source archive, a few hundred megabytes. The script prints its own
+time and size when it ends. The result is `~/.local/share/fcn/vcan-<kernel release>.ko`.
 
 Then, and again whenever the WSL virtual machine has restarted:
 
@@ -46,7 +49,8 @@ scripts/vcan-up.sh --verify
 ```
 
 loads the CAN core modules and the built module, creates `vcan0` and proves it with a frame
-sent by `cansend` and received by `candump`.
+sent by `cansend` and received by `candump`. It needs root and uses `sudo`; where `sudo` asks
+for a password it does so on the terminal.
 
 ## What to expect
 
@@ -63,8 +67,3 @@ sent by `cansend` and received by `candump`.
   warning. The comment at the top of the build script explains why that is sound here.
 - **Shared by all WSL distributions.** WSL2 runs every distribution on one kernel, so the
   module is visible from all of them, Docker Desktop's included.
-
-## Without it
-
-The UDP backend is the default and needs no kernel support. System tests that need SocketCAN
-are marked `socketcan` and are skipped, not failed, when `vcan0` does not exist.

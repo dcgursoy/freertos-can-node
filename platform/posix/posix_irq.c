@@ -9,14 +9,27 @@
  * posix_irq_raise() latches the line in an atomic word and sends SIGUSR2 to the process.
  * The port keeps signals blocked in every thread except the one that runs the current task,
  * and blocks them there too during a critical section, so the signal is taken by the running
- * task's thread and only while "interrupts are enabled": exactly the masking behaviour of a
- * real interrupt, and the same mechanism the port uses for its own tick (SIGALRM). The
- * handler runs the attached ISRs, which use the FromISR kernel API and request a context
- * switch the usual way.
+ * task's thread and only while "interrupts are enabled". The handler runs the attached ISRs,
+ * which use the FromISR kernel API and request a context switch the usual way.
  *
- * The tick hook polls the same latch. In POSIX_IRQ_POLL mode that is the only delivery path
- * (an interrupt is then served up to one tick late); in POSIX_IRQ_SIGNAL mode it is a safety
- * net, so that a line raised while delivery was disabled is still served within one tick.
+ * One handler at a time. An interrupt does not preempt its own handler, and a task's stack is
+ * sized on that assumption. The port's tick handler gets this for free: it counts the
+ * critical nesting up and down itself and leaves the signal mask alone, so signals stay
+ * blocked until the handler returns. Code outside the port cannot reach that counter. The
+ * handler here has to use vPortEnterCritical() and vPortExitCritical(), a yield from an ISR
+ * does the same, and the port's exit path unblocks every signal the moment the count is back
+ * at zero, with the handler still on the stack. A signal pending at that instant is then
+ * handled on top of the handler's frame; at a high interrupt rate handlers pile up until the
+ * stack overflows (docs/bug-log.md, entry 002). pthread_sigmask() is therefore intercepted at
+ * link time (-Wl,--wrap, like usleep in posix_tick.c) and an unblock requested while the
+ * calling thread is inside the handler is dropped. The mask comes back when the handler
+ * returns, exactly as for the tick.
+ *
+ * The tick hook polls the same latch. In POSIX_IRQ_POLL mode that is the only delivery path:
+ * an interrupt is served at the next tick the host delivers, nominally within one tick
+ * period. In POSIX_IRQ_SIGNAL mode it is a safety net, so that a line raised while delivery
+ * was disabled is served at the next tick. How late that can be is the host's decision, not
+ * a property of this code; results/platform_timing.json has the measured distribution.
  */
 #include "posix_platform.h"
 
@@ -43,6 +56,28 @@ static _Atomic uint64_t s_raised;
 static _Atomic uint64_t s_signals_sent;
 static _Atomic uint64_t s_serviced_by_signal;
 static _Atomic uint64_t s_serviced_by_tick;
+static _Atomic uint32_t s_max_nesting;
+
+/* How many frames of irq_signal_handler() are on this thread's stack. It stays set while the
+ * thread is parked inside the handler after a context switch. */
+static _Thread_local uint32_t t_handler_depth;
+
+/* The names are fixed by the linker's --wrap convention. */
+int __real_pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset);
+int __wrap_pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset);
+
+/* Every pthread_sigmask() call of the program, the port's included, arrives here. Inside the
+ * interrupt handler an unblock is dropped (see the top of this file); everything else is
+ * passed on unchanged. */
+int __wrap_pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+    if ((t_handler_depth != 0U) && (how == SIG_UNBLOCK)) {
+        /* Nothing changes; report the current mask if the caller asked for it. */
+        return (oldset != NULL) ? __real_pthread_sigmask(SIG_BLOCK, NULL, oldset) : 0;
+    }
+
+    return __real_pthread_sigmask(how, set, oldset);
+}
 
 /* Run the ISR of every pending line. Interrupt context. Returns true if any line was served. */
 static bool dispatch(BaseType_t *woken)
@@ -66,23 +101,33 @@ static void irq_signal_handler(int signum)
     const int saved_errno = errno;
 
     (void)signum;
+    t_handler_depth++;
+
+    /* Stays 1 as long as nothing unblocks signals inside the handler; the self-tests and the
+     * node's statistics check that it does. */
+    if (t_handler_depth > atomic_load(&s_max_nesting)) {
+        atomic_store(&s_max_nesting, t_handler_depth);
+    }
 
     if (atomic_load(&s_enabled)) {
         BaseType_t woken = pdFALSE;
 
-        /* The handler already runs with every signal blocked. Entering a critical section
-         * here raises the port's nesting count, so that a yield or a nested critical section
-         * inside an ISR cannot unblock signals before the handler is done. */
+        /* The handler runs with every signal blocked (sa_mask). The critical section gives
+         * the port's nesting count the value it has in the port's own tick handler, so that
+         * kernel code which checks or nests critical sections sees an interrupt context. */
         vPortEnterCritical();
 
         if (dispatch(&woken)) {
             (void)atomic_fetch_add(&s_serviced_by_signal, 1U);
         }
 
+        /* May switch to another task: this thread is then parked right here, inside the
+         * handler, and continues when its task is scheduled again. */
         portYIELD_FROM_ISR(woken);
         vPortExitCritical();
     }
 
+    t_handler_depth--;
     errno = saved_errno;
 }
 
@@ -158,4 +203,5 @@ void posix_irq_get_stats(posix_irq_stats_t *out)
     out->signals_sent = atomic_load(&s_signals_sent);
     out->serviced_by_signal = atomic_load(&s_serviced_by_signal);
     out->serviced_by_tick = atomic_load(&s_serviced_by_tick);
+    out->max_nesting = atomic_load(&s_max_nesting);
 }

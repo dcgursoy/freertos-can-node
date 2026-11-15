@@ -20,6 +20,8 @@
 #include <stdatomic.h>
 #include <string.h>
 
+#include "task.h"
+
 #define STACK_REGISTRY_MAX 16U
 #define PAINT_BYTE         0xA5U
 
@@ -28,7 +30,9 @@
 #define TASK_THREAD_STACK_BYTES ((size_t)512U * 1024U)
 
 /* Bytes just below the caller's frame that are left unpainted: they hold the frames of the
- * painting code itself. Sanitizer builds have much larger frames. */
+ * painting code itself. Sanitizer builds have much larger frames. This is also the smallest
+ * depth the scan can report: a task that never goes deeper than the margin is reported as
+ * using exactly the margin (see plat_stack_info_t). */
 #if defined(__SANITIZE_ADDRESS__)
 #define PAINT_MARGIN_BYTES 4096U
 #else
@@ -97,10 +101,17 @@ void plat_task_enter(const char *name)
         size_t size = 0U;
         uint8_t *const here = __builtin_frame_address(0);
 
+        /* pthread_getattr_np() allocates. A task that is switched out while it holds the
+         * allocator's lock blocks the host thread of the next task that allocates, and the
+         * scheduler with it, so the call is made where no task switch can happen. */
+        taskENTER_CRITICAL();
+
         if (pthread_getattr_np(pthread_self(), &attr) == 0) {
             (void)pthread_attr_getstack(&attr, &stack_addr, &size);
             (void)pthread_attr_destroy(&attr);
         }
+
+        taskEXIT_CRITICAL();
 
         uint8_t *const base = stack_addr; /* lowest address of the thread's stack */
 

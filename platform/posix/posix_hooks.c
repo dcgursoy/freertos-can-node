@@ -9,9 +9,10 @@
 
 #include "task.h"
 
-/* How long the idle task sleeps per pass. A pending tick or simulated interrupt ends the
- * sleep at once (the signal interrupts it), so this costs no wake-up latency; it only keeps
- * the idle task from burning a host core. */
+/* How long the idle task sleeps per pass, so that it does not burn a host core. A tick or a
+ * simulated interrupt ends the sleep early (the signal interrupts it), but the host still has
+ * to wake the sleeping thread first; that wake-up is part of every latency measured while the
+ * node is idle. */
 #define IDLE_SLEEP_NS 100000L
 
 void vApplicationIdleHook(void)

@@ -78,18 +78,18 @@
 #define configCHECK_FOR_STACK_OVERFLOW 2
 
 /* ---------------------------------------------------------- run-time stats and tracing */
-#define configGENERATE_RUN_TIME_STATS        1
-#define configUSE_TRACE_FACILITY             1
-#define configUSE_STATS_FORMATTING_FUNCTIONS 0
-#define configRUN_TIME_COUNTER_TYPE          uint64_t
+#define configGENERATE_RUN_TIME_STATS               1
+#define configUSE_TRACE_FACILITY                    1
+#define configUSE_STATS_FORMATTING_FUNCTIONS        0
+#define configRUN_TIME_COUNTER_TYPE                 uint64_t
 #define portALT_GET_RUN_TIME_COUNTER_VALUE(counter) ((counter) = plat_run_time_counter_us())
 
 /* ---------------------------------------------------------------------------- assert */
-#define configASSERT(x)                                                                           \
-    do {                                                                                          \
-        if (!(x)) {                                                                               \
-            plat_assert_failed(__FILE__, __LINE__);                                               \
-        }                                                                                         \
+#define configASSERT(x)                                                                            \
+    do {                                                                                           \
+        if (!(x)) {                                                                                \
+            plat_assert_failed(__FILE__, __LINE__);                                                \
+        }                                                                                          \
     } while (0)
 
 /* ------------------------------------------------------------------ optional functions */

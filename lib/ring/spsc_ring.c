@@ -58,10 +58,20 @@ bool spsc_ring_pop(spsc_ring_t *ring, void *elem)
 
 uint32_t spsc_ring_count(const spsc_ring_t *ring)
 {
-    const uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+    /* Tail first. Head only moves forward and is never behind tail, so a head that is read
+     * after the tail cannot be behind it either: the difference does not wrap, whoever calls
+     * and whatever the two sides do between the two loads. If both sides kept working in
+     * between, the difference can exceed the capacity; that is clamped. */
     const uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
+    const uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+    const uint32_t capacity = ring->mask + 1U;
+    uint32_t count = head - tail;
 
-    return head - tail;
+    if (count > capacity) {
+        count = capacity;
+    }
+
+    return count;
 }
 
 uint32_t spsc_ring_capacity(const spsc_ring_t *ring)

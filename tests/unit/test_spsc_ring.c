@@ -181,30 +181,74 @@ static void *stress_producer(void *arg)
     return NULL;
 }
 
+/* A third thread that owns neither end of the ring and keeps asking for the fill level while
+ * the other two work. */
+typedef struct {
+    spsc_ring_t *ring;
+    _Atomic bool run;
+    uint32_t calls;
+    uint32_t out_of_range;
+} observer_t;
+
+static void *stress_observer(void *arg)
+{
+    observer_t *observer = arg;
+
+    while (atomic_load(&observer->run)) {
+        if (spsc_ring_count(observer->ring) > spsc_ring_capacity(observer->ring)) {
+            observer->out_of_range++;
+        }
+
+        observer->calls++;
+    }
+
+    return NULL;
+}
+
 static void test_two_threads_transfer_a_sequence_without_loss_or_reordering(void)
 {
     spsc_ring_t ring;
-    static uint32_t storage[64];
+    static uint32_t storage[8];
+    observer_t observer = {.ring = &ring, .run = true, .calls = 0U, .out_of_range = 0U};
     pthread_t producer;
+    pthread_t watcher;
     uint32_t expected = 0U;
     uint32_t out = 0U;
     uint32_t mismatches = 0U;
+    uint32_t consumer_count_too_high = 0U;
 
-    TEST_ASSERT_TRUE(spsc_ring_init(&ring, storage, sizeof(uint32_t), 64U));
+    /* A small ring forces the full and the empty path many times, and makes a fill level
+     * computed from a stale index pair land outside the capacity quickly. */
+    TEST_ASSERT_TRUE(spsc_ring_init(&ring, storage, sizeof(uint32_t), 8U));
+    TEST_ASSERT_EQUAL_INT(0, pthread_create(&watcher, NULL, stress_observer, &observer));
     TEST_ASSERT_EQUAL_INT(0, pthread_create(&producer, NULL, stress_producer, &ring));
 
     while (expected < STRESS_ITEMS) {
-        if (spsc_ring_pop(&ring, &out)) {
+        /* The consumer's own view: it must be able to pop as many elements as it is told. */
+        uint32_t promised = spsc_ring_count(&ring);
+
+        while (promised > 0U) {
+            if (!spsc_ring_pop(&ring, &out)) {
+                consumer_count_too_high++;
+                break;
+            }
+
             if (out != expected) {
                 mismatches++;
             }
 
             expected++;
+            promised--;
         }
     }
 
     TEST_ASSERT_EQUAL_INT(0, pthread_join(producer, NULL));
+    atomic_store(&observer.run, false);
+    TEST_ASSERT_EQUAL_INT(0, pthread_join(watcher, NULL));
     TEST_ASSERT_EQUAL_UINT32(0U, mismatches);
+    TEST_ASSERT_EQUAL_UINT32(0U, consumer_count_too_high);
+    TEST_ASSERT_EQUAL_UINT32(0U, observer.out_of_range);
+    TEST_ASSERT_TRUE(observer.calls > 0U);
     TEST_ASSERT_EQUAL_UINT32(0U, spsc_ring_count(&ring));
 }
 

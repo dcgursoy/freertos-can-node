@@ -10,6 +10,8 @@
 #                     microcontroller; deviations are listed in config/misra-suppressions.txt
 #                     and explained in docs/misra-deviations.md
 #   4. clang-tidy     the checks in .clang-tidy, warnings as errors
+#   5. self-test      a file of planted defects goes through the commands of steps 1 to 4;
+#                     each analyser has to report the defect planted for it
 #
 # Any finding fails the script. Reports are written to $FCN_BUILD_ROOT/analysis/.
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
@@ -18,10 +20,62 @@ out="$FCN_BUILD_ROOT/analysis"
 mkdir -p "$out"
 status=0
 
+# ---------------------------------------------------------------- the analyser commands
+# Each analyser is run through one function, used for the project and for the self-test alike.
+
+run_clang_format() { # run_clang_format <log> <file>...
+    local log="$1"
+    shift
+    clang-format --dry-run --Werror --style=file "$@" >"$log" 2>&1
+}
+
+cppcheck_common=(
+    --std=c11 --platform=unix64
+    --inline-suppr
+    --suppress=missingIncludeSystem
+    "--suppress=*:*/third_party/*"
+    --error-exitcode=1
+    --quiet
+)
+
+run_cppcheck() { # run_cppcheck <compile db dir> <cppcheck build dir> <log>
+    mkdir -p "$2"
+    cppcheck --project="$1/compile_commands.json" --cppcheck-build-dir="$2" \
+        --enable=warning,style,performance,portability \
+        "${cppcheck_common[@]}" 2>"$3"
+}
+
+run_cppcheck_misra() { # run_cppcheck_misra <compile db dir> <cppcheck build dir> <log>
+    mkdir -p "$2"
+    # The addon reports through the 'style' severity, so that has to be enabled for it to speak.
+    cppcheck --project="$1/compile_commands.json" --cppcheck-build-dir="$2" \
+        --addon=misra --enable=style \
+        --suppressions-list="$FCN_ROOT/config/misra-suppressions.txt" \
+        "${cppcheck_common[@]}" 2>"$3"
+}
+
+units_of() { # units_of <compile db dir>: the source file of every entry, one per line
+    python3 -c '
+import json, sys
+for entry in json.load(open(sys.argv[1])):
+    print(entry["file"])
+' "$1/compile_commands.json"
+}
+
+run_clang_tidy() { # run_clang_tidy <compile db dir> <log>
+    local unit rc=0
+    : >"$2"
+    while IFS= read -r unit; do
+        clang-tidy -p "$1" --quiet --extra-arg=-Wno-unknown-warning-option "$unit" \
+            >>"$2" 2>&1 || rc=1
+    done < <(units_of "$1")
+    return "$rc"
+}
+
 # ---------------------------------------------------------------- 1. formatting
 echo "==> clang-format"
 mapfile -t files < <(fcn_project_sources)
-if clang-format --dry-run --Werror --style=file "${files[@]}" >"$out/clang-format.log" 2>&1; then
+if run_clang_format "$out/clang-format.log" "${files[@]}"; then
     echo "    ${#files[@]} files formatted correctly"
 else
     grep -E 'error|warning' "$out/clang-format.log" | head -40
@@ -34,29 +88,16 @@ fi
 fcn_build debug >/dev/null
 full_db="$FCN_BUILD_ROOT/debug/compile_commands.json"
 filter="$FCN_ROOT/scripts/filter_compile_db.py"
-db_tidy="$out/db-tidy"       # all project code, as compiled (for clang-tidy)
-db_all="$out/db-all"         # all project code, third-party headers visible to cppcheck
-db_misra="$out/db-misra"     # lib/ and app/ only
+db_tidy="$out/db-tidy"   # all project code, as compiled (for clang-tidy)
+db_all="$out/db-all"     # all project code, third-party headers visible to cppcheck
+db_misra="$out/db-misra" # lib/ and app/ only
 python3 "$filter" "$full_db" "$db_tidy" "$FCN_ROOT" "${FCN_CODE_DIRS[@]}"
 python3 "$filter" --plain-includes "$full_db" "$db_all" "$FCN_ROOT" "${FCN_CODE_DIRS[@]}"
 python3 "$filter" --plain-includes "$full_db" "$db_misra" "$FCN_ROOT" lib app
 
-cppcheck_common=(
-    --std=c11 --platform=unix64
-    --inline-suppr
-    --suppress=missingIncludeSystem
-    "--suppress=*:*/third_party/*"
-    --error-exitcode=1
-    --quiet
-)
-
 # ---------------------------------------------------------------- 2. cppcheck
 echo "==> cppcheck (all project code)"
-mkdir -p "$out/cppcheck-build-all"
-if cppcheck --project="$db_all/compile_commands.json" \
-    --cppcheck-build-dir="$out/cppcheck-build-all" \
-    --enable=warning,style,performance,portability \
-    "${cppcheck_common[@]}" 2>"$out/cppcheck.log"; then
+if run_cppcheck "$db_all" "$out/cppcheck-build-all" "$out/cppcheck.log"; then
     echo "    no findings"
 else
     cat "$out/cppcheck.log"
@@ -65,13 +106,7 @@ fi
 
 # ---------------------------------------------------------------- 3. cppcheck MISRA
 echo "==> cppcheck MISRA C:2012 addon (lib/ and app/)"
-mkdir -p "$out/cppcheck-build-misra"
-# The addon reports through the 'style' severity, so that has to be enabled for it to speak.
-if cppcheck --project="$db_misra/compile_commands.json" \
-    --cppcheck-build-dir="$out/cppcheck-build-misra" \
-    --addon=misra --enable=style \
-    --suppressions-list="$FCN_ROOT/config/misra-suppressions.txt" \
-    "${cppcheck_common[@]}" 2>"$out/cppcheck-misra.log"; then
+if run_cppcheck_misra "$db_misra" "$out/cppcheck-build-misra" "$out/cppcheck-misra.log"; then
     echo "    no findings outside the documented deviations"
 else
     cat "$out/cppcheck-misra.log"
@@ -81,45 +116,40 @@ fi
 
 # ---------------------------------------------------------------- 4. clang-tidy
 echo "==> clang-tidy"
-tidy_status=0
-: >"$out/clang-tidy.log"
-mapfile -t units < <(python3 -c '
-import json, sys
-for entry in json.load(open(sys.argv[1])):
-    print(entry["file"])
-' "$db_tidy/compile_commands.json")
-for unit in "${units[@]}"; do
-    clang-tidy -p "$db_tidy" --quiet --extra-arg=-Wno-unknown-warning-option "$unit" \
-        >>"$out/clang-tidy.log" 2>&1 || tidy_status=1
-done
-if [[ "$tidy_status" -eq 0 ]]; then
-    echo "    ${#units[@]} translation units clean"
+if run_clang_tidy "$db_tidy" "$out/clang-tidy.log"; then
+    echo "    $(units_of "$db_tidy" | wc -l) translation units clean"
 else
     grep -E 'warning:|error:' "$out/clang-tidy.log" | sort -u | head -80
     status=1
 fi
 
 # ---------------------------------------------------------------- 5. the analysers' own test
-# "No findings" only means something if the same tools, invoked the same way, do find a defect
-# that is known to be there. scripts/selftest/planted_violations.c holds one for each of them.
+# "No findings" only means something if the same commands do find a defect that is known to
+# be there. scripts/selftest/planted_violations.c holds one for each analyser. It gets the
+# compile flags of a module of lib/ and goes through the functions used above, so a check
+# that was switched off or suppressed for the project is missed here as well.
 echo "==> analyser self-test (planted violations)"
 planted="$FCN_ROOT/scripts/selftest/planted_violations.c"
-cppcheck --std=c11 --platform=unix64 --addon=misra --enable=warning,style --quiet \
-    "$planted" 2>"$out/selftest-cppcheck.log" || true
-clang-tidy --quiet "$planted" -- -std=c11 >"$out/selftest-clang-tidy.log" 2>&1 || true
-clang-format --dry-run --Werror --style=file "$planted" >"$out/selftest-clang-format.log" 2>&1 &&
-    format_caught=0 || format_caught=1
+python3 "$filter" --retarget "$planted" "$full_db" "$out/db-selftest-tidy" "$FCN_ROOT" lib
+python3 "$filter" --plain-includes --retarget "$planted" "$full_db" "$out/db-selftest" \
+    "$FCN_ROOT" lib
+run_cppcheck "$out/db-selftest" "$out/cppcheck-build-selftest" "$out/selftest-cppcheck.log" || true
+run_cppcheck_misra "$out/db-selftest" "$out/cppcheck-build-selftest-misra" \
+    "$out/selftest-cppcheck-misra.log" || true
+run_clang_tidy "$out/db-selftest-tidy" "$out/selftest-clang-tidy.log" || true
+run_clang_format "$out/selftest-clang-format.log" "$planted" && format_caught=0 || format_caught=1
 
 expect_finding() { # <log file> <finding id> <tool name>
     if grep -q "$2" "$1"; then
         echo "    $3 reports $2"
     else
-        echo "    SELF-TEST FAILED: $3 did not report the planted $2"
+        echo "    SELF-TEST FAILED: $3 did not report the planted $2 (see $1)"
         status=1
     fi
 }
 expect_finding "$out/selftest-cppcheck.log" "arrayIndexOutOfBounds" "cppcheck"
-expect_finding "$out/selftest-cppcheck.log" "misra-c2012-15.6" "cppcheck MISRA addon"
+expect_finding "$out/selftest-cppcheck.log" "duplicateExpression" "cppcheck"
+expect_finding "$out/selftest-cppcheck-misra.log" "misra-c2012-15.6" "cppcheck MISRA addon"
 expect_finding "$out/selftest-clang-tidy.log" "clang-analyzer-core.NullDereference" "clang-tidy"
 if [[ "$format_caught" -eq 1 ]]; then
     echo "    clang-format reports the unbraced if"

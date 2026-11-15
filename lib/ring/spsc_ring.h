@@ -50,9 +50,12 @@ bool spsc_ring_push(spsc_ring_t *ring, const void *elem);
 bool spsc_ring_pop(spsc_ring_t *ring, void *elem);
 
 /**
- * Number of stored elements. Exact when called by the producer or the consumer about its own
- * side's view (the producer never sees fewer free slots than there are, the consumer never
- * sees more elements than there are); a snapshot when called from anywhere else.
+ * Number of stored elements, always between 0 and the capacity. The other side may be working
+ * while the two indices are read, so the value is conservative for whoever asks:
+ *
+ *  - the consumer never gets more than are stored: it can pop at least that many;
+ *  - the producer never gets fewer than are stored: at least capacity - count slots are free;
+ *  - any other context gets an estimate, good for a fill-level display and nothing more.
  */
 uint32_t spsc_ring_count(const spsc_ring_t *ring);
 

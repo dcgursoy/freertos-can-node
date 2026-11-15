@@ -8,7 +8,8 @@
 # exact source tag and the configuration of the running kernel. Nothing of the kernel itself
 # is replaced.
 #
-# Cost: about 250 MB of download, 2 GB of disk during the build, five to ten minutes.
+# Cost: a kernel source download and a partial kernel build; docs/wsl-vcan.md has the figures
+# measured on the development laptop, and the script prints its own at the end.
 # Result: ~/.local/share/fcn/vcan-<kernel release>.ko, which scripts/vcan-up.sh loads.
 #
 # The module has to be loaded again after every `wsl --shutdown` or Windows restart
@@ -72,4 +73,5 @@ mkdir -p "$(dirname "$out")"
 cp drivers/net/can/vcan.ko "$out"
 echo "==> built $out"
 modinfo "$out" | grep -E '^(vermagic|depends):'
+echo "==> took ${SECONDS} s; the kernel source tree in $work uses $(du -sh "$work" | cut -f1)"
 echo "Load it and create vcan0 with: scripts/vcan-up.sh --verify"

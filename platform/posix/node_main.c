@@ -4,7 +4,7 @@
  * starts the application and, after an orderly stop, writes the run's statistics as JSON.
  *
  * Everything here runs on the main thread before the scheduler starts or after it has ended,
- * which is why stdio is used freely; tasks never do.
+ * which is why stdio streams are used freely; tasks never write to one.
  */
 #include <getopt.h>
 #include <signal.h>
@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <unistd.h>
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -32,8 +33,8 @@ typedef struct {
 static void print_usage(const char *program)
 {
     (void)printf("usage: %s [options]\n"
-                 "  --duration-s N         stop after N seconds of tick time (default: run until "
-                 "SIGINT/SIGTERM)\n"
+                 "  --duration-s N         stop after N seconds of tick time (default and 0: run\n"
+                 "                         until SIGINT or SIGTERM)\n"
                  "  --stats-json PATH      write run statistics to PATH on an orderly stop\n"
                  "  --tick-mode MODE       locked (default) or stock\n"
                  "  --irq-mode MODE        signal (default) or poll\n"
@@ -190,11 +191,12 @@ static bool write_stats(const char *path, const node_options_t *options, uint64_
                   (unsigned long long)tick.catch_ups, (unsigned long long)tick.dropped_ticks);
     (void)fprintf(file,
                   "  \"irq\": {\"mode\": \"%s\", \"raised\": %llu, \"signals_sent\": %llu, "
-                  "\"serviced_by_signal\": %llu, \"serviced_by_tick\": %llu},\n",
+                  "\"serviced_by_signal\": %llu, \"serviced_by_tick\": %llu, "
+                  "\"max_nesting\": %u},\n",
                   (options->platform.irq_mode == POSIX_IRQ_SIGNAL) ? "signal" : "poll",
                   (unsigned long long)irq.raised, (unsigned long long)irq.signals_sent,
                   (unsigned long long)irq.serviced_by_signal,
-                  (unsigned long long)irq.serviced_by_tick);
+                  (unsigned long long)irq.serviced_by_tick, (unsigned int)irq.max_nesting);
     (void)fprintf(file, "  \"log_lines_dropped\": %u,\n", (unsigned int)posix_log_dropped());
     (void)fprintf(file, "  \"run_time_total_us\": %llu,\n",
                   (unsigned long long)stats->total_run_time_us);
@@ -237,10 +239,18 @@ int main(int argc, char **argv)
         return (status == 1) ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
-    /* A test harness sets this so that a node can never outlive it, whatever happens to the
-     * harness: the kernel then kills the node when its parent dies. */
-    if (getenv("FCN_DIE_WITH_PARENT") != NULL) {
+    /* A test harness passes its process id here so that no node is left behind when the
+     * harness dies: the kernel is asked to kill the node when its parent exits. The request
+     * only covers a parent that is still alive when it is made, hence the check after it: if
+     * the harness died before this point, the node already has another parent and ends here. */
+    const char *const harness = getenv("FCN_DIE_WITH_PARENT");
+
+    if (harness != NULL) {
         (void)prctl(PR_SET_PDEATHSIG, SIGKILL);
+
+        if ((long)getppid() != strtol(harness, NULL, 10)) {
+            return EXIT_FAILURE;
+        }
     }
 
     posix_platform_init(&options.platform);

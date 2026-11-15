@@ -23,8 +23,9 @@ target_compile_definitions(fcn_platform_posix PRIVATE _GNU_SOURCE)
 
 target_link_libraries(fcn_platform_posix PUBLIC freertos_kernel fcn_ring fcn_log Threads::Threads)
 
-# Route the port's tick-thread sleep through platform/posix/posix_tick.c (see that file).
-target_link_options(fcn_platform_posix INTERFACE -Wl,--wrap=usleep)
+# Two calls of the port are intercepted at link time: the tick thread's sleep (posix_tick.c)
+# and the signal mask changes (posix_irq.c). Each file says why.
+target_link_options(fcn_platform_posix INTERFACE -Wl,--wrap=usleep -Wl,--wrap=pthread_sigmask)
 
 fcn_target_defaults(fcn_platform_posix)
 

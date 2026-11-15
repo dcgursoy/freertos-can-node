@@ -14,8 +14,8 @@
 #   cert-err33-c                             duplicates the explicit (void) casts used for
 #                                            deliberately ignored results
 #   bugprone-reserved-identifier, cert-dcl37-c, cert-dcl51-cpp
-#                                            the linker's --wrap convention requires the
-#                                            names __wrap_usleep and __real_usleep
+#                                            the linker's --wrap convention requires names
+#                                            such as __wrap_usleep and __real_usleep
 #   concurrency-mt-unsafe                    flags strerror/getopt style calls made only from
 #                                            main() before the scheduler starts
 #   readability-redundant-casting            a cast that is redundant on x86-64 is needed where
@@ -45,5 +45,5 @@ Checks: >
   -readability-magic-numbers,
   -readability-redundant-casting
 WarningsAsErrors: '*'
-HeaderFilterRegex: '.*/(lib|app|platform|tests)/.*'
+HeaderFilterRegex: '.*/(lib|app|platform|tests|config)/.*'
 FormatStyle: file

@@ -1,13 +1,14 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Log sink for the host: lines go into a ring and a thread outside the scheduler writes them
- * out. A task therefore never calls stdio or blocks on a file descriptor, which on the POSIX
- * port could deadlock the scheduler (see posix_platform.h).
+ * out. A task therefore never writes to a stream or a file descriptor and never takes a
+ * stream lock, which on the POSIX port could deadlock the scheduler (see posix_platform.h).
+ * Formatting a line with vsnprintf() into a buffer on the task's stack is all a task does.
  *
  * The ring is single-producer, so producers are serialised with a spin flag. A context that
  * the scheduler can switch out (a task) takes the flag only inside a critical section, so it
- * can never be descheduled by FreeRTOS while holding it. External threads take it directly:
- * they run in parallel with the scheduler and always get to release it.
+ * can never be descheduled by FreeRTOS while holding it. External threads take it directly;
+ * they are not subject to the FreeRTOS scheduler, only to the host's.
  */
 #include "posix_platform.h"
 
@@ -68,7 +69,9 @@ void posix_log_sink(const char *line, size_t len)
     }
 
     while (atomic_flag_test_and_set_explicit(&s_producer_busy, memory_order_acquire)) {
-        /* spin: the holder is running on another core and is about to release the flag */
+        /* Spin. The holder needs the flag for one ring push and is normally running on
+         * another core. If the host has descheduled it, this wait lasts until it runs again;
+         * a task spins here inside a critical section, so ticks are late by that much. */
     }
 
     pushed = spsc_ring_push(&s_ring, &record);

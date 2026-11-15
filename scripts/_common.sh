@@ -16,8 +16,9 @@ export FCN_ROOT FCN_BUILD_ROOT FCN_VENV
 # Keep Python bytecode out of the source tree.
 export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-$FCN_BUILD_ROOT/pycache}"
 
-# Directories that hold project C code (third_party/ is never analysed or reformatted).
-FCN_CODE_DIRS=(lib app platform tests)
+# Directories that hold project C code (third_party/ is never analysed or reformatted, and
+# scripts/selftest/ holds code that is wrong on purpose).
+FCN_CODE_DIRS=(lib app platform tests config)
 
 fcn_python() {
     if [[ -x "$FCN_VENV/bin/python" ]]; then

@@ -10,10 +10,12 @@
  *
  * Two properties of that loop make FreeRTOS time fall behind real time:
  *
- *   1. The sleep is relative, so every tick lasts the period plus the loop's own latency. On
- *      the development laptop a nominal 1 ms tick took 1.14 to 1.25 ms.
- *   2. SIGALRM is not queued. A tick raised while the previous one is still pending, or aimed
- *      at a thread that was switched out in the meantime, is lost.
+ *   1. The sleep is relative, so every tick lasts the period plus the loop's own latency.
+ *      results/platform_timing.json (tick.stock) has the measured size of the error.
+ *   2. SIGALRM is not queued. A tick raised while the previous one is still pending merges
+ *      with it, and the kernel counts one tick where two were due. (A tick aimed at a thread
+ *      that was switched out in the meantime is not lost: it stays pending on that thread
+ *      and is counted late, when its task next runs.)
  *
  * The kernel is a pinned, unmodified submodule, so the correction is applied at link time:
  * the executables are linked with -Wl,--wrap=usleep, which routes the port's call to
@@ -22,10 +24,13 @@
  * counted. A lost tick therefore shortens the next sleep and is made up, and the tick count
  * tracks CLOCK_MONOTONIC instead of drifting away from it.
  *
- * What cannot be fixed from here: if the host stops the whole process for longer than
- * MAX_CATCH_UP_TICKS, the missing ticks are given up rather than replayed as a burst (a burst
- * would make every periodic task run back to back). Those are counted as dropped_ticks and
- * reported, because they are host noise the measurements have to own up to.
+ * What cannot be fixed from here: whenever the kernel's count trails the wall clock by more
+ * than MAX_CATCH_UP_TICKS, the missing ticks are given up rather than replayed as a burst (a
+ * burst would make every periodic task run back to back). That happens when the host does not
+ * run the task threads for that long, for whatever reason: a loaded machine, a stopped
+ * process, and equally a task that keeps a critical section for several milliseconds. The
+ * ticks given up are counted as dropped_ticks and reported with every measurement, because a
+ * run that dropped ticks did not keep time and has to say so.
  */
 #include "posix_platform.h"
 
@@ -155,7 +160,8 @@ int __wrap_usleep(useconds_t usec)
         const uint64_t lag = expected - counted;
 
         if (lag > MAX_CATCH_UP_TICKS) {
-            /* The host stalled the process. Shift the time base instead of bursting. */
+            /* The task threads did not run for too long to make up. Shift the time base
+             * instead of bursting. */
             const uint64_t excess = lag - 1ULL;
 
             start_ns += excess * period_ns;

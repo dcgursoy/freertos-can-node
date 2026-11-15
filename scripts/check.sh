@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Everything that has to pass before a commit, in the order CI runs it.
+# The checks that have to pass before a commit, in the order CI runs them.
 #   scripts/check.sh
+#
+# CI (.github/workflows/ci.yml) runs these same scripts and, around them, the steps that only
+# make sense on the runner: it checks the executable bits in the git index, creates and
+# verifies the SocketCAN interface vcan0, and runs the timing benchmark for the record.
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 here="$FCN_ROOT/scripts"
 
@@ -23,6 +27,9 @@ step "coverage of lib/"
 
 step "system tests"
 "$here/test-system.sh"
+
+step "bug log: every entry can be re-created and is still caught"
+"$here/buglog-verify.sh"
 
 echo
 echo "check: all steps passed"

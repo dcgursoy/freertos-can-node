@@ -12,8 +12,12 @@
  *  - A thread that the port did not create is invisible to the scheduler. It must block all
  *    signals (posix_external_thread_setup) and must never call a FreeRTOS API, not even the
  *    FromISR variants: nothing would stop the kernel's data from being modified under it.
- *  - Functions of the C library that take a lock (stdio, malloc) must not be called from
- *    tasks: a task switched out while it holds the lock deadlocks the next task that wants it.
+ *  - Functions of the C library that take a lock (stdio streams, malloc) must not be called
+ *    by a task where it can be switched out: a task switched out while it holds the lock
+ *    deadlocks the next task that wants it. Tasks here never write to a stream and never
+ *    allocate from the C library; formatting into a stack buffer with vsnprintf() takes no
+ *    lock, and the one call that does allocate (in plat_task_enter()) is made inside a
+ *    critical section.
  *
  * The models of the peripherals therefore live in external threads and talk to tasks through
  * lock-free rings plus a simulated interrupt (posix_irq_raise).
@@ -39,7 +43,7 @@ typedef enum {
 
 typedef enum {
     POSIX_IRQ_SIGNAL = 0, /**< deliver simulated interrupts with a signal (default) */
-    POSIX_IRQ_POLL = 1    /**< only poll for them in the tick hook, i.e. up to 1 tick late */
+    POSIX_IRQ_POLL = 1    /**< only poll for them in the tick hook: served at the next tick */
 } posix_irq_mode_t;
 
 typedef struct {
@@ -91,6 +95,7 @@ typedef struct {
     uint64_t signals_sent;       /**< of those, how many had to send a signal */
     uint64_t serviced_by_signal; /**< dispatch passes that found work, from the signal handler */
     uint64_t serviced_by_tick;   /**< dispatch passes that found work, from the tick hook */
+    uint32_t max_nesting;        /**< deepest nesting of the signal handler: 1, or 0 if unused */
 } posix_irq_stats_t;
 
 void posix_irq_get_stats(posix_irq_stats_t *out);
@@ -102,7 +107,7 @@ typedef struct {
     bool tick_thread_seen;  /**< the wrapper recognised the port's tick thread */
     uint64_t signals_sent;  /**< tick signals the port's thread has raised */
     uint64_t catch_ups;     /**< extra signals sent to make up for a lost tick */
-    uint64_t dropped_ticks; /**< ticks given up after a host stall too long to make up */
+    uint64_t dropped_ticks; /**< ticks given up because the count had fallen too far behind */
 } posix_tick_stats_t;
 
 void posix_tick_get_stats(posix_tick_stats_t *out);

@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """Measure the two host mechanisms that all of the node's timing rests on.
 
+Everything measured here is the timing of a Linux host running the FreeRTOS POSIX port, not of
+a microcontroller: the platform layer removes the port's systematic errors, the host's
+scheduler still decides when a thread runs.
+
 1. Tick accuracy. The FreeRTOS POSIX port generates its tick with a relative sleep and so
    runs slow against the wall clock; platform/posix/posix_tick.c locks the tick count to
    CLOCK_MONOTONIC. Both are measured with a 10 ms periodic task.
 2. Simulated interrupt latency. Time from a peripheral model raising an interrupt line to the
    task it wakes, with signal delivery and with tick-hook polling
    (platform/posix/posix_irq.c), while a mid-priority task loads the scheduler.
+3. Interrupt storm. The same line raised in a tight loop for a few seconds: every raise is
+   served and interrupt handlers never stack up on a task's stack.
 
 Runs the release build of tests/platform/plat_selftest and writes
 results/platform_timing.json and results/platform_timing.png.
 
-    python bench/platform_timing.py                 # 10 s per run, about 45 s in total
-    python bench/platform_timing.py --seconds 60    # longer runs, about 4 minutes
+    python bench/platform_timing.py                 # 10 s per run, about a minute in total
+    python bench/platform_timing.py --seconds 60    # longer runs, about 4.5 minutes
     python bench/platform_timing.py --replot        # redraw the figure from the last run
 """
 from __future__ import annotations
@@ -30,6 +36,7 @@ import numpy as np
 from fcn_tools import paths, plotstyle, results
 
 IRQ_PERIOD_US = 250  # about the frame rate of a saturated 500 kbit/s CAN bus
+STORM_SECONDS_MAX = 5
 
 
 def run_selftest(binary: Path, args: list[str], timeout: float) -> tuple[dict, np.ndarray]:
@@ -48,7 +55,7 @@ def run_selftest(binary: Path, args: list[str], timeout: float) -> tuple[dict, n
 
 
 def measure(binary: Path, seconds: int) -> tuple[dict, dict]:
-    data: dict = {"seconds_per_run": seconds, "tick": {}, "interrupt": {}}
+    data: dict = {"seconds_per_run": seconds, "tick": {}, "interrupt": {}, "interrupt_storm": {}}
     raw: dict = {}
     timeout = seconds * 3 + 30
 
@@ -66,6 +73,7 @@ def measure(binary: Path, seconds: int) -> tuple[dict, dict]:
             "tick_signals_sent": report["signals_sent"],
             "catch_up_ticks": report["catch_ups"],
             "dropped_ticks": report["dropped_ticks"],
+            "unaccounted_time_percent": report["unaccounted_time_percent"],
             "wake_interval_of_10ms_task_us": results.percentiles(samples, 1e3),
         }
 
@@ -75,13 +83,32 @@ def measure(binary: Path, seconds: int) -> tuple[dict, dict]:
             binary, ["irq", mode, str(IRQ_PERIOD_US), str(seconds), "1"], timeout)
         raw[f"irq_{mode}"] = samples
         data["interrupt"][mode] = {
-            "mean_raise_period_us": IRQ_PERIOD_US,
+            "nominal_raise_period_us": report["nominal_period_us"],
+            "mean_raise_period_us": report["mean_raise_period_us"],
             "raised": report["raised"],
-            "seen_by_task": report["seen_by_task"],
-            "lost": report["raised"] - report["seen_by_task"],
+            "task_wakeups": report["task_wakeups"],
+            "unserved_at_end": report["unserved_at_end"],
             "serviced_by_signal_handler": report["serviced_by_signal"],
             "serviced_by_tick_hook": report["serviced_by_tick"],
+            "max_handler_nesting": report["max_handler_nesting"],
+            "latency_samples_not_recorded": report["latency_samples_not_recorded"],
             "latency_us": results.percentiles(samples, 1e3),
+        }
+
+    # An interrupt storm: the source raises in a tight loop. What matters here is not a
+    # latency but that the node survives it: every raise served, handlers never stacked.
+    storm_seconds = min(seconds, STORM_SECONDS_MAX)
+    for mode in ("signal", "poll"):
+        print(f"interrupt storm, {mode} mode, {storm_seconds} s ...", flush=True)
+        report, _ = run_selftest(binary, ["irq", mode, "0", str(storm_seconds), "1"], timeout)
+        data["interrupt_storm"][mode] = {
+            "seconds": storm_seconds,
+            "raised": report["raised"],
+            "raises_per_second": round(report["raised"] / storm_seconds),
+            "task_wakeups": report["task_wakeups"],
+            "unserved_at_end": report["unserved_at_end"],
+            "max_handler_nesting": report["max_handler_nesting"],
+            "stack_peak_max_bytes": report["stack_peak_max_bytes"],
         }
 
     return data, raw
@@ -176,9 +203,16 @@ def main() -> int:
         print(f"tick {mode:6s}: {tick['effective_tick_period_us']:9.3f} us per tick "
               f"({tick['error_percent']:+.3f} %)")
     for mode in ("signal", "poll"):
-        lat = data["interrupt"][mode]["latency_us"]
-        print(f"irq  {mode:6s}: p50 {lat['p50']} us, p99 {lat['p99']} us, max {lat['max']} us, "
-              f"lost {data['interrupt'][mode]['lost']}")
+        irq = data["interrupt"][mode]
+        lat = irq["latency_us"]
+        print(f"irq  {mode:6s}: one per {irq['mean_raise_period_us']:.1f} us, p50 {lat['p50']} us, "
+              f"p99 {lat['p99']} us, max {lat['max']} us, unserved {irq['unserved_at_end']}")
+    for mode in ("signal", "poll"):
+        storm = data["interrupt_storm"][mode]
+        print(f"storm {mode:6s}: {storm['raises_per_second']} raises/s, "
+              f"{storm['task_wakeups']} wake-ups, handler nesting {storm['max_handler_nesting']}, "
+              f"stack peak {storm['stack_peak_max_bytes']} bytes, "
+              f"unserved {storm['unserved_at_end']}")
     print(f"wrote {json_path} and {png_path}")
     return 0
 

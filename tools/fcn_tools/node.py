@@ -66,8 +66,10 @@ class NodeProcess:
             *self.args,
         ]
         # A session of its own: a Ctrl-C aimed at the test runner must not reach the node
-        # behind the test's back. FCN_DIE_WITH_PARENT makes the kernel kill the node if this
-        # process dies, so a crashed test run cannot leave nodes behind.
+        # behind the test's back. FCN_DIE_WITH_PARENT carries this process's id: the node
+        # asks the kernel to kill it when its parent exits, so a crashed test run leaves no
+        # nodes behind. (The kernel ties that to the thread that started the node: start
+        # nodes from a thread that outlives them, as the main thread does.)
         # stdout and stderr go to files, not pipes: nobody reads a pipe while the node runs,
         # and a full pipe would block the node.
         with open(self.workdir / f"{self.name}.stdout.txt", "wb") as out, \
@@ -75,7 +77,7 @@ class NodeProcess:
             self._proc = subprocess.Popen(
                 command, cwd=self.workdir, stdin=subprocess.DEVNULL,
                 stdout=out, stderr=err, start_new_session=True,
-                env=dict(os.environ, FCN_DIE_WITH_PARENT="1"),
+                env=dict(os.environ, FCN_DIE_WITH_PARENT=str(os.getpid())),
             )
         _LIVE.add(self)
         return self

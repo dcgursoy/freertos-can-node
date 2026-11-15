@@ -58,7 +58,10 @@ void plat_task_enter(const char *name);
 /** Peak stack depth of one registered task. */
 typedef struct {
     char name[16];
-    uint32_t peak_bytes; /**< deepest use seen since plat_task_enter() */
+    /** Deepest use seen since plat_task_enter(). The measurement has a floor: use below it
+     *  is reported as the floor itself. On the host the floor is 512 bytes (4096 in a
+     *  sanitizer build), so that value means "at most that much". */
+    uint32_t peak_bytes;
     uint32_t size_bytes; /**< total stack available to the task */
 } plat_stack_info_t;
 

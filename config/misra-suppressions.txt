@@ -1,19 +1,12 @@
 // MISRA C:2012 deviations for lib/ and app/, in cppcheck suppression syntax.
 // Each entry is explained in docs/misra-deviations.md. Keep the two files in step.
+// An entry is added when a finding exists and a deviation is the right answer to it, never
+// in advance: a suppression with nothing behind it would wave the first real violation through.
 
 // Rule 1.4 (emergent language features): the project is written in C11 on purpose and uses
 // <stdatomic.h> for its lock-free ring and _Noreturn for the reset functions. Rule 1.4 comes
 // from Amendment 2, which predates MISRA's own guidance for C11 (MISRA C:2023 permits both).
 misra-c2012-1.4
-
-// Advisory rule 15.5 (single point of exit): not adopted project-wide. Early returns are
-// used for argument checks where they make a function shorter and clearer.
-misra-c2012-15.5
-
-// Advisory rule 8.7 (no external linkage when used in one unit only): the modules under lib/
-// are libraries; their public functions are called by other modules and by the unit tests,
-// which the analysis of one program configuration cannot see.
-misra-c2012-8.7
 
 // Advisory rule 8.9 (define an object at block scope if only one function uses it): the
 // statically allocated kernel objects and buffers of a module are declared together at file
