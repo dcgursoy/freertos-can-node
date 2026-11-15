@@ -1,0 +1,96 @@
+{
+  "schema": "fcn.result/platform_timing/1",
+  "provenance": {
+    "generated_utc": "2026-11-15T07:00:46+00:00",
+    "command": "python bench/platform_timing.py --seconds 60",
+    "git_commit": "2c5cddb93bdfb5254c05bebe08920910bfdb98fb",
+    "git_modified_files": [],
+    "host": {
+      "kernel": "6.6.87.2-microsoft-standard-WSL2",
+      "is_wsl": true,
+      "machine": "x86_64",
+      "cpu": "Intel(R) Core(TM) Ultra 7 258V",
+      "logical_cpus": 8,
+      "python": "3.12.3"
+    }
+  },
+  "seconds_per_run": 60,
+  "tick": {
+    "stock": {
+      "nominal_tick_period_us": 1000.0,
+      "effective_tick_period_us": 1060.672,
+      "error_percent": 6.067,
+      "drift_over_run_us": 3639091.5,
+      "tick_signals_sent": 60010,
+      "catch_up_ticks": 0,
+      "dropped_ticks": 0,
+      "wake_interval_of_10ms_task_us": {
+        "n": 5998,
+        "mean": 10606.717,
+        "min": 9753.651,
+        "p50": 10534.456,
+        "p90": 11037.187,
+        "p99": 11647.035,
+        "p99_9": 12277.36,
+        "max": 18443.034
+      }
+    },
+    "locked": {
+      "nominal_tick_period_us": 1000.0,
+      "effective_tick_period_us": 1000.0,
+      "error_percent": 0.0,
+      "drift_over_run_us": 26.9,
+      "tick_signals_sent": 60050,
+      "catch_up_ticks": 74,
+      "dropped_ticks": 0,
+      "wake_interval_of_10ms_task_us": {
+        "n": 5998,
+        "mean": 10000.004,
+        "min": 6842.869,
+        "p50": 10001.248,
+        "p90": 10141.983,
+        "p99": 10299.807,
+        "p99_9": 10823.216,
+        "max": 13313.078
+      }
+    }
+  },
+  "interrupt": {
+    "signal": {
+      "mean_raise_period_us": 250,
+      "raised": 179939,
+      "seen_by_task": 179939,
+      "lost": 0,
+      "serviced_by_signal_handler": 172079,
+      "serviced_by_tick_hook": 7588,
+      "latency_us": {
+        "n": 179475,
+        "mean": 55.067,
+        "min": 6.233,
+        "p50": 42.629,
+        "p90": 99.544,
+        "p99": 199.472,
+        "p99_9": 497.155,
+        "max": 4037.848
+      }
+    },
+    "poll": {
+      "mean_raise_period_us": 250,
+      "raised": 178272,
+      "seen_by_task": 178272,
+      "lost": 0,
+      "serviced_by_signal_handler": 0,
+      "serviced_by_tick_hook": 59896,
+      "latency_us": {
+        "n": 59866,
+        "mean": 828.322,
+        "min": 17.484,
+        "p50": 828.855,
+        "p90": 995.11,
+        "p99": 1132.5,
+        "p99_9": 1871.262,
+        "max": 14936.378
+      }
+    }
+  }
+}
