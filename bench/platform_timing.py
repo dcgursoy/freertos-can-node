@@ -13,6 +13,7 @@ results/platform_timing.json and results/platform_timing.png.
 
     python bench/platform_timing.py                 # 10 s per run, about 45 s in total
     python bench/platform_timing.py --seconds 60    # longer runs, about 4 minutes
+    python bench/platform_timing.py --replot        # redraw the figure from the last run
 """
 from __future__ import annotations
 
@@ -90,8 +91,8 @@ def plot(raw: dict, data: dict, path: Path) -> None:
     import matplotlib.pyplot as plt
 
     plotstyle.apply()
-    fig, (ax_tick, ax_irq) = plt.subplots(1, 2, figsize=(10.0, 4.1))
-    fig.subplots_adjust(left=0.07, right=0.98, top=0.8, bottom=0.19, wspace=0.22)
+    fig, (ax_tick, ax_irq) = plt.subplots(1, 2, figsize=(10.0, 4.3))
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.76, bottom=0.18, wspace=0.22)
     series = {"locked": ("locked tick (this project)", plotstyle.SERIES[0]),
               "stock": ("stock POSIX port", plotstyle.SERIES[1])}
 
@@ -132,7 +133,7 @@ def plot(raw: dict, data: dict, path: Path) -> None:
     ax_irq.set_ylabel("interrupts served within (%)")
     plotstyle.legend_above(ax_irq)
 
-    host = "WSL2" if results.provenance()["host"]["is_wsl"] else "Linux"
+    host = "WSL2" if data["provenance"]["host"]["is_wsl"] else "Linux"
     plotstyle.footnote(fig, f"bench/platform_timing.py, {data['seconds_per_run']} s per run, "
                             f"FreeRTOS POSIX port on a {host} host. Host timing, not MCU timing.")
     plotstyle.save(fig, path)
@@ -141,7 +142,23 @@ def plot(raw: dict, data: dict, path: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--seconds", type=int, default=10, help="duration of each of the 4 runs")
+    parser.add_argument("--replot", action="store_true",
+                        help="only redraw the plot from the samples of the last run")
     args = parser.parse_args()
+
+    json_path = paths.results_dir() / "platform_timing.json"
+    png_path = json_path.with_suffix(".png")
+    # The raw samples are kept next to the build, not in the repository; --replot redraws the
+    # figure from them without measuring again.
+    raw_path = paths.build_root() / "bench" / "platform_timing_raw.npz"
+
+    if args.replot:
+        if not (json_path.exists() and raw_path.exists()):
+            print("nothing to replot: run without --replot first", file=sys.stderr)
+            return 1
+        plot(dict(np.load(raw_path)), json.loads(json_path.read_text()), png_path)
+        print(f"redrew {png_path}")
+        return 0
 
     binary = paths.selftest_binary("release")
     if not binary.exists():
@@ -149,9 +166,10 @@ def main() -> int:
         return 1
 
     data, raw = measure(binary, args.seconds)
-    json_path = results.write_result("platform_timing", data)
-    png_path = json_path.with_suffix(".png")
-    plot(raw, data, png_path)
+    results.write_result("platform_timing", data)
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(raw_path, **raw)
+    plot(raw, json.loads(json_path.read_text()), png_path)
 
     for mode in ("stock", "locked"):
         tick = data["tick"][mode]

@@ -78,11 +78,12 @@ def reference_line(ax, x: float, label: str) -> None:
 
 
 def legend_above(ax) -> None:
-    """Put the legend in a row between the title and the plot, where it cannot cover data."""
-    ax.title.set_position((0.0, 1.0))
-    ax.set_title(ax.get_title(), pad=26)
-    ax.legend(loc="lower left", bbox_to_anchor=(-0.01, 1.0), ncol=2, borderaxespad=0.2,
-              handlelength=1.6, columnspacing=1.6)
+    """Stack the legend between the title and the plot, where it cannot cover data."""
+    handles, labels = ax.get_legend_handles_labels()
+    rows = max(len(labels), 1)
+    ax.set_title(ax.get_title(loc="left"), loc="left", pad=10 + 13 * rows)
+    ax.legend(handles, labels, loc="lower left", bbox_to_anchor=(-0.01, 1.0), ncol=1,
+              borderaxespad=0.2, handlelength=1.6, labelspacing=0.3)
 
 
 def footnote(fig, text: str) -> None:

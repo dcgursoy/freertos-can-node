@@ -29,8 +29,9 @@ jobs:
       - name: Scripts are executable in the repository
         # The work tree is edited on Windows, where the file mode cannot be seen; a script
         # committed without its executable bit would only fail here, on Linux.
+        # (_common.sh is sourced by the others, never run, and stays non-executable.)
         run: |
-          bad="$(git ls-files -s 'scripts/*.sh' | grep -v '^100755' || true)"
+          bad="$(git ls-files -s 'scripts/*.sh' | grep -v '/_common\.sh$' | grep -v '^100755' || true)"
           if [ -n "$bad" ]; then echo "not executable in the index:"; echo "$bad"; exit 1; fi
 
       - name: Install packages
