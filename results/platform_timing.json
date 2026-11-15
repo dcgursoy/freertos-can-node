@@ -1,9 +1,9 @@
 {
   "schema": "fcn.result/platform_timing/1",
   "provenance": {
-    "generated_utc": "2026-11-15T07:00:46+00:00",
+    "generated_utc": "2026-11-15T09:09:35+00:00",
     "command": "python bench/platform_timing.py --seconds 60",
-    "git_commit": "2c5cddb93bdfb5254c05bebe08920910bfdb98fb",
+    "git_commit": "e4a3773d08e59748335f3d0a4d2f601a7529eeb7",
     "git_modified_files": [],
     "host": {
       "kernel": "6.6.87.2-microsoft-standard-WSL2",
@@ -14,83 +14,112 @@
       "python": "3.12.3"
     }
   },
+  "host_timing_note": "Measured on the FreeRTOS POSIX port, where every task is a thread of a Linux process. Times, jitter and latencies are those of the host's scheduler and are not what the same code shows on a microcontroller; counts, orderings and sizes of protocol data are independent of the host.",
   "seconds_per_run": 60,
   "tick": {
     "stock": {
       "nominal_tick_period_us": 1000.0,
-      "effective_tick_period_us": 1060.672,
-      "error_percent": 6.067,
-      "drift_over_run_us": 3639091.5,
-      "tick_signals_sent": 60010,
+      "effective_tick_period_us": 1097.11,
+      "error_percent": 9.711,
+      "drift_over_run_us": 5824674.1,
+      "tick_signals_sent": 60143,
       "catch_up_ticks": 0,
       "dropped_ticks": 0,
+      "unaccounted_time_percent": 8.851,
       "wake_interval_of_10ms_task_us": {
         "n": 5998,
-        "mean": 10606.717,
-        "min": 9753.651,
-        "p50": 10534.456,
-        "p90": 11037.187,
-        "p99": 11647.035,
-        "p99_9": 12277.36,
-        "max": 18443.034
+        "mean": 10971.103,
+        "min": 9339.889,
+        "p50": 10762.971,
+        "p90": 11231.845,
+        "p99": 16069.931,
+        "p99_9": 31645.093,
+        "max": 47609.507
       }
     },
     "locked": {
       "nominal_tick_period_us": 1000.0,
-      "effective_tick_period_us": 1000.0,
-      "error_percent": 0.0,
-      "drift_over_run_us": 26.9,
-      "tick_signals_sent": 60050,
-      "catch_up_ticks": 74,
-      "dropped_ticks": 0,
+      "effective_tick_period_us": 1001.152,
+      "error_percent": 0.115,
+      "drift_over_run_us": 69080.4,
+      "tick_signals_sent": 60426,
+      "catch_up_ticks": 564,
+      "dropped_ticks": 69,
+      "unaccounted_time_percent": 0.0,
       "wake_interval_of_10ms_task_us": {
         "n": 5998,
-        "mean": 10000.004,
-        "min": 6842.869,
-        "p50": 10001.248,
-        "p90": 10141.983,
-        "p99": 10299.807,
-        "p99_9": 10823.216,
-        "max": 13313.078
+        "mean": 10011.517,
+        "min": 5057.024,
+        "p50": 9999.838,
+        "p90": 10115.444,
+        "p99": 10296.924,
+        "p99_9": 15236.851,
+        "max": 29452.733
       }
     }
   },
   "interrupt": {
     "signal": {
-      "mean_raise_period_us": 250,
-      "raised": 179939,
-      "seen_by_task": 179939,
-      "lost": 0,
-      "serviced_by_signal_handler": 172079,
-      "serviced_by_tick_hook": 7588,
+      "nominal_raise_period_us": 250,
+      "mean_raise_period_us": 249.728,
+      "raised": 241450,
+      "task_wakeups": 233629,
+      "unserved_at_end": 0,
+      "serviced_by_signal_handler": 222569,
+      "serviced_by_tick_hook": 13757,
+      "max_handler_nesting": 1,
+      "latency_samples_not_recorded": 0,
       "latency_us": {
-        "n": 179475,
-        "mean": 55.067,
-        "min": 6.233,
-        "p50": 42.629,
-        "p90": 99.544,
-        "p99": 199.472,
-        "p99_9": 497.155,
-        "max": 4037.848
+        "n": 233352,
+        "mean": 73.88,
+        "min": 0.163,
+        "p50": 58.709,
+        "p90": 126.444,
+        "p99": 248.977,
+        "p99_9": 865.408,
+        "max": 15963.046
       }
     },
     "poll": {
-      "mean_raise_period_us": 250,
-      "raised": 178272,
-      "seen_by_task": 178272,
-      "lost": 0,
+      "nominal_raise_period_us": 250,
+      "mean_raise_period_us": 249.728,
+      "raised": 241252,
+      "task_wakeups": 59289,
+      "unserved_at_end": 0,
       "serviced_by_signal_handler": 0,
-      "serviced_by_tick_hook": 59896,
+      "serviced_by_tick_hook": 59430,
+      "max_handler_nesting": 0,
+      "latency_samples_not_recorded": 0,
       "latency_us": {
-        "n": 59866,
-        "mean": 828.322,
-        "min": 17.484,
-        "p50": 828.855,
-        "p90": 995.11,
-        "p99": 1132.5,
-        "p99_9": 1871.262,
-        "max": 14936.378
+        "n": 59191,
+        "mean": 883.415,
+        "min": 4.309,
+        "p50": 876.532,
+        "p90": 1012.016,
+        "p99": 1621.305,
+        "p99_9": 4591.274,
+        "max": 18127.677
       }
+    }
+  },
+  "interrupt_storm": {
+    "signal": {
+      "seconds": 5,
+      "raised": 53410248,
+      "raises_per_second": 10682050,
+      "task_wakeups": 995135,
+      "unserved_at_end": 0,
+      "max_handler_nesting": 1,
+      "stack_peak_max_bytes": 2056
+    },
+    "poll": {
+      "seconds": 5,
+      "raised": 71647006,
+      "raises_per_second": 14329401,
+      "task_wakeups": 4981,
+      "unserved_at_end": 0,
+      "max_handler_nesting": 0,
+      "stack_peak_max_bytes": 1992
     }
   }
 }
