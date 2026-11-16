@@ -54,6 +54,34 @@ function(fcn_add_platform_test name)
         ENVIRONMENT "${_fcn_sanitizer_env}")
 endfunction()
 
+# ---------------------------------------------------------------- host I/O without a kernel
+# Unity tests of the parts of the host layer that do not need FreeRTOS.
+#   test_can_backend  the UDP datagram format, the UDP bus between participants, and
+#                     SocketCAN on vcan0 (reported as "ignored" where the machine has no
+#                     vcan0, as a failure where FCN_REQUIRE_SOCKETCAN is set, as in CI)
+#   test_posix_sim    the simulation control protocol
+foreach(_test IN ITEMS can_backend posix_sim)
+    add_executable(test_${_test} test_${_test}.c)
+    target_compile_definitions(test_${_test} PRIVATE _POSIX_C_SOURCE=200809L)
+    target_link_libraries(test_${_test} PRIVATE fcn_host_io unity)
+    fcn_target_defaults(test_${_test} NO_COVERAGE)
+    add_test(NAME platform_${_test} COMMAND test_${_test})
+    set_tests_properties(platform_${_test} PROPERTIES
+        LABELS "platform" TIMEOUT 60 ENVIRONMENT "${_fcn_sanitizer_env}")
+endforeach()
+
+# ------------------------------------------------- the CAN controller without a scheduler
+# The test plays the driver: it calls plat_can.h itself and polls, against the real hardware
+# thread on a UDP bus of its own, with faults applied through simulation control.
+add_executable(test_posix_can test_posix_can.c)
+target_compile_definitions(test_posix_can PRIVATE _POSIX_C_SOURCE=200809L)
+target_link_libraries(test_posix_can PRIVATE fcn_platform_posix unity)
+fcn_target_defaults(test_posix_can NO_COVERAGE)
+add_test(NAME platform_posix_can COMMAND test_posix_can)
+set_tests_properties(platform_posix_can PROPERTIES
+    LABELS "platform" TIMEOUT 60 ENVIRONMENT "${_fcn_sanitizer_env}")
+
+# ---------------------------------------------------------------- self-tests under FreeRTOS
 set(_dir "${CMAKE_CURRENT_BINARY_DIR}")
 
 # The tick: locked mode keeps time and drops few ticks; stock mode leaves the tick alone.

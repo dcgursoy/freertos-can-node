@@ -12,6 +12,13 @@ matrix, a qualified tool and a review process that a portfolio project does not 
 accurate statement is: *checked with cppcheck's MISRA addon, with the deviations listed
 here.*
 
+Two more rules are not evaluated, although the addon implements them: rule 2.5 (unused macro)
+and rule 8.7 (external linkage for a function used in one translation unit only). They need
+a view of the whole program, and cppcheck 2.13 does not run the addon's whole-program rules
+when it is driven from a compile database, which is how this project runs it. Naming the
+files on the command line instead makes it report them: constants of the public headers that
+no module uses, and library functions that have a single caller. Both rules are advisory.
+
 The host simulation code in `platform/posix` and the tests are not in the MISRA scope: they
 are Linux programs built on signals, pthreads and stdio. They are still subject to cppcheck's
 regular checks and to clang-tidy.

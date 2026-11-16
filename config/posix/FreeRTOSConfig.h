@@ -93,7 +93,7 @@
     } while (0)
 
 /* ------------------------------------------------------------------ optional functions */
-#define INCLUDE_vTaskPrioritySet            0
+#define INCLUDE_vTaskPrioritySet            1 /* used once: the final statistics (app.c) */
 #define INCLUDE_uxTaskPriorityGet           1
 #define INCLUDE_vTaskDelete                 1 /* needed by vTaskEndScheduler() */
 #define INCLUDE_vTaskSuspend                1 /* needed to block with portMAX_DELAY */

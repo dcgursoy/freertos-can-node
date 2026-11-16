@@ -23,6 +23,7 @@ scripts/buglog-verify.sh
 | [001](#001-the-stack-report-read-the-stack-of-a-task-that-no-longer-existed) | 0 | The stack report read the idle task's stack after the kernel had deleted the task | system test of the node's statistics |
 | [002](#002-interrupt-handlers-could-stack-up-until-the-task-stack-overflowed) | 0 | Simulated interrupt handlers could run on top of each other without bound; an interrupt storm overflowed the task's stack | interrupt-storm self-test written during the review of phase 0 |
 | [003](#003-a-suspended-scheduler-made-the-tick-run-fast-and-then-stand-still) | 0 | While a task held the scheduler suspended, the locked tick took the kernel's deferred ticks for lost ones: time ran several times too fast, then stood still | suspended-scheduler self-test written during the review of phase 0 |
+| [004](#004-a-short-set-at-the-instant-a-received-frame-was-due-to-start-let-the-frame-through) | 1 | In the CAN controller model, a bus short set exactly at the start of a queued received frame took effect a frame late, and the frame was delivered | unit test of the controller model |
 
 ---
 
@@ -161,3 +162,35 @@ both changed.)
 **Evidence.** [failing output](buglog/003-tick-count-while-suspended/failing-output.txt),
 [patch that re-creates the bug](buglog/003-tick-count-while-suspended/reintroduce.patch).
 The bug is in commits `323055e` to `e6db709`.
+
+## 004 A short set at the instant a received frame was due to start let the frame through
+
+**Found** 2026-11-15, by the unit tests of the CAN controller model while it was written
+(phase 1). The test `test_a_received_frame_due_to_start_at_the_instant_of_a_short_never_passes`
+queues two received frames back to back and shorts the bus exactly at the start of frame of
+the second.
+
+```
+test_can_ctrl.c:1185:test_a_received_frame_due_to_start_at_the_instant_of_a_short_never_passes:FAIL: Expected 1006000 Was 1106000:next wake-up
+```
+
+The short took effect 50 bit times late, after the second frame, and that frame was delivered
+to the driver although the bus was shorted at its start of frame.
+
+**Cause.** A fault set while a frame is on the wire takes effect after that frame
+(`lib/can/can_ctrl.h`, "A fault that begins or ends while a frame is on the wire takes effect
+from the next frame"). To find "the frames on the wire", `free_after_started()` walks the queue
+of received frames and stops at the first one that has not started yet. Its test was
+`start_ns > at_ns`, so a frame starting at exactly the instant of the fault counted as already
+started. Everywhere else the model applies an input before the events of its own instant: a
+transmission due to start at the instant a fault is set starts under the fault. The two rules
+disagreed at a single nanosecond.
+
+**Fix.** `start_ns >= at_ns`: a frame due to start at the instant of the fault has not started.
+The rule is now written next to the function.
+
+**Regression test.** The test that found it, in `tests/unit/test_can_ctrl.c`.
+
+**Evidence.** [failing output](buglog/004-fault-at-the-start-of-a-queued-frame/failing-output.txt),
+[patch that re-creates the bug](buglog/004-fault-at-the-start-of-a-queued-frame/reintroduce.patch).
+The bug never reached a commit.

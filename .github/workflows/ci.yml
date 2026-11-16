@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   check:
-    name: Analyse, build, test (Ubuntu 24.04)
+    name: Analyse, build, test (Ubuntu 24.04, real SocketCAN)
     # Pinned on purpose: ubuntu-latest moves between releases, and the toolchain versions
     # (gcc 13, cppcheck 2.13, clang-tidy 18) are part of what the results depend on.
     runs-on: ubuntu-24.04
@@ -21,6 +21,9 @@ jobs:
     env:
       FCN_BUILD_ROOT: ${{ github.workspace }}/build
       FCN_VENV: ${{ github.workspace }}/.venv
+      # Every test that runs on both transports must run on SocketCAN here: without vcan0 it
+      # fails instead of being skipped, as it is on a laptop that has no vcan module.
+      FCN_REQUIRE_SOCKETCAN: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -47,8 +50,9 @@ jobs:
           python3 --version
 
       - name: Bring up vcan0 and verify that it carries a frame
-        # This step fails the job unless a frame sent with cansend arrives in candump. The
-        # runner's kernel has vcan built as a module; the script falls back to
+        # Real SocketCAN: this step fails the job unless a frame sent with cansend arrives in
+        # candump, and the tests below run the node and its transports on this interface.
+        # The runner's kernel has vcan built as a module; the script falls back to
         # linux-modules-extra only where an image keeps it there.
         run: scripts/vcan-up.sh --verify --install-modules-extra
 

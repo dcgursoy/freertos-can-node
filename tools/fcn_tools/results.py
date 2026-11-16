@@ -117,7 +117,10 @@ def percentiles(samples, unit_divisor: float = 1.0) -> dict:
         return {"n": 0}
 
     def pct(q: float):
-        if n * (1.0 - q / 100.0) < 5.0:
+        # In whole tenths of a percent, so that the boundary itself is exact: in binary
+        # floating point 50 * (1 - 0.9) is 4.999..., which would withhold p90 at n = 50.
+        tenths = round(q * 10)
+        if n * (1000 - tenths) < 5000:
             return None
         return round(float(np.percentile(values, q)), 3)
 

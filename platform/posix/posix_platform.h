@@ -119,6 +119,60 @@ typedef struct {
 
 void posix_tick_get_stats(posix_tick_stats_t *out);
 
+/* ------------------------------------------------------------- the CAN controller hardware */
+
+/**
+ * Open the transport named by `backend_spec` ("udp:29500", "socketcan:vcan0") and start the
+ * hardware thread that runs the controller model on it. `bitrate` 0 switches pacing off.
+ * Call after posix_platform_init() and before the scheduler starts. On failure returns
+ * false with a message for the user in `error`.
+ */
+bool posix_can_start(const char *backend_spec, uint32_t bitrate, char *error, size_t error_len);
+
+/** Stop the hardware thread and close the transport. Call after the scheduler has ended. */
+void posix_can_stop(void);
+
+typedef struct {
+    uint64_t frames_paced;       /**< transmitted frames the figures below cover */
+    uint64_t pacing_lag_max_ns;  /**< worst lateness of a write against the modelled end of frame */
+    uint64_t pacing_lag_mean_ns; /**< mean of the same */
+    uint32_t rx_fifo_overruns;   /**< received frames lost because the driver did not drain */
+    uint32_t event_fifo_overruns; /**< transmit outcomes that found the event FIFO full: 0, by
+                                       the argument at the top of posix_can.c */
+    uint32_t state_events_merged; /**< state changes not queued when they happened because the
+                                       driver was far behind; the latest state was sent later */
+} posix_can_stats_t;
+
+void posix_can_get_stats(posix_can_stats_t *out);
+
+/** Everything the hardware side counted, for the end-of-run report. Only valid after
+ *  posix_can_stop(): the model is then no longer being changed by its thread. */
+typedef struct {
+    const char *transport; /**< "udp" or "socketcan" */
+    uint32_t bitrate;
+    uint64_t elapsed_ns; /**< how long the hardware thread ran */
+    uint8_t state;       /**< final error state, PLAT_CAN_* numbering */
+    uint16_t tec;
+    uint16_t rec;
+    uint64_t tx_frames;
+    uint64_t tx_attempts_failed;
+    uint64_t tx_aborted;
+    uint64_t rx_frames;
+    uint64_t rx_errors;
+    uint64_t rx_lost_fault;
+    uint64_t wire_overruns;
+    uint64_t bus_off_events;
+    uint64_t late_resyncs;
+    uint64_t busy_ns;
+    uint64_t transport_tx_frames;
+    uint64_t transport_tx_failed;
+    uint64_t transport_rx_frames;
+    uint64_t transport_rx_malformed;
+    uint64_t transport_rx_overflow;
+} posix_can_report_t;
+
+void posix_can_get_report(posix_can_report_t *out);
+
 /* -------------------------------------------------------------------------------- logging */
 
 /** Number of log lines discarded because the log ring was full. */

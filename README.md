@@ -7,17 +7,17 @@ measurements on CAN and takes fail-safe A/B firmware updates over the same bus. 
 as a Linux process on the FreeRTOS POSIX port, and its CAN controller, flash and sensors are
 simulated around it, so that all of it builds, runs and is tested on a laptop and in CI.
 
-> **Work in progress: phase 0 of 8 is done.** This page is a placeholder until the last
-> phase. The sections below describe only what exists today and quote no results; the final
-> README will take every number from `results/*.json`.
+> **Work in progress: phases 0 and 1 of 8 are done.** This page is a placeholder until the
+> last phase. The sections below describe only what exists today and quote no results; the
+> final README will take every number from `results/*.json`.
 
 ## Where the project stands
 
 | Phase | Content | State |
 |---|---|---|
 | 0 | Repository, FreeRTOS kernel, build presets, host platform layer, unit tests, sanitizers, coverage, static analysis, CI | done |
-| 1 | CAN stack: CRCs, frame bit timing, controller model, SocketCAN and UDP backends | next |
-| 2 | Application: tasks and IPC, DBC, end-to-end protection, telemetry | |
+| 1 | CAN stack: CRCs, frame bit timing, controller model with fault confinement, transmit queue, SocketCAN and UDP transports, CAN tasks | done |
+| 2 | Application: tasks and IPC, DBC, end-to-end protection, telemetry | next |
 | 3 | Fault handling: trouble codes, watchdogs, bus-off recovery | |
 | 4 | Simulated NOR flash, bootloader, A/B update logic | |
 | 5 | ISO-TP, UDS download, end-to-end update | |
@@ -62,6 +62,38 @@ simulated around it, so that all of it builds, runs and is tested on a laptop an
   [bench/platform_timing.py](bench/platform_timing.py): tick accuracy and interrupt latency
   of the host platform layer on the development laptop. Host timing, as said above.
 
+## What phase 1 adds
+
+The node now has a CAN path from a task to the bus and back. As a stand-in for the telemetry
+of phase 2 it sends a status frame every 10 ms and answers a ping frame.
+[docs/can-simulation.md](docs/can-simulation.md) describes the simulated bus in full.
+
+- **Transports** ([platform/posix/can_backend.h](platform/posix/can_backend.h)). Linux
+  SocketCAN, and a virtual bus over UDP on the loopback interface for machines without the
+  `vcan` kernel module. The node and every Python tool select one with the same string
+  (`socketcan:vcan0`, `udp:29500`). The UDP bus is also a python-can interface
+  ([tools/fcn_tools/udpbus.py](tools/fcn_tools/udpbus.py)).
+- **Controller model** ([lib/can](lib/can)). A socket delivers instantly and never fails; a
+  bus does neither. The model puts every frame on one timeline with its exact stuffed length
+  at the configured bit rate, sends the highest-priority mailbox first, and applies the fault
+  confinement rules of the Bosch CAN specification (error counters, error passive, bus off,
+  recovery) to faults that the test bench injects as physical conditions: a shorted bus, a
+  bus held dominant, a missing acknowledgement.
+- **Transmit queue** ([lib/can/can_txq.h](lib/can/can_txq.h)). One latest-value slot per
+  cyclic message and a bounded FIFO with a timeout for frames that must not be replaced, with
+  exact accounting of every frame, and the bus-off policy: empty the mailboxes, keep
+  accepting frames, ask for recovery after a hold-off that backs off. Frames that go stale in
+  a mailbox during a fault that never reaches bus off are called back, so what the bus sees
+  after any fault is current data.
+- **CAN tasks** ([app/can_io.c](app/can_io.c)). A receive task and a transmit task behind one
+  interrupt handler, connected to it by task notifications.
+- **Simulation control** ([platform/posix/posix_sim.h](platform/posix/posix_sim.h)). Faults are
+  applied to the simulated hardware through a channel of its own, the way a test bench works
+  on a real device; the application has no test hooks.
+- **Tests.** Unit tests of every module of `lib/can` and `lib/crc` against published vectors
+  and independent Python implementations; system tests that run every bus test on both
+  transports (CI refuses to skip SocketCAN).
+
 ## Build and test
 
 Ubuntu 24.04 (natively, or under WSL2):
@@ -104,12 +136,13 @@ platform/        include/ is what the application expects from a platform;
                  posix/ implements it on Linux under the FreeRTOS POSIX port
 config/          FreeRTOSConfig.h, MISRA deviation list
 cmake/           the compiler settings every project target gets
-tests/           unit/ (Unity), platform/ (self-tests of the host layer), system/ (pytest)
-tools/           Python package: process control, result files, plot style
+tests/           unit/ (Unity), platform/ (tests of the host layer), python/ (pytest, tools),
+                 system/ (pytest, the node as a process), tools/ (C helpers the tests call)
+tools/           Python package: node and bus control, UDP bus for python-can, result files
 bench/           measurement scripts; they write results/
 results/         measured data (JSON with provenance) and plots; host timing only
 scripts/         one script per build, test and analysis step
-docs/            bug log, MISRA deviations, notes on WSL
+docs/            the simulated CAN bus, bug log, MISRA deviations, notes on WSL
 third_party/     FreeRTOS-Kernel and Unity, pinned submodules
 ```
 
@@ -120,9 +153,9 @@ The project is developed on Windows with WSL2. Two things are worth knowing ther
 - Keep build trees and the Python environment on the Linux filesystem, not on the Windows
   drive: set `FCN_BUILD_ROOT` and `FCN_VENV` (for example to `~/fcn-build` and `~/.venvs/fcn`)
   before running the scripts.
-- The stock WSL2 kernel has no `vcan` module. Nothing needs it yet;
-  [docs/wsl-vcan.md](docs/wsl-vcan.md) shows how to add it for the SocketCAN transport that
-  phase 1 brings.
+- The stock WSL2 kernel has no `vcan` module. Everything runs on the UDP bus without it, and
+  the SocketCAN half of the tests is skipped; [docs/wsl-vcan.md](docs/wsl-vcan.md) shows how
+  to add the module and run that half too.
 
 ## Licence
 

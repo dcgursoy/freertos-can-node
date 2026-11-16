@@ -1,11 +1,25 @@
 # Host simulation layer under the FreeRTOS POSIX port.
-#
+find_package(Threads REQUIRED)
+
+# The parts of the host layer that know nothing about FreeRTOS: the CAN transports (SocketCAN,
+# UDP) and the simulation control socket. A library of their own, so that their tests link
+# without a kernel.
+add_library(fcn_host_io STATIC
+    can_backend.c
+    can_backend_socketcan.c
+    can_backend_udp.c
+    posix_sim.c)
+target_include_directories(fcn_host_io PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+# struct ifreq and the SO_RXQ_OVFL socket option.
+target_compile_definitions(fcn_host_io PRIVATE _GNU_SOURCE)
+target_link_libraries(fcn_host_io PUBLIC fcn_can)
+fcn_target_defaults(fcn_host_io)
+
 # An OBJECT library on purpose: the kernel calls back into this code (hooks, the assert
 # handler, the wrapped usleep), and with a static archive whether those definitions get linked
 # would depend on the order of the archives on the link line. Objects are always linked whole.
-find_package(Threads REQUIRED)
-
 add_library(fcn_platform_posix OBJECT
+    posix_can.c
     posix_clock.c
     posix_hooks.c
     posix_irq.c
@@ -18,10 +32,11 @@ target_include_directories(fcn_platform_posix PUBLIC
     "${CMAKE_SOURCE_DIR}/platform/include"
     "${CMAKE_CURRENT_SOURCE_DIR}")
 
-# pthread_getattr_np, pthread_setattr_default_np, pthread_setname_np and clock_nanosleep.
+# pthread_getattr_np, pthread_setattr_default_np, pthread_setname_np, clock_nanosleep, ppoll.
 target_compile_definitions(fcn_platform_posix PRIVATE _GNU_SOURCE)
 
-target_link_libraries(fcn_platform_posix PUBLIC freertos_kernel fcn_ring fcn_log Threads::Threads)
+target_link_libraries(fcn_platform_posix PUBLIC
+    freertos_kernel fcn_host_io fcn_can fcn_ring fcn_log Threads::Threads)
 
 # Two calls of the port are intercepted at link time: the tick thread's sleep (posix_tick.c)
 # and the signal mask changes (posix_irq.c). Each file says why.

@@ -10,6 +10,7 @@ import time
 import pytest
 
 from fcn_tools.node import EXIT_OK
+from fcn_tools.timing import check_timing
 
 
 def test_version_names_the_node_and_the_kernel(node_binary):
@@ -20,11 +21,29 @@ def test_version_names_the_node_and_the_kernel(node_binary):
     assert "FreeRTOS V11.3.3" in out.stdout
 
 
-def test_unknown_option_is_a_usage_error(node_binary):
-    out = subprocess.run([str(node_binary), "--tick-mode", "nonsense"], capture_output=True,
-                         text=True, timeout=10)
+def test_help_lists_every_option(node_binary):
+    out = subprocess.run([str(node_binary), "--help"], capture_output=True, text=True, timeout=10)
+    assert out.returncode == 0
+    for option in ("--can", "--bitrate", "--sim-port", "--duration-s", "--stats-json",
+                   "--tick-mode", "--irq-mode", "--log-file", "--log-level", "--version"):
+        assert option in out.stdout
+
+
+@pytest.mark.parametrize("args, message", [
+    (["--no-such-option"], "unrecognized option"),
+    (["--stat-json", "x.json"], "unrecognized option"),      # a typo must not be ignored
+    (["--duration-s", "1", "stray"], "unexpected argument: stray"),
+    (["--duration-s", "2x"], "invalid --duration-s"),
+    (["--duration-s", "86401"], "invalid --duration-s"),
+    (["--duration-s", "-1"], "invalid --duration-s"),
+    (["--tick-mode", "nonsense"], "invalid --tick-mode"),
+    (["--irq-mode", "nonsense"], "invalid --irq-mode"),
+    (["--log-level", "loud"], "invalid --log-level"),
+])
+def test_a_bad_command_line_is_a_usage_error(node_binary, args, message):
+    out = subprocess.run([str(node_binary), *args], capture_output=True, text=True, timeout=10)
     assert out.returncode == 1
-    assert "invalid --tick-mode" in out.stderr
+    assert message in out.stderr
 
 
 def test_runs_for_the_requested_time_and_reports_statistics(start_node):
@@ -40,10 +59,13 @@ def test_runs_for_the_requested_time_and_reports_statistics(start_node):
     assert stats["log_lines_dropped"] == 0
 
     tasks = {task["name"]: task for task in stats["tasks"]}
-    assert {"ticker", "health", "IDLE"} <= set(tasks)
-    assert tasks["ticker"]["priority"] > tasks["health"]["priority"] > tasks["IDLE"]["priority"]
+    assert set(tasks) == {"can_rx", "ticker", "can_tx", "health", "IDLE"}
+    # Priorities as documented in app/app.c, highest first.
+    by_priority = sorted(tasks, key=lambda name: tasks[name]["priority"], reverse=True)
+    assert by_priority == ["can_rx", "ticker", "can_tx", "health", "IDLE"]
+    assert len({task["priority"] for task in tasks.values()}) == len(tasks)
     assert sum(task["run_time_us"] for task in tasks.values()) <= stats["run_time_total_us"]
-    # A node that only blinks is idle nearly all the time.
+    # A node that sends one frame every 10 ms is idle nearly all the time.
     assert tasks["IDLE"]["run_time_us"] > 0.5 * stats["run_time_total_us"]
     # Every task registered its real stack, and none of them is anywhere near its limit.
     for task in tasks.values():
@@ -58,12 +80,15 @@ def test_runs_for_the_requested_time_and_reports_statistics(start_node):
 @pytest.mark.parametrize("stop_signal", [signal.SIGTERM, signal.SIGINT])
 def test_a_stop_signal_ends_the_node_through_its_orderly_path(start_node, stop_signal):
     node = start_node()
-    time.sleep(0.5)
-    assert node.running
+    # The simulated hardware answers as soon as the node is up: no sleeping to wait for it.
+    with node.sim(timeout=0.5) as sim:
+        assert sim.ping() == node.pid
     node.send_signal(stop_signal)
-    assert node.wait(timeout=5) == EXIT_OK
+    # Longer than the shutdown guard (POSIX_SHUTDOWN_TIMEOUT_MS, 5 s), so that a stop that
+    # hangs is reported with the guard's exit status 70 and not as a timeout of this test.
+    assert node.wait(timeout=8) == EXIT_OK
     assert "scheduler stopped" in node.log()
-    assert node.stats()["tick"]["count"] >= 400
+    assert node.stats()["schema"] == "fcn.node_stats/1"     # it went through write_stats()
 
 
 @pytest.mark.timing
@@ -77,14 +102,36 @@ def test_the_tick_tracks_the_wall_clock(start_node):
     # starting and stopping the scheduler, so this bound is loose; the platform self-test
     # checks the same identity precisely.
     period_us = stats["elapsed_ns"] / 1000 / (tick["count"] + tick["dropped"])
-    assert 970 <= period_us <= 1030, (
-        f"one accounted tick period took {period_us:.1f} us ({tick['dropped']} dropped)")
+    check_timing(970 <= period_us <= 1030,
+                 f"one accounted tick period took {period_us:.1f} us ({tick['dropped']} dropped)")
+    # A dropped tick is excused only as long as there are few: the count comes from the tick
+    # code itself, and without a bound a tick that runs slow and books the difference as
+    # dropped would pass. 2 % is 60 ticks here; a busy laptop drops about 0.1 %.
+    check_timing(tick["dropped"] <= 0.02 * tick["count"],
+                 f"{tick['dropped']} of {tick['count']} ticks dropped")
 
 
-def test_the_stock_tick_mode_still_runs(start_node):
-    node = start_node("--duration-s", "1", "--tick-mode", "stock")
+@pytest.mark.parametrize("option, value", [("--tick-mode", "stock"), ("--irq-mode", "poll")])
+def test_the_alternative_platform_modes_still_run(start_node, option, value):
+    node = start_node("--duration-s", "1", option, value)
     assert node.wait(timeout=20) == EXIT_OK
-    assert node.stats()["tick"]["mode"] == "stock"
+    stats = node.stats()
+    tick, irq = stats["tick"], stats["irq"]
+    # The tick statistics report the mode the tick code ran in, not the option echoed back.
+    assert tick["mode"] == ("stock" if value == "stock" else "locked")
+    if value == "stock":
+        # The unmodified port never makes up for a tick and never gives one up.
+        assert tick["catch_ups"] == 0 and tick["dropped"] == 0
+    if value == "poll":
+        # Polling only: no signal is ever sent, and every interrupt is served from the tick.
+        assert irq["signals_sent"] == 0 and irq["serviced_by_signal"] == 0
+        assert irq["serviced_by_tick"] > 0
+    else:
+        assert irq["signals_sent"] > 0 and irq["serviced_by_signal"] > 0
+    # The CAN path works in every mode: one status frame per 10 ticks of the node's time.
+    assert abs(stats["can"]["controller"]["tx_frames"] - tick["count"] / 10) <= 3
+    # Simulated interrupt handlers never run on top of each other (docs/bug-log.md, 002).
+    assert irq["max_nesting"] == (1 if value != "poll" else 0)
 
 
 # A harness passes its process id in FCN_DIE_WITH_PARENT; see platform/posix/node_main.c.
@@ -99,18 +146,25 @@ os._exit(0)              # the harness dies without stopping its node
 
 
 def _process_exists(pid: int) -> bool:
+    """True while the process runs. A zombie (killed, not yet reaped by its new parent) is
+    dead: os.kill(pid, 0) would still succeed for it, and whether it is reaped soon depends
+    on who the parent is, not on the node."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as stat:
+            # The state follows the command name, which is in parentheses and may contain
+            # spaces: take the first field after the last ')'.
+            state = stat.read().rsplit(")", 1)[1].split()[0]
+    except (FileNotFoundError, ProcessLookupError, IndexError):
         return False
-    return True
+    return state not in ("Z", "X")
 
 
-def test_a_node_is_killed_when_the_harness_that_started_it_dies(node_binary):
+def test_a_node_is_killed_when_the_harness_that_started_it_dies(node_binary, ports):
     # The duration only bounds the damage if this test fails: the node then ends by itself.
-    harness = subprocess.run([sys.executable, "-c", _START_A_NODE_AND_DIE, str(node_binary),
-                              "--duration-s", "30"],
-                             capture_output=True, text=True, timeout=20)
+    harness = subprocess.run(
+        [sys.executable, "-c", _START_A_NODE_AND_DIE, str(node_binary), "--can",
+         f"udp:{ports.bus}", "--duration-s", "30"],
+        capture_output=True, text=True, timeout=20)
     node_pid = int(harness.stdout.strip())
 
     deadline = time.monotonic() + 5.0
@@ -123,9 +177,10 @@ def test_a_node_is_killed_when_the_harness_that_started_it_dies(node_binary):
             os.kill(node_pid, signal.SIGKILL)
 
 
-def test_a_node_whose_harness_is_gone_before_it_looks_does_not_run(node_binary):
+def test_a_node_whose_harness_is_gone_before_it_looks_does_not_run(node_binary, ports):
     # The process id of a parent that this node does not have: what the node sees when its
     # harness died before the node could ask the kernel to be killed with it.
-    out = subprocess.run([str(node_binary), "--duration-s", "5"], capture_output=True, text=True,
-                         timeout=10, env=dict(os.environ, FCN_DIE_WITH_PARENT="1"))
+    out = subprocess.run([str(node_binary), "--duration-s", "5", "--can", f"udp:{ports.bus}"],
+                         capture_output=True, text=True, timeout=10,
+                         env=dict(os.environ, FCN_DIE_WITH_PARENT="1"))
     assert out.returncode == 1

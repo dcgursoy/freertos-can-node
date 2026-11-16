@@ -20,6 +20,12 @@ def node_binary(preset: str = "release") -> Path:
     return Path(override) if override else build_root() / preset / "bin" / "fcn_node"
 
 
+def tool_binary(name: str, preset: str = "release") -> Path:
+    """A program of tests/tools/, for example "can_bits_cli": the build puts them next to the
+    node. They exist only to be run from a build tree by the tests, so there is no override."""
+    return build_root() / preset / "bin" / name
+
+
 def selftest_binary(preset: str = "release") -> Path:
     override = os.environ.get("FCN_SELFTEST")
     if override:

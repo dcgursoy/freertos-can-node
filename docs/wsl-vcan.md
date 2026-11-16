@@ -1,9 +1,11 @@
 # SocketCAN on WSL2: enabling `vcan` (optional)
 
-Nothing in this project needs this step. The CAN transports arrive with phase 1: one over UDP
-on the loopback interface, which needs no kernel support and is the default, and one on
-SocketCAN, which CI exercises on GitHub's runners. This page is for running the SocketCAN
-transport on a Windows laptop as well.
+Nothing in this project needs this step. The node has two CAN transports
+([can-simulation.md](can-simulation.md)): one over UDP on the loopback interface, which needs
+no kernel support and is the default, and one on SocketCAN. Every test that involves the bus
+runs on both; on a machine without `vcan0` the SocketCAN half is skipped, and CI, where the
+interface exists, refuses to skip it. This page is for running the SocketCAN half on a
+Windows laptop as well.
 
 ## The check
 
