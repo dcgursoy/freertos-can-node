@@ -64,6 +64,11 @@ jobs:
       - name: Unit tests and platform self-tests under ASan and UBSan
         run: scripts/test-unit.sh asan
 
+      - name: Unit tests that start threads, under ThreadSanitizer
+        # The script switches address-space randomisation off for the test run (setarch -R),
+        # which the runtime of gcc 13 needs on kernels with vm.mmap_rnd_bits above 28.
+        run: scripts/test-tsan.sh
+
       - name: Coverage of lib/ (gate on lines and branches)
         run: scripts/coverage.sh
 
@@ -76,7 +81,10 @@ jobs:
       - name: Platform timing on this runner (reported, not gated)
         # A shared runner keeps time poorly; a timing self-test that fails here is recorded
         # in the step's log and does not fail the job. The gated timing tests are in the test
-        # steps above, where a failed one is repeated once before it counts.
+        # steps above, where one that misses its timing tolerance (exit status 75) is repeated
+        # once by its own CTest command; any other failure counts at once. The benchmark builds
+        # the release preset itself and refuses a binary whose build id (commit plus a hash of
+        # the uncommitted changes) is not the checked-out tree's.
         continue-on-error: true
         run: |
           "$FCN_VENV/bin/python" bench/platform_timing.py --seconds 5
@@ -91,6 +99,7 @@ jobs:
           if-no-files-found: warn
           path: |
             build/asan/test-results/
+            build/tsan/test-results/
             build/coverage/coverage/
             build/system-test/
             build/analysis/*.log

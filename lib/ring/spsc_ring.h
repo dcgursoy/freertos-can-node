@@ -15,6 +15,23 @@
  * The indices are free-running 32-bit counters; the element slot is `index & mask`. The
  * number of stored elements is `head - tail` in modular arithmetic, which stays correct when
  * the counters wrap around.
+ *
+ * What the tests can and cannot see (tests/unit/test_spsc_ring.c, scripts/test-tsan.sh):
+ *
+ *  - The unit tests catch an element published before it is written, a slot freed before it
+ *    is read, a fill level that is not clamped, and spsc_ring_count() loading head before
+ *    tail. These are races, caught only when the threads interleave the right way: with a CPU
+ *    for every thread each of them failed every run, pinned to one or two CPUs some runs miss
+ *    them. A pass on a small or busy host is weaker evidence than a pass on a large one.
+ *  - On x86-64 every load is an acquire and every store a release, so the unit tests pass with
+ *    all orderings relaxed. ThreadSanitizer checks the C11 rules instead: for each of the four
+ *    orderings in push and pop made relaxed, it reports a data race on the element storage.
+ *  - Nothing tests the acquire on the two loads in spsc_ring_count(). No element is read on
+ *    the strength of a count (push and pop load the other side's index themselves), so
+ *    ThreadSanitizer has no race to report, and x86-64 keeps the loads in order anyway. What
+ *    the acquire on the tail load is for is the bound that other contexts get on a weakly
+ *    ordered CPU: it keeps the head load after it, and makes that load see at least the head
+ *    the consumer had seen when it stored that tail.
  */
 #ifndef FCN_SPSC_RING_H
 #define FCN_SPSC_RING_H
@@ -55,7 +72,10 @@ bool spsc_ring_pop(spsc_ring_t *ring, void *elem);
  *
  *  - the consumer never gets more than are stored: it can pop at least that many;
  *  - the producer never gets fewer than are stored: at least capacity - count slots are free;
- *  - any other context gets an estimate, good for a fill-level display and nothing more.
+ *  - any other context gets an estimate, good for a fill-level display and nothing more. It
+ *    is never more than the elements stored when the call began plus those pushed during it,
+ *    because tail is loaded before head; loaded the other way round, a consumer that catches
+ *    up between the two loads would make a nearly empty ring read as full.
  */
 uint32_t spsc_ring_count(const spsc_ring_t *ring);
 

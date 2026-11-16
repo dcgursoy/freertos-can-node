@@ -152,8 +152,11 @@ A side effect: the tick thread no longer reads a kernel variable it has no busin
 
 **Regression test.** `plat_selftest suspend <ms>` suspends the scheduler for the given time
 and fails unless the tick count advanced by the time that passed, both during the suspension
-and in the 100 ms after it. CTest runs it with 20 ms (`platform_tick_suspended_scheduler`).
-With the fix: 20 ticks during, 100 after, no replacement tick raised.
+and in the second after it (the task blocks for 1000 ticks, and their wall time is compared
+with them). CTest runs it with 20 ms (`platform_tick_suspended_scheduler`). With the fix:
+20 ticks during, 1000 after. (Until the review of the tests the second interval was 100 ms
+of busy-waiting with a tolerance of 3 ticks; see `tests/platform/plat_selftest.c` for why
+both changed.)
 
 **Evidence.** [failing output](buglog/003-tick-count-while-suspended/failing-output.txt),
 [patch that re-creates the bug](buglog/003-tick-count-while-suspended/reintroduce.patch).

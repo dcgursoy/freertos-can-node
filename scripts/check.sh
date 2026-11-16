@@ -22,6 +22,9 @@ step "build: debug and release, warnings as errors"
 step "unit tests and platform self-tests under ASan + UBSan"
 "$here/test-unit.sh" asan
 
+step "unit tests that start threads, under ThreadSanitizer"
+"$here/test-tsan.sh"
+
 step "coverage of lib/"
 "$here/coverage.sh"
 

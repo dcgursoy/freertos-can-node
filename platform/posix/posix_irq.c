@@ -30,6 +30,11 @@
  * period. In POSIX_IRQ_SIGNAL mode it is a safety net, so that a line raised while delivery
  * was disabled is served at the next tick. How late that can be is the host's decision, not
  * a property of this code; results/platform_timing.json has the measured distribution.
+ *
+ * Because the safety net serves whatever the signal path misses, a broken signal path would
+ * look like a slow one. The self-tests therefore switch the net off for one case
+ * (posix_irq_test_set_tick_fallback, a test-only switch) and require that every signal was
+ * served by the signal handler alone.
  */
 #include "posix_platform.h"
 
@@ -57,6 +62,9 @@ static _Atomic uint64_t s_signals_sent;
 static _Atomic uint64_t s_serviced_by_signal;
 static _Atomic uint64_t s_serviced_by_tick;
 static _Atomic uint32_t s_max_nesting;
+/* Test-only (posix_irq_test_set_tick_fallback): false switches the tick hook's safety net off
+ * in POSIX_IRQ_SIGNAL mode. The node never changes it. */
+static _Atomic bool s_tick_fallback = true;
 
 /* How many frames of irq_signal_handler() are on this thread's stack. It stays set while the
  * thread is parked inside the handler after a context switch. */
@@ -184,9 +192,18 @@ void posix_irq_raise(unsigned int line)
     }
 }
 
+void posix_irq_test_set_tick_fallback(bool enabled)
+{
+    atomic_store(&s_tick_fallback, enabled);
+}
+
 void posix_irq_poll_from_tick(void)
 {
-    if (atomic_load(&s_enabled) && (atomic_load(&s_pending) != 0U)) {
+    /* In signal mode this is only the safety net, and a self-test may have switched it off.
+     * In poll mode it is the delivery path and always runs. */
+    const bool wanted = (s_mode == POSIX_IRQ_POLL) || atomic_load(&s_tick_fallback);
+
+    if (wanted && atomic_load(&s_enabled) && (atomic_load(&s_pending) != 0U)) {
         BaseType_t woken = pdFALSE;
 
         /* Called from the tick interrupt: a task made ready here is switched to when the
@@ -204,4 +221,5 @@ void posix_irq_get_stats(posix_irq_stats_t *out)
     out->serviced_by_signal = atomic_load(&s_serviced_by_signal);
     out->serviced_by_tick = atomic_load(&s_serviced_by_tick);
     out->max_nesting = atomic_load(&s_max_nesting);
+    out->pending = atomic_load(&s_pending);
 }

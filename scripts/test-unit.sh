@@ -4,9 +4,11 @@
 #   scripts/test-unit.sh debug
 # A JUnit report is written to <build>/test-results/.
 #
-# Tests labelled "timing" depend on the host keeping time (for example the tick self-test
-# asserts the tick period within 3 %). They may be repeated once before they count as failed;
-# every other test must pass on the first run.
+# Every test has to pass on its first run. The one exception is decided inside the test, not
+# here: a platform self-test labelled "timing" that misses its timing tolerance because the
+# host did not run it well exits with status 75 and is repeated once by its own CTest command
+# (tests/platform/run_selftest.sh). A crash, a sanitizer report or a wrong result is never
+# repeated.
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 preset="${1:-asan}"
@@ -15,9 +17,4 @@ mkdir -p "$FCN_BUILD_ROOT"
 fcn_build "$preset"
 mkdir -p "$dir/test-results"
 
-status=0
-ctest --test-dir "$dir" -LE timing --output-on-failure \
-    --output-junit "$dir/test-results/ctest.xml" || status=1
-ctest --test-dir "$dir" -L timing --output-on-failure --repeat until-pass:2 \
-    --output-junit "$dir/test-results/ctest-timing.xml" || status=1
-exit "$status"
+ctest --test-dir "$dir" --output-on-failure --output-junit "$dir/test-results/ctest.xml"

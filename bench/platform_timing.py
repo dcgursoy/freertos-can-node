@@ -9,13 +9,20 @@ scheduler still decides when a thread runs.
    runs slow against the wall clock; platform/posix/posix_tick.c locks the tick count to
    CLOCK_MONOTONIC. Both are measured with a 10 ms periodic task.
 2. Simulated interrupt latency. Time from a peripheral model raising an interrupt line to the
-   task it wakes, with signal delivery and with tick-hook polling
+   task it wakes, for every raise, with signal delivery and with tick-hook polling
    (platform/posix/posix_irq.c), while a mid-priority task loads the scheduler.
 3. Interrupt storm. The same line raised in a tight loop for a few seconds: every raise is
    served and interrupt handlers never stack up on a task's stack.
 
-Runs the release build of tests/platform/plat_selftest and writes
-results/platform_timing.json and results/platform_timing.png.
+Builds the release preset first (scripts/build.sh release), so the binary measured is the one
+the tree describes, then runs its tests/platform/plat_selftest and writes
+results/platform_timing.json and results/platform_timing.png. The self-test reports the build
+id it was compiled with (computed at build time: the commit and, for a tree with uncommitted
+changes, a hash of those changes); a result is only written if that id equals the id of the
+tree its provenance records, as the tree is when the result is written: the commit and the
+content of the uncommitted changes, not only whether there are any. FCN_SELFTEST names
+another binary to measure; nothing is built then, and the same check applies, so a binary
+built from a different set of uncommitted changes is refused as well.
 
     python bench/platform_timing.py                 # 10 s per run, about a minute in total
     python bench/platform_timing.py --seconds 60    # longer runs, about 4.5 minutes
@@ -24,6 +31,7 @@ results/platform_timing.json and results/platform_timing.png.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -37,6 +45,7 @@ from fcn_tools import paths, plotstyle, results
 
 IRQ_PERIOD_US = 250  # about the frame rate of a saturated 500 kbit/s CAN bus
 STORM_SECONDS_MAX = 5
+TIMING_MISSED = 75  # plat_selftest: the host did not keep time well enough for the test
 
 
 def run_selftest(binary: Path, args: list[str], timeout: float) -> tuple[dict, np.ndarray]:
@@ -47,21 +56,26 @@ def run_selftest(binary: Path, args: list[str], timeout: float) -> tuple[dict, n
         proc = subprocess.run([str(binary), *args], capture_output=True, text=True,
                               timeout=timeout, env=env)
         if proc.returncode != 0:
-            raise RuntimeError(
-                f"plat_selftest {' '.join(args)} exited {proc.returncode}: {proc.stderr.strip()}")
+            why = (" (a timing tolerance was missed: the host did not run the test well "
+                   "enough to measure it)" if proc.returncode == TIMING_MISSED else "")
+            raise RuntimeError(f"plat_selftest {' '.join(args)} exited {proc.returncode}{why}: "
+                               f"{proc.stderr.strip()}")
         report = json.loads(proc.stdout.strip().splitlines()[-1])
         samples = np.loadtxt(dump, dtype=np.float64, ndmin=1)
     return report, samples
 
 
-def measure(binary: Path, seconds: int) -> tuple[dict, dict]:
+def measure(binary: Path, seconds: int) -> tuple[dict, dict, set[str]]:
+    """Run every measurement; return the data, the raw samples and the build ids reported."""
     data: dict = {"seconds_per_run": seconds, "tick": {}, "interrupt": {}, "interrupt_storm": {}}
     raw: dict = {}
+    build_ids: set[str] = set()
     timeout = seconds * 3 + 30
 
     for mode in ("stock", "locked"):
         print(f"tick, {mode} mode, {seconds} s ...", flush=True)
         report, samples = run_selftest(binary, ["tick", mode, str(seconds)], timeout)
+        build_ids.add(report["build_id"])
         raw[f"tick_{mode}"] = samples
         data["tick"][mode] = {
             "nominal_tick_period_us": report["nominal_tick_period_us"],
@@ -73,6 +87,12 @@ def measure(binary: Path, seconds: int) -> tuple[dict, dict]:
             "tick_signals_sent": report["signals_sent"],
             "catch_up_ticks": report["catch_ups"],
             "dropped_ticks": report["dropped_ticks"],
+            "dropped_ticks_in_measured_span": report["dropped_ticks_in_span"],
+            # Stalls of the whole process, seen by a witness thread outside the scheduler, and
+            # the dropped ticks they do not explain (see plat_selftest.c, "dropped ticks").
+            "host_stalls_seen": report["host_stalls_seen"],
+            "host_stall_us": report["host_stall_us"],
+            "dropped_not_explained_by_host_stalls": report["dropped_unexcused"],
             "unaccounted_time_percent": report["unaccounted_time_percent"],
             "wake_interval_of_10ms_task_us": results.percentiles(samples, 1e3),
         }
@@ -81,6 +101,7 @@ def measure(binary: Path, seconds: int) -> tuple[dict, dict]:
         print(f"interrupt latency, {mode} mode, {seconds} s ...", flush=True)
         report, samples = run_selftest(
             binary, ["irq", mode, str(IRQ_PERIOD_US), str(seconds), "1"], timeout)
+        build_ids.add(report["build_id"])
         raw[f"irq_{mode}"] = samples
         data["interrupt"][mode] = {
             "nominal_raise_period_us": report["nominal_period_us"],
@@ -91,8 +112,10 @@ def measure(binary: Path, seconds: int) -> tuple[dict, dict]:
             "serviced_by_signal_handler": report["serviced_by_signal"],
             "serviced_by_tick_hook": report["serviced_by_tick"],
             "max_handler_nesting": report["max_handler_nesting"],
-            "latency_samples_not_recorded": report["latency_samples_not_recorded"],
-            "latency_us": results.percentiles(samples, 1e3),
+            # One sample per raise: from the raise to the task's first run after it. n is the
+            # number of raises, less those the self-test could not sample (counted here).
+            "raises_without_latency_sample": report["latency_samples_not_recorded"],
+            "raise_to_task_latency_per_interrupt_us": results.percentiles(samples, 1e3),
         }
 
     # An interrupt storm: the source raises in a tight loop. What matters here is not a
@@ -101,6 +124,7 @@ def measure(binary: Path, seconds: int) -> tuple[dict, dict]:
     for mode in ("signal", "poll"):
         print(f"interrupt storm, {mode} mode, {storm_seconds} s ...", flush=True)
         report, _ = run_selftest(binary, ["irq", mode, "0", str(storm_seconds), "1"], timeout)
+        build_ids.add(report["build_id"])
         data["interrupt_storm"][mode] = {
             "seconds": storm_seconds,
             "raised": report["raised"],
@@ -111,7 +135,7 @@ def measure(binary: Path, seconds: int) -> tuple[dict, dict]:
             "stack_peak_max_bytes": report["stack_peak_max_bytes"],
         }
 
-    return data, raw
+    return data, raw, build_ids
 
 
 def plot(raw: dict, data: dict, path: Path) -> None:
@@ -142,28 +166,92 @@ def plot(raw: dict, data: dict, path: Path) -> None:
     ax_tick.set_ylabel("share of wake-ups (%)")
     plotstyle.legend_above(ax_tick)
 
-    # Right: cumulative distribution of interrupt-to-task latency.
+    # Right: cumulative distribution of the latency of every interrupt, raise to task.
     irq_series = {"signal": ("signal delivery", plotstyle.SERIES[0]),
                   "poll": ("tick-hook polling", plotstyle.SERIES[1])}
     for mode in ("signal", "poll"):
         label, colour = irq_series[mode]
         us = np.sort(raw[f"irq_{mode}"]) / 1e3
         share = np.arange(1, us.size + 1) / us.size * 100.0
-        p50 = data["interrupt"][mode]["latency_us"]["p50"]
-        ax_irq.plot(us, share, color=colour, label=f"{label}: median {p50:.0f} µs")
+        stats = data["interrupt"][mode]["raise_to_task_latency_per_interrupt_us"]
+        ax_irq.plot(us, share, color=colour,
+                    label=f"{label}: median {stats['p50']:.0f} µs (n = {stats['n']} raises)")
     ax_irq.set_xscale("log")
     ax_irq.set_xlim(10, 5000)
     ax_irq.set_ylim(0, 100)
     plotstyle.reference_line(ax_irq, 1000.0, "1 tick")
-    ax_irq.set_title("Simulated interrupt: raise to task running")
-    ax_irq.set_xlabel("latency (µs, log scale)")
-    ax_irq.set_ylabel("interrupts served within (%)")
+    ax_irq.set_title("Simulated interrupt: every raise, to the task running")
+    ax_irq.set_xlabel("latency from raise to task (µs, log scale)")
+    ax_irq.set_ylabel("share of interrupts served within (%)")
     plotstyle.legend_above(ax_irq)
 
     host = "WSL2" if data["provenance"]["host"]["is_wsl"] else "Linux"
     plotstyle.footnote(fig, f"bench/platform_timing.py, {data['seconds_per_run']} s per run, "
                             f"FreeRTOS POSIX port on a {host} host. Host timing, not MCU timing.")
     plotstyle.save(fig, path)
+
+
+# The changes that make up a dirty build id; must match cmake/FcnBuildId.cmake exactly.
+DIFF_FOR_BUILD_ID = ["diff", "HEAD", "--binary", "--no-color", "--no-ext-diff", "--no-textconv",
+                     "--no-renames", "--ignore-submodules", "--", ".", ":(exclude)results"]
+
+
+def changes_hash() -> str:
+    """First 12 hex digits of the git blob hash of the tree's uncommitted changes, computed as
+    cmake/FcnBuildId.cmake computes it; "unknown" if git fails."""
+    git = ["git", "-C", str(paths.REPO_ROOT), "--no-optional-locks"]
+    try:
+        diff = subprocess.run([*git, *DIFF_FOR_BUILD_ID], capture_output=True, check=True)
+        blob = subprocess.run([*git, "hash-object", "--stdin"], input=diff.stdout,
+                              capture_output=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    digest = blob.stdout.decode().strip()
+    return digest[:12] if digest else "unknown"
+
+
+def tree_build_id(provenance: dict) -> str:
+    """The build id that a binary built from the tree in `provenance` carries.
+
+    Same rule as cmake/FcnBuildId.cmake: the commit; if tracked files other than results/
+    differ from it, "-dirty-" and the hash of the changes as they are now (changes_hash);
+    "unknown" without git."""
+    commit = provenance["git_commit"]
+    if commit == "unknown":
+        return "unknown"
+    if not provenance["git_modified_files"]:
+        return commit
+    digest = changes_hash()
+    return "unknown" if digest == "unknown" else f"{commit}-dirty-{digest}"
+
+
+def selftest_binary() -> tuple[Path, str]:
+    """Build the release preset unless FCN_SELFTEST names a binary; return it and its origin."""
+    if os.environ.get("FCN_SELFTEST"):
+        return paths.selftest_binary("release"), "FCN_SELFTEST"
+    print("building the release preset (scripts/build.sh release) ...", flush=True)
+    subprocess.run(["bash", str(paths.REPO_ROOT / "scripts" / "build.sh"), "release"],
+                   check=True)
+    return paths.selftest_binary("release"), "scripts/build.sh release"
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def build_id_mismatch(build_ids: set[str], provenance: dict) -> str | None:
+    """Why the binary does not belong to the tree in `provenance`, or None if it does."""
+    expected = tree_build_id(provenance)
+    if expected == "unknown":
+        return "the tree's build id is unknown (no git?), so the binary cannot be tied to it"
+    if build_ids != {expected}:
+        return (f"the self-test reports build id {', '.join(sorted(build_ids))}, but the tree is "
+                f"{expected}: the binary was not built from the tree the result would name")
+    return None
 
 
 def main() -> int:
@@ -187,13 +275,40 @@ def main() -> int:
         print(f"redrew {png_path}")
         return 0
 
-    binary = paths.selftest_binary("release")
+    binary, origin = selftest_binary()
     if not binary.exists():
-        print(f"{binary} not found: run scripts/build.sh release", file=sys.stderr)
+        print(f"{binary} not found", file=sys.stderr)
         return 1
 
-    data, raw = measure(binary, args.seconds)
+    # The binary must not change while it is measured, so its hash is taken before and after.
+    binary_sha256 = sha256_of(binary)
+    data, raw, build_ids = measure(binary, args.seconds)
+    if sha256_of(binary) != binary_sha256:
+        print(f"{binary} changed while it was measured; no result written", file=sys.stderr)
+        return 1
+
+    # Checked against the tree as it is now, just before the provenance is recorded, and again
+    # against the provenance that was actually written.
+    mismatch = build_id_mismatch(build_ids, results.provenance())
+    if mismatch is not None:
+        print(f"no result written: {mismatch}", file=sys.stderr)
+        return 1
+    data["binary"] = {"path": str(binary), "sha256": binary_sha256,
+                      "build_id": next(iter(build_ids)), "origin": origin}
+
+    previous = json_path.read_bytes() if json_path.exists() else None
     results.write_result("platform_timing", data)
+    mismatch = build_id_mismatch(build_ids, json.loads(json_path.read_text())["provenance"])
+    if mismatch is not None:
+        # The tree changed in the moment between the check and the write: put back what was
+        # there, so that no result names a tree its binary was not built from.
+        if previous is None:
+            json_path.unlink()
+        else:
+            json_path.write_bytes(previous)
+        print(f"no result written: {mismatch}", file=sys.stderr)
+        return 1
+
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(raw_path, **raw)
     plot(raw, json.loads(json_path.read_text()), png_path)
@@ -201,19 +316,20 @@ def main() -> int:
     for mode in ("stock", "locked"):
         tick = data["tick"][mode]
         print(f"tick {mode:6s}: {tick['effective_tick_period_us']:9.3f} us per tick "
-              f"({tick['error_percent']:+.3f} %)")
+              f"({tick['error_percent']:+.3f} %), dropped {tick['dropped_ticks_in_measured_span']}")
     for mode in ("signal", "poll"):
         irq = data["interrupt"][mode]
-        lat = irq["latency_us"]
-        print(f"irq  {mode:6s}: one per {irq['mean_raise_period_us']:.1f} us, p50 {lat['p50']} us, "
-              f"p99 {lat['p99']} us, max {lat['max']} us, unserved {irq['unserved_at_end']}")
+        lat = irq["raise_to_task_latency_per_interrupt_us"]
+        print(f"irq  {mode:6s}: one per {irq['mean_raise_period_us']:.1f} us, n {lat['n']} of "
+              f"{irq['raised']} raises, p50 {lat['p50']} us, p99 {lat['p99']} us, "
+              f"max {lat['max']} us, unserved {irq['unserved_at_end']}")
     for mode in ("signal", "poll"):
         storm = data["interrupt_storm"][mode]
         print(f"storm {mode:6s}: {storm['raises_per_second']} raises/s, "
               f"{storm['task_wakeups']} wake-ups, handler nesting {storm['max_handler_nesting']}, "
               f"stack peak {storm['stack_peak_max_bytes']} bytes, "
               f"unserved {storm['unserved_at_end']}")
-    print(f"wrote {json_path} and {png_path}")
+    print(f"wrote {json_path} and {png_path} (binary {data['binary']['build_id']})")
     return 0
 
 

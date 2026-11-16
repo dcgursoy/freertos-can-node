@@ -90,12 +90,19 @@ void posix_irq_poll_from_tick(void);
 /** Allow or stop delivery; the platform enables it around the scheduler's lifetime. */
 void posix_irq_set_enabled(bool enabled);
 
+/** Test-only: false switches off the tick hook's safety net in POSIX_IRQ_SIGNAL mode, so that
+ *  a self-test can show that the signal path alone serves every interrupt. No effect in
+ *  POSIX_IRQ_POLL mode, where the tick hook is the delivery path. The node never calls it.
+ *  Call before the scheduler starts. */
+void posix_irq_test_set_tick_fallback(bool enabled);
+
 typedef struct {
     uint64_t raised;             /**< calls to posix_irq_raise() */
     uint64_t signals_sent;       /**< of those, how many had to send a signal */
     uint64_t serviced_by_signal; /**< dispatch passes that found work, from the signal handler */
     uint64_t serviced_by_tick;   /**< dispatch passes that found work, from the tick hook */
     uint32_t max_nesting;        /**< deepest nesting of the signal handler: 1, or 0 if unused */
+    uint32_t pending;            /**< lines latched now and not yet served, one bit per line */
 } posix_irq_stats_t;
 
 void posix_irq_get_stats(posix_irq_stats_t *out);

@@ -83,12 +83,17 @@ scripts/check.sh
 ```
 
 `scripts/check.sh` runs the checks CI runs: static analysis, the debug and release builds,
-the unit and platform tests under AddressSanitizer and UndefinedBehaviorSanitizer, coverage of
-`lib/`, the system tests and the verification of the bug log. The individual steps are
-`scripts/static-analysis.sh`, `scripts/build.sh`, `scripts/test-unit.sh`,
-`scripts/coverage.sh`, `scripts/test-system.sh` and `scripts/buglog-verify.sh`. CI adds the
-steps that belong to the runner: it checks the executable bits in the git index, creates and
-verifies the SocketCAN interface `vcan0`, and runs the timing benchmark for the record.
+the unit and platform tests under AddressSanitizer and UndefinedBehaviorSanitizer, the unit
+tests that start threads under ThreadSanitizer, coverage of `lib/`, the system tests and the
+verification of the bug log. The individual steps are `scripts/static-analysis.sh`,
+`scripts/build.sh`, `scripts/test-unit.sh`, `scripts/test-tsan.sh`, `scripts/coverage.sh`,
+`scripts/test-system.sh` and `scripts/buglog-verify.sh`. A test whose verdict depends on the
+host keeping time exits with status 75 when only a timing tolerance was missed; that status,
+and nothing else, is repeated once. The ThreadSanitizer runtime of gcc 13 needs address-space
+randomisation off on kernels that randomise mmap with more than 28 bits (WSL2 among them);
+`scripts/test-tsan.sh` turns it off for the test run with `setarch -R`. CI adds the steps that
+belong to the runner: it checks the executable bits in the git index, creates and verifies the
+SocketCAN interface `vcan0`, and runs the timing benchmark for the record.
 
 ## Repository layout
 
