@@ -8,6 +8,7 @@ fcn_tools.timing.check_timing in tests marked `timing`; everything else is exact
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import signal
@@ -356,11 +357,17 @@ print(json.dumps({"before": status, "after": after, "deleted": changed.returncod
 
 
 def _run_in_private_namespace(node_binary, workdir, ports, mode: str) -> dict:
-    """Runs _TRANSPORT_LOST in a user and network namespace of its own and returns its result;
-    skips the test where that cannot be done here."""
+    """Runs _TRANSPORT_LOST in a user and network namespace of its own and returns its result.
+    Where that cannot be done here the test is skipped, or fails if FCN_REQUIRE_SOCKETCAN is
+    set (CI sets it): there a test of the SocketCAN transport that cannot run is a failure."""
+    def cannot_run(message: str) -> None:
+        if os.environ.get("FCN_REQUIRE_SOCKETCAN"):
+            pytest.fail(message, pytrace=False)
+        pytest.skip(message)
+
     reason = _user_namespaces_work()
     if reason is not None:
-        pytest.skip(reason)
+        cannot_run(reason)
 
     out = subprocess.run(
         ["unshare", "-rn", sys.executable, "-c", _TRANSPORT_LOST, str(node_binary), str(workdir),
@@ -369,7 +376,7 @@ def _run_in_private_namespace(node_binary, workdir, ports, mode: str) -> dict:
     assert out.returncode == 0, out.stderr
     result = json.loads(out.stdout.strip().splitlines()[-1])
     if "skip" in result:
-        pytest.skip(f"no vcan interface in a private namespace: {result['skip']}")
+        cannot_run(f"no vcan interface in a private namespace: {result['skip']}")
     assert result["deleted"] == 0, result["deleted_stderr"]
     return result
 

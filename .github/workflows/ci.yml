@@ -56,6 +56,15 @@ jobs:
         # linux-modules-extra only where an image keeps it there.
         run: scripts/vcan-up.sh --verify --install-modules-extra
 
+      - name: Allow unprivileged user namespaces
+        # The tests that delete or take down a vcan interface under the node do it in a user
+        # and network namespace of their own (unshare -rn), so that vcan0 is not touched.
+        # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor; this lifts the
+        # restriction for the job, and the check makes the step fail if it did not take.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare -rn true
+
       - name: Python environment
         run: scripts/setup-python.sh
 
