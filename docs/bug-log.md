@@ -337,11 +337,11 @@ The bug is in commit `b6c3534`.
 with the shortest frames there are, base-format data frames without data. Comparing what the
 controller model delivered with what the driver took, a large part was lost to receive FIFO
 overruns, whether or not a handler was registered for the identifier. With the bug put back,
-the system test added with the fix loses 21.4 % and 11.7 % of the delivered frames, one run
-for each of its two identifiers, with no tick dropped:
+the system test added with the fix loses 22.2 % and 20.8 % of the frames delivered in its
+measurement window, one run for each of its two identifiers, with no tick dropped:
 
 ```
-E           AssertionError: 17546 of 82146 received frames lost to receive FIFO overruns (32.0 frames/ms offered, 20.6 received, bus busy 94%, largest wake-up lag of the hardware thread 0.8 ms; rx_batches_cut 3927, ticks dropped 0)
+E           AssertionError: 9152 of 41155 frames delivered in the window lost to receive FIFO overruns (32.0 frames/ms offered, 20.6 received, bus busy 94%, largest wake-up lag of the hardware thread 1.9 ms; whole run: rx_batches_cut 3968, ticks dropped 0)
 ```
 
 **Cause.** The receive task drains the controller's receive FIFO in batches of at most
@@ -365,19 +365,31 @@ lets the task catch up after a late tick.
 **Regression test.**
 `tests/system/test_node_errors.py::test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_mbit`
 runs once for an identifier nobody handles and once for the ping. A tester offers 32 frames per
-millisecond to a node at 1 Mbit/s until the node ends its 4 s run, and the figures are taken
-over 2 s in the middle. Every frame the model delivered must be accounted for exactly: taken by
-the driver, lost to an overrun, or still in the FIFO at the stop. The model must have delivered
-at least 16.8 frames per millisecond, more than 16 per tick; that is a timing tolerance,
-checked first, since a lighter load says nothing about the receive path. At that rate a receive
-path limited to 16 per tick loses at least 4.8 %, and the test allows 2 %. A fixed node loses
-frames only when the host stalls its tasks for longer than the FIFO lasts (24 ms at full load),
-longer than the 6 ticks the tick code makes up, so such a stall shows as dropped ticks: the 2 %
-limit is a timing tolerance in a run that dropped ticks and a plain assertion in one that did
-not. `test.sh` repeats a run that missed only timing tolerances once, as
-`scripts/test-system.sh` does, and exits with 75 if the repetition misses only timing
-tolerances too; `scripts/buglog-verify.sh` then reports the entry as inconclusive rather than
-caught or broken.
+millisecond to a node at 1 Mbit/s until the node ends its 4 s run. Every frame the model
+delivered must be accounted for exactly: taken by the driver, lost to an overrun, or still in
+the FIFO at the stop. The load and the losses are both measured over the same 2 s window, half a
+second into the load. The model must have delivered at least 16.8 frames per millisecond in the
+window, more than 16 per tick; that is a timing tolerance, checked first, since a lighter load
+says nothing about the receive path. At that rate a receive path limited to 16 per tick loses at
+least 4.8 % of the window's frames, and more than 3 % even if its FIFO was empty when the window
+began; the test allows 1 %. A fixed node loses frames only when the host stalls its tasks for
+longer than the FIFO lasts (24 ms at full load). The tick code makes up 6 lost ticks and drops
+the rest, so such a stall drops at least 18 ticks: the 1 % limit is a timing tolerance in a run
+that dropped 18 ticks or more, and a plain assertion in one that did not. (A busy host drops a
+few ticks at start-up, so the bound cannot be zero.) `test.sh` repeats a run that missed only
+timing tolerances once, as `scripts/test-system.sh` does, and exits with 75 if the repetition
+misses only timing tolerances too; `scripts/buglog-verify.sh` then reports the entry as
+inconclusive rather than caught or broken. The failing output shows both: on a busy host the
+first run dropped 48 and 28 ticks and only missed its tolerance; the repetition dropped none and
+failed.
+
+A first version of this test measured the load in the window but counted the losses over the
+whole run, against 2 % of everything received. On GitHub's runner it passed with the bug put
+back, once for the ping and once for both identifiers; a passing test printed no figures, so
+why is not known. On the development laptop the patched node drained 15.9 to 16.0 frames per
+tick in every run, as the cause above says it must. The losses are now measured in the window
+where the load is measured, and `test.sh` prints the figures of passing runs too (`-rP`), so
+that a pass with the bug put back can be explained.
 
 **Evidence.** [failing output](buglog/007-receive-fifo-overran-at-1-mbit/failing-output.txt),
 [patch that re-creates the bug](buglog/007-receive-fifo-overran-at-1-mbit/reintroduce.patch).

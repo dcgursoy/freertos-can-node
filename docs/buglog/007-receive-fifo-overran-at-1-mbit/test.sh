@@ -9,7 +9,7 @@
 report="$FCN_BUILD_ROOT/buglog-007-timing-report.txt"
 run() {
     rm -f "$report"
-    "$FCN_PYTHON" -m pytest tests/system/test_node_errors.py -q -p no:cacheprovider \
+    "$FCN_PYTHON" -m pytest tests/system/test_node_errors.py -q -p no:cacheprovider -rP \
         -k test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_mbit \
         --timing-report "$report" --artifacts "$FCN_BUILD_ROOT/system-test-logs"
 }

@@ -152,6 +152,14 @@ def test_every_received_frame_is_accounted_for_when_the_node_stops_during_traffi
     assert_every_received_frame_is_accounted_for(stats)
 
 
+# PLAT_CAN_RX_FIFO_DEPTH (platform/include/plat_can.h) and MAX_CATCH_UP_TICKS
+# (platform/posix/posix_tick.c). A full 1 Mbit/s bus fills the FIFO in 512 / 21.3 = 24 ms; a
+# stall that long, with 6 ticks made up, drops at least 24 - 6 = 18 ticks.
+RX_FIFO_DEPTH = 512
+MAX_CATCH_UP_TICKS = 6
+STALL_DROPPED_TICKS = int(RX_FIFO_DEPTH / 21.3) - MAX_CATCH_UP_TICKS
+
+
 @pytest.mark.timing
 @pytest.mark.parametrize("arbitration_id", [0x555, ID_PING], ids=["unregistered", "ping"])
 def test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_mbit(
@@ -160,13 +168,16 @@ def test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_m
     when they have no data. The receive task used to take at most 16 per tick, and the receive
     FIFO overran for as long as the load lasted, whether a handler was registered or not.
 
-    At the 16.8 frames/ms this test requires at least, a receive path that takes 16 per tick
-    loses at least 4.8 % of the frames, and more when the host is slow (docs/bug-log.md, 007).
-    One that is fast enough loses frames only when the host stalls the node's tasks for longer
-    than the FIFO lasts (512 frames, 24 ms at full load). Such a stall is longer than the
-    6 ticks the tick code makes up, so it shows as dropped ticks. Losses above 2 % are
-    therefore a timing miss in a run that dropped ticks and a plain failure in one that did
-    not: then the host ran every tick, and the receive path did not keep up."""
+    Everything is measured over the same 2 s window, half a second into the load. At the
+    16.8 frames/ms the window must see at least, a receive path that takes 16 per tick loses
+    at least 4.8 % of what the window delivers, and more than 3 % even if its FIFO was empty
+    when the window began (512 frames absorbed of more than 33,600). One that is fast enough
+    loses nothing there unless the host stalls the node's tasks for longer than the FIFO lasts
+    (24 ms at full load). The tick code makes up a lag of 6 ticks and drops the rest, so such
+    a stall drops at least STALL_DROPPED_TICKS ticks. Losses above 1 % of the window are
+    therefore a timing miss in a run that dropped that many ticks, and a plain failure in one
+    that did not: then the host ran the node, and the receive path did not keep up. (A few
+    ticks are dropped at start-up on a busy host; that is why the bound is not zero.)"""
     node = start_node("--bitrate", "1000000", "--duration-s", "4")
     with node.sim() as sim:
         sim.ping()
@@ -192,15 +203,17 @@ def test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_m
     # tick. Without that the run says nothing about the receive path, either way.
     check_timing(rate >= 16.8, f"too little load to show the bug ({load}): the tester or the "
                                "host was too slow")
-    overruns = stats["driver"]["rx_fifo_overruns"]
-    received = stats["controller"]["rx_frames"]
+    delivered = last["rx"] - first["rx"]
+    overruns = last["rx_fifo_overruns"] - first["rx_fifo_overruns"]
     dropped = node.stats()["tick"]["dropped"]
-    lost = (f"{overruns} of {received} received frames lost to receive FIFO overruns ({load}; "
-            f"rx_batches_cut {stats['driver']['rx_batches_cut']}, ticks dropped {dropped})")
-    if dropped > 0:
-        check_timing(overruns <= 0.02 * received, lost)
+    lost = (f"{overruns} of {delivered} frames delivered in the window lost to receive FIFO "
+            f"overruns ({load}; whole run: rx_batches_cut {stats['driver']['rx_batches_cut']}, "
+            f"ticks dropped {dropped})")
+    print(lost)  # shown for passing runs too with pytest -rP (the bug-log entry's test.sh)
+    if dropped >= STALL_DROPPED_TICKS:
+        check_timing(overruns <= 0.01 * delivered, lost)
     else:
-        assert overruns <= 0.02 * received, lost
+        assert overruns <= 0.01 * delivered, lost
 
 
 # ----------------------------------------------------------------------------- host stalls
