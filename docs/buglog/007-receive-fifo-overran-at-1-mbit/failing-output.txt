@@ -1,25 +1,23 @@
 $ bash docs/buglog/007-receive-fifo-overran-at-1-mbit/test.sh   # with reintroduce.patch applied (release preset), on a busy host
 =================================== FAILURES ===================================
 >           check_timing(overruns <= 0.01 * delivered, lost)
-tests/system/test_node_errors.py:214:
-E           fcn_tools.timing.TimingToleranceMissed: 9440 of 40873 frames delivered in the window lost to receive FIFO overruns (32.0 frames/ms offered, 20.4 received, bus busy 93%, largest wake-up lag of the hardware thread 5.7 ms; whole run: rx_batches_cut 3898, ticks dropped 48)
+tests/system/test_node_errors.py:226:
+E           fcn_tools.timing.TimingToleranceMissed: 9244 of 40878 frames delivered in the window lost to receive FIFO overruns (32.0 frames/ms offered, 20.4 received, bus busy 93%, largest wake-up lag of the hardware thread 10.4 ms; whole run: rx_batches_cut 3687, ticks dropped 28)
 >           check_timing(overruns <= 0.01 * delivered, lost)
-tests/system/test_node_errors.py:214:
-E           fcn_tools.timing.TimingToleranceMissed: 8380 of 39851 frames delivered in the window lost to receive FIFO overruns (32.0 frames/ms offered, 19.9 received, bus busy 93%, largest wake-up lag of the hardware thread 7.5 ms; whole run: rx_batches_cut 3936, ticks dropped 28)
-FAILED tests/system/test_node_errors.py::test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_mbit[unregistered]
-FAILED tests/system/test_node_errors.py::test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_mbit[ping]
-2 failed, 19 deselected in 8.27s
+tests/system/test_node_errors.py:226:
+E           fcn_tools.timing.TimingToleranceMissed: 9707 of 39139 frames delivered in the window lost to receive FIFO overruns (32.0 frames/ms offered, 19.6 received, bus busy 91%, largest wake-up lag of the hardware thread 10.3 ms; whole run: rx_batches_cut 3899, ticks dropped 167)
+2 failed, 19 deselected in 8.32s
 only timing tolerances were missed; repeating once
 =================================== FAILURES ===================================
 >           assert overruns <= 0.01 * delivered, lost
-E           AssertionError: 9152 of 41155 frames delivered in the window lost to receive FIFO overruns (32.0 frames/ms offered, 20.6 received, bus busy 94%, largest wake-up lag of the hardware thread 1.9 ms; whole run: rx_batches_cut 3968, ticks dropped 0)
-E           assert 9152 <= (0.01 * 41155)
-tests/system/test_node_errors.py:216: AssertionError
+E           AssertionError: 9151 of 41153 frames delivered in the window lost to receive FIFO overruns (32.0 frames/ms offered, 20.6 received, bus busy 94%, largest wake-up lag of the hardware thread 10.2 ms; whole run: rx_batches_cut 3685, ticks dropped 9)
+E           assert 9151 <= (0.01 * 41153)
+tests/system/test_node_errors.py:228: AssertionError
 >           assert overruns <= 0.01 * delivered, lost
-E           AssertionError: 8379 of 40297 frames delivered in the window lost to receive FIFO overruns (32.0 frames/ms offered, 20.1 received, bus busy 94%, largest wake-up lag of the hardware thread 2.0 ms; whole run: rx_batches_cut 3621, ticks dropped 0)
-E           assert 8379 <= (0.01 * 40297)
-tests/system/test_node_errors.py:216: AssertionError
+E           AssertionError: 8396 of 40320 frames delivered in the window lost to receive FIFO overruns (32.0 frames/ms offered, 20.2 received, bus busy 94%, largest wake-up lag of the hardware thread 10.6 ms; whole run: rx_batches_cut 3683, ticks dropped 10)
+E           assert 8396 <= (0.01 * 40320)
+tests/system/test_node_errors.py:228: AssertionError
 FAILED tests/system/test_node_errors.py::test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_mbit[unregistered]
 FAILED tests/system/test_node_errors.py::test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_mbit[ping]
-2 failed, 19 deselected in 8.12s
+2 failed, 19 deselected in 8.13s
 (test.sh exit status 1)

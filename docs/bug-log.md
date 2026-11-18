@@ -338,58 +338,65 @@ with the shortest frames there are, base-format data frames without data. Compar
 controller model delivered with what the driver took, a large part was lost to receive FIFO
 overruns, whether or not a handler was registered for the identifier. With the bug put back,
 the system test added with the fix loses 22.2 % and 20.8 % of the frames delivered in its
-measurement window, one run for each of its two identifiers, with no tick dropped:
+measurement window, one run for each of its two identifiers:
 
 ```
-E           AssertionError: 9152 of 41155 frames delivered in the window lost to receive FIFO overruns (32.0 frames/ms offered, 20.6 received, bus busy 94%, largest wake-up lag of the hardware thread 1.9 ms; whole run: rx_batches_cut 3968, ticks dropped 0)
+E           AssertionError: 9151 of 41153 frames delivered in the window lost to receive FIFO overruns (32.0 frames/ms offered, 20.6 received, bus busy 94%, largest wake-up lag of the hardware thread 10.2 ms; whole run: rx_batches_cut 3685, ticks dropped 9)
 ```
 
 **Cause.** The receive task drains the controller's receive FIFO in batches of at most
 `CAN_IO_RX_BATCH` frames per activation, so that its execution time per activation has a bound.
-When a batch is full, it lets the other tasks run for one tick and counts the cut
-(`rx_batches_cut`). The batch was 16, and the tick is 1 ms, so for as long as frames kept
-coming the task took at most 16 per millisecond. A full 1 Mbit/s bus delivers up to 21.3: the
-shortest frame is 44 bits, plus the 3-bit intermission. The FIFO of 512 frames filled and then
-overran for as long as the load lasted. The batch size had been chosen without reference to the
-bit rate. At 500 kbit/s a full bus carries at most 10.6 frames per millisecond, and at 1 Mbit/s
-frames with 8 data bytes come at most 9.0 per millisecond. Both are below 16, which is why no
-earlier test had seen the bug.
+When a batch is full, it lets the other tasks run until the next tick and counts the cut
+(`rx_batches_cut`); otherwise it waits for the next frame. The batch was 16 and the tick is
+1 ms. A full 1 Mbit/s bus delivers up to 21.3 frames per millisecond: the shortest frame is 44
+bits, plus the 3-bit intermission. While the task kept pace, taking frames as they came, the
+batch did not matter. But once anything delayed it long enough for 16 frames to be waiting (at
+full load, 0.75 ms: a tick handler, a lower-priority task in a critical section, the host), it
+took 16 per tick from then on, the backlog grew by up to 5.3 frames every millisecond, and the
+FIFO of 512 frames filled and overran for as long as the load lasted. The batch size had been
+chosen without reference to the bit rate. At 500 kbit/s a full bus carries at most 10.6 frames
+per millisecond, and at 1 Mbit/s frames with 8 data bytes come at most 9.0 per millisecond. Both
+are below 16, which is why no earlier test had seen the bug.
 
 **Fix.** `CAN_IO_RX_BATCH` is now 32 ([can_io.h](../app/can_io.h)). A compile-time check in
 [can_io.c](../app/can_io.c) ties it to the tick rate and to `PLAT_CAN_MAX_BITRATE`, the highest
 bit rate the controller can be configured for (now in
 [plat_can.h](../platform/include/plat_can.h), and the limit of the node's `--bitrate`). One
 batch per tick must cover the frames a full bus can deliver in a tick. The margin above 21.3
-lets the task catch up after a late tick.
+drains a backlog: up to 10.7 frames more than arrive, every tick.
 
 **Regression test.**
 `tests/system/test_node_errors.py::test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_mbit`
 runs once for an identifier nobody handles and once for the ping. A tester offers 32 frames per
 millisecond to a node at 1 Mbit/s until the node ends its 4 s run. Every frame the model
 delivered must be accounted for exactly: taken by the driver, lost to an overrun, or still in
-the FIFO at the stop. The load and the losses are both measured over the same 2 s window, half a
-second into the load. The model must have delivered at least 16.8 frames per millisecond in the
+the FIFO at the stop. The test makes the delay that starts the overrun itself: 0.3 s into the
+load it stops the node for 10 ms (SIGSTOP), as a busy host would, which leaves about 200 frames
+waiting. A receive path that keeps up drains them in about 18 ms; one that takes 16 per tick
+never does while the load lasts. Load and losses are then measured over the same 2 s window,
+0.2 s after the stop. The model must have delivered at least 16.8 frames per millisecond in the
 window, more than 16 per tick; that is a timing tolerance, checked first, since a lighter load
-says nothing about the receive path. At that rate a receive path limited to 16 per tick loses at
-least 4.8 % of the window's frames, and more than 3 % even if its FIFO was empty when the window
-began; the test allows 1 %. A fixed node loses frames only when the host stalls its tasks for
-longer than the FIFO lasts (24 ms at full load). The tick code makes up 6 lost ticks and drops
-the rest, so such a stall drops at least 18 ticks: the 1 % limit is a timing tolerance in a run
-that dropped 18 ticks or more, and a plain assertion in one that did not. (A busy host drops a
-few ticks at start-up, so the bound cannot be zero.) `test.sh` repeats a run that missed only
-timing tolerances once, as `scripts/test-system.sh` does, and exits with 75 if the repetition
-misses only timing tolerances too; `scripts/buglog-verify.sh` then reports the entry as
-inconclusive rather than caught or broken. The failing output shows both: on a busy host the
-first run dropped 48 and 28 ticks and only missed its tolerance; the repetition dropped none and
-failed.
+says nothing about the receive path. At that rate a 16-per-tick path loses at least 4.8 % of the
+window's frames; the test allows 1 %. A fixed node loses frames in the window only when the host
+stalls it for longer than the FIFO lasts (24 ms at full load). The tick code makes up a lag of up
+to 6 ticks and gives up all but one tick of a longer lag, so such a stall drops at least 23
+ticks: the 1 % limit is a timing tolerance in a run that dropped 23 ticks or more, and a plain
+assertion in one that did not. (The test's own stop and, on a busy host, the start-up drop a few
+ticks too; they count, which only makes the bound stricter.) `test.sh` repeats a run that missed
+only timing tolerances once, as `scripts/test-system.sh` does, and exits with 75 if the
+repetition misses only timing tolerances too; `scripts/buglog-verify.sh` then reports the entry
+as inconclusive rather than caught or broken. The failing output shows both: on a busy host the
+first run dropped 28 and 167 ticks and only missed its tolerance; the repetition dropped 9 and
+10, the ones of its own stop, and failed.
 
-A first version of this test measured the load in the window but counted the losses over the
-whole run, against 2 % of everything received. On GitHub's runner it passed with the bug put
-back, once for the ping and once for both identifiers; a passing test printed no figures, so
-why is not known. On the development laptop the patched node drained 15.9 to 16.0 frames per
-tick in every run, as the cause above says it must. The losses are now measured in the window
-where the load is measured, and `test.sh` prints the figures of passing runs too (`-rP`), so
-that a pass with the bug put back can be explained.
+Two earlier versions of this test relied on the host to cause the first delay. The first
+counted the losses over the whole run against 2 % of everything received; on GitHub's runner it
+passed with the bug put back, once for the ping and once for both identifiers. The second
+measured the losses in the window and printed its figures: on the runner the patched node lost
+only 5.1 % and 1.2 % of the window, with batches cut in about half of the ticks (2060 and 1728
+of about 4000), where the development laptop showed 20 to 22 % and a cut in every tick. On the
+faster runner the task fell behind less often, and the second figure was a hair above the 1 %
+limit. Stopping the node before the window takes the host out of that question.
 
 **Evidence.** [failing output](buglog/007-receive-fifo-overran-at-1-mbit/failing-output.txt),
 [patch that re-creates the bug](buglog/007-receive-fifo-overran-at-1-mbit/reintroduce.patch).

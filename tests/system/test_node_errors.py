@@ -152,12 +152,16 @@ def test_every_received_frame_is_accounted_for_when_the_node_stops_during_traffi
     assert_every_received_frame_is_accounted_for(stats)
 
 
-# PLAT_CAN_RX_FIFO_DEPTH (platform/include/plat_can.h) and MAX_CATCH_UP_TICKS
-# (platform/posix/posix_tick.c). A full 1 Mbit/s bus fills the FIFO in 512 / 21.3 = 24 ms; a
-# stall that long, with 6 ticks made up, drops at least 24 - 6 = 18 ticks.
+# PLAT_CAN_RX_FIFO_DEPTH (platform/include/plat_can.h). A full 1 Mbit/s bus fills the FIFO in
+# 512 / 21.3 = 24 ms. The tick code (platform/posix/posix_tick.c) makes up a lag of up to 6
+# ticks one by one and gives up all but one tick of a longer lag, so a stall of 24 ms drops at
+# least 23 ticks by itself.
 RX_FIFO_DEPTH = 512
-MAX_CATCH_UP_TICKS = 6
-STALL_DROPPED_TICKS = int(RX_FIFO_DEPTH / 21.3) - MAX_CATCH_UP_TICKS
+STALL_DROPPED_TICKS = int(RX_FIFO_DEPTH / 21.3) - 1
+# The stall the test makes before its window: long enough to leave more than a batch of 16
+# frames waiting (about 200), short enough for a receive path that keeps up to drain them
+# (in about 18 ms at 32 per tick) long before the window begins.
+STOP_S = 0.010
 
 
 @pytest.mark.timing
@@ -165,24 +169,32 @@ STALL_DROPPED_TICKS = int(RX_FIFO_DEPTH / 21.3) - MAX_CATCH_UP_TICKS
 def test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_mbit(
         start_node, ports, arbitration_id):
     """docs/bug-log.md, 007. A full 1 Mbit/s bus carries up to 21.3 frames per millisecond
-    when they have no data. The receive task used to take at most 16 per tick, and the receive
-    FIFO overran for as long as the load lasted, whether a handler was registered or not.
+    when they have no data. The receive task takes at most one batch per activation and, when
+    the batch is full, waits for the next tick. With a batch of 16, once 16 frames were waiting
+    it took 16 per tick from then on, the backlog only grew, and the receive FIFO overran for
+    as long as the load lasted, whether a handler was registered or not.
 
-    Everything is measured over the same 2 s window, half a second into the load. At the
-    16.8 frames/ms the window must see at least, a receive path that takes 16 per tick loses
-    at least 4.8 % of what the window delivers, and more than 3 % even if its FIFO was empty
-    when the window began (512 frames absorbed of more than 33,600). One that is fast enough
-    loses nothing there unless the host stalls the node's tasks for longer than the FIFO lasts
-    (24 ms at full load). The tick code makes up a lag of 6 ticks and drops the rest, so such
-    a stall drops at least STALL_DROPPED_TICKS ticks. Losses above 1 % of the window are
-    therefore a timing miss in a run that dropped that many ticks, and a plain failure in one
-    that did not: then the host ran the node, and the receive path did not keep up. (A few
-    ticks are dropped at start-up on a busy host; that is why the bound is not zero.)"""
+    What starts that is any delay of the task that leaves a full batch waiting; on a fast host
+    the task may otherwise take the frames as they come. So the test makes the delay itself:
+    STOP_S into the load it stops the node (SIGSTOP), as a busy host would, which leaves about
+    200 frames waiting. A receive path that keeps up drains them in about 18 ms; one that takes
+    16 per tick never does while the load lasts. Then load and losses are measured over the same
+    2 s window, 0.2 s later. At the 16.8 frames/ms the window must see at least, a 16-per-tick
+    path loses at least 4.8 % of what the window delivers. A path that keeps up loses nothing in
+    the window unless the host stalls the node for longer than the FIFO lasts (24 ms at full
+    load), and such a stall drops at least STALL_DROPPED_TICKS ticks. Losses above 1 % of the
+    window are therefore a timing miss in a run that dropped that many ticks, and a plain
+    failure in one that did not: then the receive path did not keep up. (The stop and, on a busy
+    host, the start-up drop some ticks too; they count, which only makes the bound stricter.)"""
     node = start_node("--bitrate", "1000000", "--duration-s", "4")
     with node.sim() as sim:
         sim.ping()
         with Flood(ports.bus, arbitration_id, frames_per_ms=32) as flood:
-            time.sleep(0.5)
+            time.sleep(0.3)
+            node.send_signal(signal.SIGSTOP)
+            time.sleep(STOP_S)
+            node.send_signal(signal.SIGCONT)
+            time.sleep(0.2)
             first = sim.can_status()
             sent_first = flood.sent
             time.sleep(2.0)
