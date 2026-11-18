@@ -6,9 +6,22 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
+#include "can/can_bits.h"
 #include "log/log.h"
 #include "plat_can.h"
 #include "platform.h"
+
+/* The shortest classical frame on the bus: a base-format data frame without data and without
+ * a single stuff bit is 44 bits (SOF 1, identifier 11, RTR 1, IDE 1, r0 1, DLC 4, CRC 15, CRC
+ * delimiter 1, ACK 2, EOF 7), followed by the intermission. */
+#define SHORTEST_FRAME_BITS (44U + CAN_BITS_INTERMISSION)
+
+/* The receive task takes at most one batch per tick when frames keep coming (see rx_task), so
+ * a batch per tick must cover the most frames a full bus can deliver in a tick. Otherwise the
+ * receive FIFO overruns for as long as the load lasts. */
+_Static_assert(((uint64_t)CAN_IO_RX_BATCH * SHORTEST_FRAME_BITS * (uint64_t)configTICK_RATE_HZ) >=
+                   (uint64_t)PLAT_CAN_MAX_BITRATE,
+               "CAN_IO_RX_BATCH is below the frame rate of a full bus at PLAT_CAN_MAX_BITRATE");
 
 /* Notification bits of the two tasks. */
 #define NOTIFY_RX_PENDING 0x01U /* receive task: the controller's receive FIFO has frames */

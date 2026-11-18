@@ -20,20 +20,26 @@
  * repeats until the next event lies after `now`. The events, and at equal times the order in
  * which they are taken:
  *
- *   1  FRAME_END  the attempt in flight ends, or the oldest received frame reaches its end of
- *                 frame. While an attempt is in flight it is always the earlier of the two:
- *                 a frame is placed on the timeline only after everything placed before it, and
- *                 an attempt starts only once the frames before it have ended.
+ *   1  FRAME_END  the attempt in flight ends, or the oldest received frame on the timeline
+ *                 reaches its end of frame. While an attempt is in flight it is always the
+ *                 earlier of the two: a frame is placed on the timeline only after everything
+ *                 placed before it, and an attempt starts only once the frames before it have
+ *                 ended.
  *   2  RECOVERY   the 128th occurrence of 11 recessive bits.
  *   3  FAULT      a fault change takes effect.
  *   4  DOMINANT   the next counter step while the bus is held dominant.
- *   5  TX_START   the pending frame that wins arbitration starts. It produces no action, but it
- *                 is a wake-up time: a start taken late by more than a frame length would
- *                 trigger the late-caller rule.
+ *   5  START      the bus is free and the winner of arbitration starts (next_start()): this
+ *                 node's best mailbox (TX_START) or the oldest received frame waiting in the
+ *                 wire queue (RX_START). Neither produces an action. A TX_START is a wake-up
+ *                 time, because a start taken late by more than a frame length would trigger
+ *                 the late-caller rule. An RX_START is not: nothing depends on when it is
+ *                 processed, so can_ctrl_next_wakeup() looks through it to that frame's end.
  *
  * Frame ends come first so that a fault or a start at the very end of the intermission sees the
  * frame finished; a recovery occurrence that ends exactly at a start of frame or at the onset of
- * a dominant fault counts, because its 11 recessive bits are complete by then.
+ * a dominant fault counts, because its 11 recessive bits are complete by then. A fault comes
+ * before a start at the same instant, so that a fault taking effect when the bus becomes free
+ * is in force at the start of the next frame.
  *
  * DECISIONS WHERE THE CONTRACT IS OPEN (each is also stated where it is implemented)
  *
@@ -44,6 +50,18 @@
  *  - When a fault takes effect. A fault set at F takes effect at the end of the intermission of
  *    whatever is on the bus at F (F itself on an idle bus). This is "from the next frame", and
  *    for a dominant fault it is the "or after the bus would have become free" of the contract.
+ *  - Received frames, waiting or placed. A frame handed in goes on the timeline at once only
+ *    if no received frame waits before it, the bus carries frames (no short or dominant bus in
+ *    force) and its start would lie before the time of the call (hand_in()). Every start of
+ *    frame before that time has been decided by then (unless a full action queue holds the
+ *    model up, see below), and none took the bus: the received frame was alone. A start at the
+ *    very instant of the call has not been decided (an input comes before the events of its
+ *    instant), so such a frame waits and arbitrates.
+ *  - Arbitration against other nodes. At a start, this node's best mailbox competes if it
+ *    could start then (transmission_start()), the oldest waiting received frame if it could
+ *    start then (received_start()); if both can, the smaller arbitration key wins and equal
+ *    keys go to the received frame. Only the oldest waiting received frame competes, so
+ *    received frames keep their arrival order.
  *  - Faults and received frames. A frame handed in while the fault last set is a short or a
  *    dominant bus is discarded (rx_lost_fault). Received frames already queued that have not
  *    started when such a fault takes effect never reach the bus either: they are discarded then
@@ -63,21 +81,27 @@
  *    while the node is not bus off and its receive counter is below its maximum.
  *  - Received frames and bus off. A frame is judged at its end of frame: if the node is bus off
  *    then, it is not delivered and counts in rx_lost_fault. A frame handed in while the node is
- *    bus off is refused and counted at once, but kept on the timeline (marked lost) as long as
- *    the wire queue has room, because it still passes on the bus: it occupies the bus, delays
- *    later frames and counts towards recovery.
+ *    bus off is refused and counted at once, but kept in the wire queue (marked lost) as long
+ *    as it has room, because it still passes on the bus: it occupies the bus, delays later
+ *    frames, counts towards recovery and, once the node has recovered, arbitrates against it.
  *  - Recovery counting. See recovery_count_until().
  *  - Late callers. A transmission whose start lies more than its own frame length before `now`
  *    starts at `now`. With pacing off a frame lasts 0 ns, so any lateness moves the start to
- *    `now`, and is counted: the frame then completes at the poll, as the contract says.
+ *    `now`, and is counted: the frame then completes at the poll, as the contract says. The
+ *    arbitration against received frames is not run again for the moved start: this node's
+ *    frame won the bus, the received frames that lost wait for it. (Among the mailboxes it is
+ *    run again, and its winner has a key no larger than the frame that won.)
  *  - Inputs while the action queue is full. The model stops before an event for which the queue
  *    has no room for the two actions an event can produce. An input given while it is stopped
  *    is applied to the model as it stands; a mailbox submitted then still competes only from its
- *    submission time on. A caller that reads its actions never meets this case.
+ *    submission time on, and a received frame handed in then that has to wait for the bus
+ *    only from the time of the call. A caller that reads its actions never meets this case.
  *  - Event budget. One call processes at most EVENTS_PER_CALL events. With pacing off a node
  *    that is never acknowledged retries for ever at one instant; the budget ends the call, and
  *    can_ctrl_next_wakeup() then asks for an immediate poll. At any positive bit rate the budget
- *    is never reached: a late poll moves the next start to `now` instead of replaying the past.
+ *    is never reached: a late poll moves the next start of this node to `now` instead of
+ *    replaying the past, and the received frames it replays are at most CAN_CTRL_WIRE_QUEUE,
+ *    two events each.
  *  - can_ctrl_poll() with a NULL action returns true when at least one action is queued.
  *  - can_ctrl_tx_abort_all() removes every waiting frame even if `max_handles` is smaller than
  *    their number; it writes the handles of the first `max_handles` of them, in submission order.
@@ -120,13 +144,18 @@
 /* See "Event budget" above. */
 #define EVENTS_PER_CALL 1024U
 
+/* start_ns of a received frame that is still waiting for the bus. Later than any time, so a
+ * walk over the wire queue that stops at the first frame not started yet stops at it too. */
+#define NOT_STARTED UINT64_MAX
+
 typedef enum {
     EVENT_NONE = 0,
     EVENT_FRAME_END,
     EVENT_RECOVERY,
     EVENT_FAULT,
     EVENT_DOMINANT,
-    EVENT_TX_START
+    EVENT_TX_START,
+    EVENT_RX_START
 } ctrl_event_t;
 
 /* ------------------------------------------------------------------------- time helpers */
@@ -271,7 +300,8 @@ static void complete_recovery(can_ctrl_t *ctrl, uint64_t time_ns)
  * time is started_free_ns), a received frame in progress, or a frame that already ended. A
  * frame due to start at `at_ns` itself has not started: an input is applied before the events
  * of its own instant (catch_up), so a fault set then is in force at that frame's start, as it
- * is for a transmission due to start then. */
+ * is for a transmission due to start then. The walk stops at the first received frame that
+ * has not started; the frames still waiting for the bus come after it and have NOT_STARTED. */
 static uint64_t free_after_started(const can_ctrl_t *ctrl, uint64_t at_ns)
 {
     uint64_t free_ns = later_of(at_ns, ctrl->started_free_ns);
@@ -292,43 +322,94 @@ static uint64_t free_after_started(const can_ctrl_t *ctrl, uint64_t at_ns)
     return free_ns;
 }
 
+/* A shorted bus and a bus held dominant carry no frame: no received frame starts while one of
+ * them is in force. */
+static bool bus_carries_frames(const can_ctrl_t *ctrl)
+{
+    return (ctrl->fault_effective != CAN_BUS_FAULT_SHORT) &&
+           (ctrl->fault_effective != CAN_BUS_FAULT_STUCK_DOMINANT);
+}
+
+/* Index in `wire` of the oldest received frame that waits for the bus. Waiting frames follow
+ * the placed ones. The caller makes sure that one waits. */
+static uint32_t first_waiting(const can_ctrl_t *ctrl)
+{
+    return wire_index(ctrl, ctrl->wire_placed);
+}
+
+/* Put the oldest waiting received frame on the timeline, starting at `start_ns`. */
+static void place_received(can_ctrl_t *ctrl, uint64_t start_ns)
+{
+    can_ctrl_wire_slot_t *const slot = &ctrl->wire[first_waiting(ctrl)];
+
+    slot->start_ns = start_ns;
+    slot->eof_ns = start_ns + bits_ns(ctrl, slot->bits);
+    ctrl->wire_placed++;
+
+    ctrl->bus_free_at_ns = start_ns + bits_ns(ctrl, (uint32_t)slot->bits + CAN_BITS_INTERMISSION);
+    ctrl->last_frame_was_ours = false;
+}
+
 /*
- * Put a received frame on the timeline. It is taken to have ended at its arrival, or, if the
- * bus was not free for the whole frame before that, one frame length after the bus became free.
- * It never ends before the last event already processed, so that what has been reported stays
- * in time order even for an arrival time that lies before the last `now`.
+ * A frame from the transport joins the wire queue; the caller made sure there is room. `now_ns`
+ * is the time of the call, to which the model has been advanced: every start of frame before it
+ * has been decided (unless a full action queue holds the model up, see "Inputs while the action
+ * queue is full"). See "Receive" in can_ctrl.h.
+ *
+ * The frame's earliest start: it ended at its arrival, or one frame length after the bus became
+ * free if that is later, and it never ends before the last event already processed, so that
+ * what has been reported stays in time order even for an arrival time that lies before the
+ * last `now`. If that start lies before `now_ns`, the bus was free then and nothing took it,
+ * and no received frame waits that would go first: the frame is placed there. Otherwise it
+ * waits and competes from `now_ns` on.
  */
-static void place_received(can_ctrl_t *ctrl, const can_frame_t *frame, uint16_t bits,
-                           uint64_t arrival_ns, bool lost)
+static void hand_in(can_ctrl_t *ctrl, const can_frame_t *frame, uint16_t bits, uint64_t arrival_ns,
+                    uint64_t now_ns, bool lost)
 {
     const uint64_t frame_ns = bits_ns(ctrl, bits);
+    const bool none_waiting = (ctrl->wire_placed == ctrl->wire_count);
     can_ctrl_wire_slot_t *const slot = &ctrl->wire[wire_index(ctrl, ctrl->wire_count)];
     uint64_t start_ns = later_of(minus_or_zero(arrival_ns, frame_ns), ctrl->bus_free_at_ns);
 
     start_ns = later_of(start_ns, minus_or_zero(ctrl->model_ns, frame_ns));
 
     slot->frame = *frame;
-    slot->start_ns = start_ns;
-    slot->eof_ns = start_ns + frame_ns;
+    slot->start_ns = NOT_STARTED;
+    slot->eof_ns = NOT_STARTED;
+    slot->ready_ns = now_ns;
     slot->bits = bits;
     slot->lost = lost;
     ctrl->wire_count++;
 
-    ctrl->bus_free_at_ns = start_ns + bits_ns(ctrl, (uint32_t)bits + CAN_BITS_INTERMISSION);
-    ctrl->last_frame_was_ours = false;
+    if (none_waiting && bus_carries_frames(ctrl) && (start_ns < now_ns)) {
+        place_received(ctrl, start_ns);
+    }
 }
 
-/* Received frames that have not started when the bus is shorted or held dominant never pass. */
-static void discard_queued_frames(can_ctrl_t *ctrl)
+/*
+ * Received frames that have not started at `at_ns`, when the bus is shorted or held dominant,
+ * never pass: those still waiting for the bus, and any placed frame due to start then or
+ * later. A placed frame that started before `at_ns` is on the wire and passes. (When the model
+ * runs without being held up, no such frame is left by then: its end of frame comes before the
+ * fault. One is left when the fault was set while a full action queue held the model up,
+ * before the start of a received frame that had to wait.)
+ */
+static void discard_queued_frames(can_ctrl_t *ctrl, uint64_t at_ns)
 {
-    for (uint32_t position = 0U; position < ctrl->wire_count; position++) {
+    uint32_t kept = 0U;
+
+    while ((kept < ctrl->wire_placed) && (ctrl->wire[wire_index(ctrl, kept)].start_ns < at_ns)) {
+        kept++;
+    }
+
+    for (uint32_t position = kept; position < ctrl->wire_count; position++) {
         if (!ctrl->wire[wire_index(ctrl, position)].lost) {
             ctrl->stats.rx_lost_fault++; /* a lost frame was counted when it was handed in */
         }
     }
 
-    ctrl->wire_head = 0U;
-    ctrl->wire_count = 0U;
+    ctrl->wire_count = kept;
+    ctrl->wire_placed = kept;
 }
 
 /* ------------------------------------------------------------------------- transmission */
@@ -396,6 +477,66 @@ static bool transmission_start(const can_ctrl_t *ctrl, uint64_t *start_ns)
     }
 
     return pending;
+}
+
+/*
+ * When the oldest waiting received frame could start, if one waits and the bus can carry it:
+ * when the bus is free, and not before it was handed in.
+ *
+ * Three of the conditions do not bind today; each is stated so that the invariant it keeps
+ * does not depend on the reasoning that shows it. The attempt in flight: the free time lies
+ * after it. The last event processed, so that model time cannot go back: as in
+ * transmission_start(). A short or a dominant bus in force: a frame can wait while one is in
+ * force only if it was handed in after the removal was asked for (the others were refused or
+ * discarded), and the removal takes effect once what was on the bus at that moment has passed;
+ * the frame cannot start earlier, and at the same instant the fault is taken first.
+ */
+static bool received_start(const can_ctrl_t *ctrl, uint64_t *start_ns)
+{
+    const bool possible =
+        (ctrl->wire_count > ctrl->wire_placed) && !ctrl->tx_in_flight && bus_carries_frames(ctrl);
+
+    if (possible) {
+        const can_ctrl_wire_slot_t *const slot = &ctrl->wire[first_waiting(ctrl)];
+
+        *start_ns = later_of(later_of(ctrl->bus_free_at_ns, ctrl->model_ns), slot->ready_ns);
+    }
+
+    return possible;
+}
+
+/*
+ * The next start of frame and who wins it: EVENT_TX_START for this node's best mailbox,
+ * EVENT_RX_START for the oldest waiting received frame, EVENT_NONE if nothing can start. A
+ * frame that can start earlier than the other goes alone; two that can start at the same
+ * instant arbitrate: the smaller key wins, and of equal keys the received frame.
+ */
+static ctrl_event_t next_start(const can_ctrl_t *ctrl, uint64_t *start_ns)
+{
+    uint64_t tx_ns = 0U;
+    uint64_t rx_ns = 0U;
+    const bool tx = transmission_start(ctrl, &tx_ns);
+    const bool rx = received_start(ctrl, &rx_ns);
+    ctrl_event_t event = EVENT_NONE;
+
+    if (tx && rx && (tx_ns == rx_ns)) {
+        const uint32_t ours =
+            can_frame_arbitration_key(&ctrl->mailboxes[arbitration_winner(ctrl, tx_ns)].frame);
+        const uint32_t theirs = can_frame_arbitration_key(&ctrl->wire[first_waiting(ctrl)].frame);
+
+        event = (ours < theirs) ? EVENT_TX_START : EVENT_RX_START;
+        *start_ns = tx_ns;
+    } else if (tx && (!rx || (tx_ns < rx_ns))) {
+        event = EVENT_TX_START;
+        *start_ns = tx_ns;
+    } else if (rx) {
+        event = EVENT_RX_START;
+        *start_ns = rx_ns;
+    } else {
+        /* nothing waits, or nothing may start */
+    }
+
+    return event;
 }
 
 /* The outcome of an attempt is fixed by the fault in force at its start of frame. Bus time of
@@ -512,6 +653,7 @@ static void end_reception(can_ctrl_t *ctrl)
 
     ctrl->wire_head = wire_index(ctrl, 1U);
     ctrl->wire_count--;
+    ctrl->wire_placed--;
     ctrl->stats.busy_ns += bits_ns(ctrl, slot.bits);
     ctrl->started_free_ns =
         later_of(ctrl->started_free_ns,
@@ -610,9 +752,9 @@ static void fault_takes_effect(can_ctrl_t *ctrl)
         ctrl->dominant_base_ns = at_ns;
         ctrl->dominant_bits = STUCK_STUFF_ERROR_BITS;
         ctrl->last_frame_was_ours = false;
-        discard_queued_frames(ctrl);
+        discard_queued_frames(ctrl, at_ns);
     } else if (beginning == CAN_BUS_FAULT_SHORT) {
-        discard_queued_frames(ctrl);
+        discard_queued_frames(ctrl, at_ns);
     } else {
         /* Received frames already queued pass as planned. */
     }
@@ -636,10 +778,11 @@ static ctrl_event_t next_event(const can_ctrl_t *ctrl, uint64_t *when_ns)
     ctrl_event_t event = EVENT_NONE;
     uint64_t when = 0U;
     uint64_t start_ns = 0U;
+    ctrl_event_t start = EVENT_NONE;
 
     if (ctrl->tx_in_flight) {
         consider(&event, &when, EVENT_FRAME_END, ctrl->tx_end_ns);
-    } else if (ctrl->wire_count > 0U) {
+    } else if (ctrl->wire_placed > 0U) {
         consider(&event, &when, EVENT_FRAME_END, ctrl->wire[ctrl->wire_head].eof_ns);
     } else {
         /* the bus carries nothing */
@@ -648,9 +791,11 @@ static ctrl_event_t next_event(const can_ctrl_t *ctrl, uint64_t *when_ns)
     if (recovery_counting(ctrl)) {
         const uint64_t done_ns = recovery_occurrence_ns(ctrl, recovery_missing(ctrl));
 
-        /* Only if the run is not cut short by a frame first; if it is, that frame's end
-         * counts the run and starts the next one. */
-        if ((ctrl->wire_count == 0U) || (done_ns <= ctrl->wire[ctrl->wire_head].start_ns)) {
+        /* Only if the run is not cut short by the received frame on the timeline, which has
+         * started; if it is, that frame's end counts the run and starts the next one. A frame
+         * that has yet to start needs no test here: if it starts before done_ns, its start is
+         * the earlier event, and once it has started it is the frame on the timeline. */
+        if ((ctrl->wire_placed == 0U) || (done_ns <= ctrl->wire[ctrl->wire_head].start_ns)) {
             consider(&event, &when, EVENT_RECOVERY, done_ns);
         }
     }
@@ -664,8 +809,10 @@ static ctrl_event_t next_event(const can_ctrl_t *ctrl, uint64_t *when_ns)
                  ctrl->dominant_base_ns + bits_ns(ctrl, ctrl->dominant_bits));
     }
 
-    if (transmission_start(ctrl, &start_ns)) {
-        consider(&event, &when, EVENT_TX_START, start_ns);
+    start = next_start(ctrl, &start_ns);
+
+    if (start != EVENT_NONE) {
+        consider(&event, &when, start, start_ns);
     }
 
     *when_ns = when;
@@ -702,8 +849,10 @@ static void advance(can_ctrl_t *ctrl, uint64_t now_ns, bool including_now)
                 fault_takes_effect(ctrl);
             } else if (event == EVENT_DOMINANT) {
                 dominant_step(ctrl, when);
-            } else {
+            } else if (event == EVENT_TX_START) {
                 start_transmission(ctrl, when, now_ns);
+            } else {
+                place_received(ctrl, when); /* EVENT_RX_START */
             }
         }
     }
@@ -717,7 +866,8 @@ static void advance(can_ctrl_t *ctrl, uint64_t now_ns, bool including_now)
  * lies strictly before its time, and is applied before the events of that very instant: frames
  * submitted at the same instant then arbitrate together ("among those already submitted at that
  * moment"), a fault set at the instant a frame could start is in force at its start of frame,
- * and a frame that arrives at the instant a transmission could start is placed before it.
+ * and a frame handed in at the instant a transmission could start goes first if it had the bus
+ * before that instant (hand_in) and arbitrates against the transmission otherwise.
  */
 static uint64_t catch_up(can_ctrl_t *ctrl, uint64_t now_ns, bool including_now)
 {
@@ -838,8 +988,7 @@ bool can_ctrl_wire_rx(can_ctrl_t *ctrl, const can_frame_t *frame, uint64_t arriv
 {
     can_bits_info_t info = {0U, 0U, 0U};
     bool accepted = false;
-
-    (void)catch_up(ctrl, arrival_ns, false);
+    const uint64_t now = catch_up(ctrl, arrival_ns, false);
 
     if (can_bits_exact(frame, &info)) {
         if ((ctrl->fault == CAN_BUS_FAULT_SHORT) || (ctrl->fault == CAN_BUS_FAULT_STUCK_DOMINANT)) {
@@ -849,12 +998,12 @@ bool can_ctrl_wire_rx(can_ctrl_t *ctrl, const can_frame_t *frame, uint64_t arriv
 
             /* Refused, but it still passes on the bus. Beyond the queue it is not modelled. */
             if (ctrl->wire_count < CAN_CTRL_WIRE_QUEUE) {
-                place_received(ctrl, frame, info.frame_bits, arrival_ns, true);
+                hand_in(ctrl, frame, info.frame_bits, arrival_ns, now, true);
             }
         } else if (ctrl->wire_count >= CAN_CTRL_WIRE_QUEUE) {
             ctrl->stats.wire_overruns++;
         } else {
-            place_received(ctrl, frame, info.frame_bits, arrival_ns, false);
+            hand_in(ctrl, frame, info.frame_bits, arrival_ns, now, false);
             accepted = true;
         }
     }
@@ -884,12 +1033,25 @@ uint64_t can_ctrl_next_wakeup(const can_ctrl_t *ctrl)
 
     if (ctrl->action_count > 0U) {
         wake_ns = ctrl->last_now_ns; /* something is due already */
-    } else if (next_event(ctrl, &when) != EVENT_NONE) {
-        /* Not earlier than the last `now`: an event still due then (the event budget was used
-         * up) is due at once. */
-        wake_ns = later_of(when, ctrl->last_now_ns);
     } else {
-        /* idle until an input */
+        const ctrl_event_t event = next_event(ctrl, &when);
+
+        if (event == EVENT_RX_START) {
+            /* The start of a received frame reports nothing, and no late-caller rule depends
+             * on it: the next thing to do is its end of frame. Nothing else comes in between.
+             * A start of this node's frame waits for the intermission after it; a recovery
+             * waits for its end (next_event); a bus held dominant, the only source of counter
+             * steps, lets no received frame start; and a fault change takes effect once what
+             * was on the bus when it was asked for has passed, so no later than this start,
+             * and at the same instant the fault is taken first. */
+            when += bits_ns(ctrl, ctrl->wire[first_waiting(ctrl)].bits);
+        }
+
+        if (event != EVENT_NONE) {
+            /* Not earlier than the last `now`: an event still due then (the event budget was
+             * used up) is due at once. */
+            wake_ns = later_of(when, ctrl->last_now_ns);
+        }
     }
 
     return wake_ns;

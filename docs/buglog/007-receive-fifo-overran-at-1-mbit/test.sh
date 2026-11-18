@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# The system test that loads the node's bus at 1 Mbit/s with the shortest frames, once with an
+# identifier nobody handles and once with the ping, and counts what the receive FIFO lost. It
+# is marked timing: a host too busy to load the bus, or one that stalls the node's tasks for
+# longer than the FIFO lasts (which shows as dropped ticks), misses a tolerance. As
+# scripts/test-system.sh does, a run whose failures were all such misses is repeated once, and
+# if the repetition misses only timing tolerances too, the status is 75: the run neither shows
+# nor rules out the bug (scripts/buglog-verify.sh reports that as inconclusive).
+report="$FCN_BUILD_ROOT/buglog-007-timing-report.txt"
+run() {
+    rm -f "$report"
+    "$FCN_PYTHON" -m pytest tests/system/test_node_errors.py -q -p no:cacheprovider \
+        -k test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_mbit \
+        --timing-report "$report" --artifacts "$FCN_BUILD_ROOT/system-test-logs"
+}
+only_timing_missed() {
+    [ -s "$report" ] && ! grep -qv '^miss ' "$report"
+}
+run && exit 0
+only_timing_missed || exit 1
+echo "only timing tolerances were missed; repeating once"
+run && exit 0
+only_timing_missed && exit 75
+exit 1

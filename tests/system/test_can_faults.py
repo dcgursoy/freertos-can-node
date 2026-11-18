@@ -7,20 +7,26 @@ together in the running node: fault, controller, interrupt, transmit task, queue
 """
 from __future__ import annotations
 
+import re
+import signal
+import statistics
+import threading
 import time
 
 import can
 import pytest
 
-from fcn_tools.bus import ID_PING, collect, is_pong, is_status, status_gaps, wait_for
+from fcn_tools.bus import (ID_PING, collect, collect_count, drain, is_pong, is_status,
+                           status_fields, status_gaps, status_missing_since_start, wait_for)
 from fcn_tools.node import EXIT_OK
+from fcn_tools.timing import check_timing
 
 
 def ping(payload: bytes) -> can.Message:
     return can.Message(arbitration_id=ID_PING, data=payload, is_extended_id=False)
 
 
-def wait_status(sim, reached, timeout: float = 5.0) -> dict:
+def wait_status(sim, reached, timeout: float = 10.0) -> dict:
     """Poll the controller's status until `reached(status)` holds; fail with the last status."""
     deadline = time.monotonic() + timeout
     while True:
@@ -49,6 +55,12 @@ def assert_fresh_and_in_step(frames: list[can.Message]) -> None:
     status_gaps(frames)
 
 
+def next_status_frames(bus, count: int = 10) -> list[can.Message]:
+    """The next `count` status frames: a number of frames, not a time, so that a slow host
+    does not make the list short."""
+    return collect_count(bus, count, keep=is_status, timeout=10.0)
+
+
 # ------------------------------------------------------------------------ no acknowledgement
 
 
@@ -67,8 +79,7 @@ def test_without_acknowledgement_the_node_goes_error_passive_and_never_bus_off(o
         assert later["tx_failed"] > status["tx_failed"] + 100      # it keeps trying
 
         sim.can_fault("none")
-        frames = collect(link.bus, 0.4, keep=is_status)
-        assert_fresh_and_in_step(frames)
+        assert_fresh_and_in_step(next_status_frames(link.bus))
         # One acknowledged frame takes the counter below 128: error active again.
         status = wait_status(sim, lambda s: s["state"] == "active")
         assert status["tec"] < 128 and status["bus_off"] == 0
@@ -99,9 +110,8 @@ def test_a_shorted_bus_takes_the_node_bus_off_and_it_returns_by_itself(open_link
 
         sim.can_fault("none")
         # The node is somewhere in a hold-off of at most 1.6 s; after it, it is back.
-        first = wait_for(link.bus, is_status, timeout=4.0)
-        assert first is not None, "the node did not return to the bus"
-        frames = [first] + collect(link.bus, 0.4, keep=is_status)
+        frames = next_status_frames(link.bus)
+        assert frames, "the node did not return to the bus"
         assert_fresh_and_in_step(frames)
         status = wait_status(sim, lambda s: s["state"] == "active")
         assert status["tec"] < 128
@@ -109,7 +119,7 @@ def test_a_shorted_bus_takes_the_node_bus_off_and_it_returns_by_itself(open_link
 
         # And it still answers.
         link.bus.send(ping(b"\x42"))
-        pong = wait_for(link.bus, is_pong, timeout=1.0)
+        pong = wait_for(link.bus, is_pong, timeout=5.0)
         assert pong is not None and bytes(pong.data) == b"\x42"
 
     assert link.node.stop() == EXIT_OK
@@ -121,6 +131,46 @@ def test_a_shorted_bus_takes_the_node_bus_off_and_it_returns_by_itself(open_link
     assert queue["produced"] == (queue["sent"] + queue["superseded"] + queue["dropped"]
                                  + queue["expired"] + queue["pending"])
     assert "bus off: requesting recovery" in link.node.log()
+
+
+# Log lines of the transmit task (app/can_io.c): when it took note of bus off, and when it
+# asked the controller to recover. Both are stamped with the node's clock when written.
+_LOG_LINE = re.compile(r"^\[\s*(\d+)\.(\d{6})\] W can: (.*)$", re.MULTILINE)
+_BUS_OFF = "controller state 1 -> 2"
+_RECOVERY = "bus off: requesting recovery"
+
+
+def _holdoffs_ms(log: str) -> list[float]:
+    """Time from each bus off to the request to recover from it, in milliseconds."""
+    holdoffs, bus_off_at = [], None
+    for seconds, micros, text in _LOG_LINE.findall(log):
+        at_ms = int(seconds) * 1000.0 + int(micros) / 1000.0
+        if text.startswith(_BUS_OFF):
+            bus_off_at = at_ms
+        elif text == _RECOVERY and bus_off_at is not None:
+            holdoffs.append(at_ms - bus_off_at)
+            bus_off_at = None
+    return holdoffs
+
+
+@pytest.mark.timing
+def test_recovery_is_requested_when_the_hold_off_ends(open_link):
+    link = open_link()
+    with link.node.sim() as sim:
+        sim.can_fault("short")
+        # Four times bus off, so three hold-offs have ended: 100, 200 and 400 ms
+        # (TX_HOLDOFF_INITIAL_MS in app/can_io.c, doubled at each further bus off).
+        wait_status(sim, lambda s: s["bus_off"] >= 4)
+    assert link.node.stop() == EXIT_OK
+
+    holdoffs = _holdoffs_ms(link.node.log())
+    assert len(holdoffs) >= 3, link.node.log()
+    late_ms = [measured - nominal for measured, nominal in zip(holdoffs, (100.0, 200.0, 400.0))]
+    # The transmit task sleeps until the queue's next deadline, the end of the hold-off, and
+    # rounds that up to the next whole tick: about 1 ms late. A task that slept until some
+    # other wake-up instead (the ticker's publish every 10 ms) is late by up to 10 ms.
+    check_timing(statistics.median(late_ms) < 3.0,
+                 "recovery requested late by " + ", ".join(f"{ms:.1f}" for ms in late_ms) + " ms")
 
 
 # ------------------------------------------------------------------------ bus held dominant
@@ -146,14 +196,13 @@ def test_a_bus_held_dominant_stops_all_traffic_without_bus_off(open_link):
         assert status["bus_off"] == 0
 
         sim.can_fault("none")
-        frames = collect(link.bus, 0.4, keep=is_status)
-        assert_fresh_and_in_step(frames)
+        assert_fresh_and_in_step(next_status_frames(link.bus))
 
         # Transmitting does not lower the receive counter; the first frame the node receives
         # correctly does, and with it the node is error active again.
         assert sim.can_status()["state"] == "passive"
         link.bus.send(ping(b"\x02"))
-        pong = wait_for(link.bus, is_pong, timeout=1.0)
+        pong = wait_for(link.bus, is_pong, timeout=5.0)
         assert pong is not None and bytes(pong.data) == b"\x02"
         status = wait_status(sim, lambda s: s["state"] == "active")
         assert status["rec"] <= 127
@@ -170,15 +219,48 @@ def test_destroyed_transmissions_are_repeated_and_nothing_is_lost(open_link):
         status = wait_status(sim, lambda s: s["tx_failed"] == before["tx_failed"] + 5)
         # Five errors add 40; every frame that got through since takes 1 off.
         assert 0 < status["tec"] <= 40 and status["state"] == "active"
-
-    status_gaps(collect(link.bus, 0.4, keep=is_status))
+        # Ten more frames after that, so that the run goes on well past the errors.
+        wait_status(sim, lambda s: s["tx"] >= status["tx"] + 10)
 
     assert link.node.stop() == EXIT_OK
+    # Everything the node sent, from its first frame to its last: the tester's socket kept
+    # what it did not read during the test.
+    heard = [link.first_status] + drain(link.bus)
     stats = link.node.stats()["can"]
-    # Each destroyed attempt was repeated: nothing was given up, nothing went bus off.
-    assert stats["controller"]["tx_attempts_failed"] == 5
-    assert stats["controller"]["tx_aborted"] == 0 and stats["queue"]["bus_off_count"] == 0
-    assert stats["queue"]["dropped"] == 0 and stats["queue"]["expired"] == 0
+    controller, queue = stats["controller"], stats["queue"]
+    # Each destroyed attempt was repeated: nothing was given up, nothing went bus off. A frame
+    # is aborted only when a status value that waited in its mailbox for a whole period (a
+    # host stall) is called back for its successor, which the queue counts as superseded.
+    assert controller["tx_attempts_failed"] == 5
+    assert controller["tx_aborted"] <= queue["superseded"] and queue["bus_off_count"] == 0
+    assert queue["dropped"] == 0 and queue["expired"] == 0
+    # And nothing was lost on the way: every frame the controller completed reached the
+    # tester, in order, and every value that never left was replaced by its successor in the
+    # node and counted as such, up to the last one the node produced.
+    assert stats["transport_counters"]["tx_frames"] == controller["tx_frames"]
+    assert all(is_status(m) for m in heard) and len(heard) == controller["tx_frames"]
+    assert status_missing_since_start(heard, max_step=None) == queue["superseded"]
+    last_counter = status_fields(heard[-1])[0]
+    assert last_counter <= queue["produced"] <= last_counter + queue["pending"]
+
+
+def test_a_command_is_carried_out_once_even_if_the_node_answers_late(open_link):
+    link = open_link()
+    with link.node.sim() as sim:         # gives up after 3 x 1 s
+        before = sim.can_status()
+        # The node does not run for 1.5 s: longer than the client waits for one answer.
+        link.node.send_signal(signal.SIGSTOP)
+        resume = threading.Timer(1.5, link.node.send_signal, (signal.SIGCONT,))
+        resume.start()
+        try:
+            sim.can_inject("tx", 5)
+        finally:
+            resume.join()
+        # The five destroyed attempts, and then ten frames that got through: had the request
+        # been carried out twice, ten attempts would have been destroyed by now.
+        failed = wait_status(sim, lambda s: s["tx_failed"] >= before["tx_failed"] + 5)
+        after = wait_status(sim, lambda s: s["tx"] >= failed["tx"] + 10)
+        assert after["tx_failed"] == before["tx_failed"] + 5
 
 
 def test_destroyed_receptions_do_not_reach_the_application(open_link):
@@ -188,10 +270,10 @@ def test_destroyed_receptions_do_not_reach_the_application(open_link):
         for n in range(3):
             link.bus.send(ping(bytes([n])))
         # On a real bus the sender would repeat a destroyed frame; this tester does not, so
-        # the three frames are simply gone. The fourth one arrives.
+        # the three frames are simply gone. The fourth one arrives, and its pong is the first.
         link.bus.send(ping(b"\x99"))
-        pongs = collect(link.bus, 0.5, keep=is_pong)
-        assert [bytes(pong.data) for pong in pongs] == [b"\x99"]
+        pong = wait_for(link.bus, is_pong, timeout=5.0)
+        assert pong is not None and bytes(pong.data) == b"\x99"
         status = sim.can_status()
         assert status["rx_errors"] == 3 and status["rx"] == 1
         assert status["rec"] == 2          # three errors up, one good frame down

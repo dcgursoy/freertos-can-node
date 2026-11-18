@@ -521,31 +521,6 @@ static void test_a_frame_arriving_during_a_transmission_is_delivered_after_it(vo
     TEST_ASSERT_EQUAL_UINT64(t0 + bt(111U), got.start_ns);
 }
 
-static void test_a_transmission_requested_while_frames_are_being_received_starts_after_them(void)
-{
-    can_ctrl_t ctrl;
-    const can_frame_t theirs = frame_2aa();
-    const can_frame_t mine = frame_009();
-    const uint64_t a = 1000000U;
-
-    init_ctrl(&ctrl, BITRATE, 0U);
-    TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &theirs, a));
-    TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &theirs, a));
-
-    /* Received: [.., a] and [a + 3, a + 111]. Mine waits for the intermission: [114, 163]. */
-    TEST_ASSERT_TRUE(can_ctrl_tx_submit(&ctrl, &mine, 1U, a + 1000U));
-    run_until(&ctrl, a + bt(1000U), &s_log);
-
-    TEST_ASSERT_EQUAL_UINT32(3U, s_log.count);
-    TEST_ASSERT_EQUAL_INT(CAN_CTRL_ACTION_RX_DELIVER, s_log.action[0].kind);
-    TEST_ASSERT_EQUAL_UINT64(a, s_log.action[0].time_ns);
-    TEST_ASSERT_EQUAL_INT(CAN_CTRL_ACTION_RX_DELIVER, s_log.action[1].kind);
-    TEST_ASSERT_EQUAL_UINT64(a + bt(111U), s_log.action[1].time_ns);
-    TEST_ASSERT_EQUAL_INT(CAN_CTRL_ACTION_TX_COMPLETE, s_log.action[2].kind);
-    TEST_ASSERT_EQUAL_UINT64(a + bt(114U), s_log.action[2].start_ns);
-    TEST_ASSERT_EQUAL_UINT64(a + bt(163U), s_log.action[2].time_ns);
-}
-
 static void test_the_wire_queue_holds_64_frames_and_counts_those_beyond_as_overruns(void)
 {
     can_ctrl_t ctrl;
@@ -577,6 +552,306 @@ static void test_the_wire_queue_holds_64_frames_and_counts_those_beyond_as_overr
 
     EXPECT_WAKEUP(&ctrl, CAN_CTRL_NO_WAKEUP);
     TEST_ASSERT_EQUAL_UINT64(65U, can_ctrl_stats(&ctrl)->rx_frames);
+}
+
+/* ------------------------------------------------- 2b. arbitration against received frames */
+
+/* s_log.action[i] is an action of `kind` for a frame on the bus [start, end]. */
+#define EXPECT_LOGGED(i, kind, start, end) expect_logged((i), (kind), (start), (end), __LINE__)
+
+static void expect_logged(uint32_t i, can_ctrl_action_kind_t kind, uint64_t start_ns,
+                          uint64_t end_ns, int line)
+{
+    UNITY_TEST_ASSERT(i < s_log.count, line, "the action was logged");
+    UNITY_TEST_ASSERT_EQUAL_INT(kind, s_log.action[i].kind, line, "action kind");
+    UNITY_TEST_ASSERT_EQUAL_UINT64(start_ns, s_log.action[i].start_ns, line, "start of frame");
+    UNITY_TEST_ASSERT_EQUAL_UINT64(end_ns, s_log.action[i].time_ns, line, "end of frame");
+}
+
+/* Two received frames 0x2AA handed in at a: the first passed on a free bus, [a - 108, a]; the
+ * second could not, and waits for the bus, which is free at a + 3. Then `second`, a frame of
+ * another node that waits behind it, if not NULL; then `mine` is submitted at a + 1000 ns,
+ * during the intermission. */
+static void wait_behind_a_received_frame(can_ctrl_t *ctrl, const can_frame_t *second,
+                                         const can_frame_t *mine, uint64_t a)
+{
+    const can_frame_t theirs = frame_2aa();
+
+    init_ctrl(ctrl, BITRATE, 0U);
+    TEST_ASSERT_TRUE(can_ctrl_wire_rx(ctrl, &theirs, a));
+    TEST_ASSERT_TRUE(can_ctrl_wire_rx(ctrl, &theirs, a));
+
+    if (second != NULL) {
+        TEST_ASSERT_TRUE(can_ctrl_wire_rx(ctrl, second, a));
+    }
+
+    TEST_ASSERT_TRUE(can_ctrl_tx_submit(ctrl, mine, 1U, a + 1000U));
+}
+
+/* When the bus becomes free at a + 3, the waiting 0x2AA and this node's 0x009 arbitrate, as
+ * on a real bus, and the smaller key wins: 0x009 [a + 3, a + 52], then 0x2AA [a + 55, a + 163].
+ * (Until bug 005 was fixed, received frames went first whatever their key: 0x009 [114, 163].) */
+static void test_a_frame_of_this_node_goes_before_a_waiting_received_frame_with_a_larger_key(void)
+{
+    can_ctrl_t ctrl;
+    const can_frame_t mine = frame_009();
+    const uint64_t a = 1000000U;
+
+    wait_behind_a_received_frame(&ctrl, NULL, &mine, a);
+    run_until(&ctrl, a + bt(1000U), &s_log);
+
+    TEST_ASSERT_EQUAL_UINT32(3U, s_log.count);
+    EXPECT_LOGGED(0U, CAN_CTRL_ACTION_RX_DELIVER, a - bt(LEN_2AA), a);
+    EXPECT_LOGGED(1U, CAN_CTRL_ACTION_TX_COMPLETE, a + bt(3U), a + bt(52U));
+    EXPECT_LOGGED(2U, CAN_CTRL_ACTION_RX_DELIVER, a + bt(55U), a + bt(163U));
+    EXPECT_WAKEUP(&ctrl, CAN_CTRL_NO_WAKEUP);
+}
+
+/* The mirror case: the waiting received frame has the smaller key and goes first. 0x2AA
+ * passed, [a - 108, a]; a received 0x000 waits; this node's 0x009 is submitted at a + 1000 ns.
+ * 0x000 [a + 3, a + 53], then 0x009 [a + 56, a + 105]. */
+static void test_a_waiting_received_frame_with_a_smaller_key_goes_before_this_node(void)
+{
+    can_ctrl_t ctrl;
+    const can_frame_t theirs = frame_2aa();
+    const can_frame_t first = frame_000();
+    const can_frame_t mine = frame_009();
+    const uint64_t a = 1000000U;
+
+    init_ctrl(&ctrl, BITRATE, 0U);
+    TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &theirs, a));
+    TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &first, a));
+    TEST_ASSERT_TRUE(can_ctrl_tx_submit(&ctrl, &mine, 1U, a + 1000U));
+    run_until(&ctrl, a + bt(1000U), &s_log);
+
+    TEST_ASSERT_EQUAL_UINT32(3U, s_log.count);
+    EXPECT_LOGGED(0U, CAN_CTRL_ACTION_RX_DELIVER, a - bt(LEN_2AA), a);
+    EXPECT_LOGGED(1U, CAN_CTRL_ACTION_RX_DELIVER, a + bt(3U), a + bt(53U));
+    EXPECT_FRAME(&first, &s_log.action[1].frame);
+    EXPECT_LOGGED(2U, CAN_CTRL_ACTION_TX_COMPLETE, a + bt(56U), a + bt(105U));
+}
+
+/* Equal keys: the received frame goes first (ARBITRATION in can_ctrl.h). 0x2AA passed,
+ * [a - 108, a]; a received 0x009 waits; this node's 0x009 is submitted at a + 1000 ns. The
+ * received one [a + 3, a + 52], this node's [a + 55, a + 104]. */
+static void test_with_equal_keys_the_waiting_received_frame_goes_first(void)
+{
+    can_ctrl_t ctrl;
+    const can_frame_t theirs = frame_2aa();
+    const can_frame_t same = frame_009();
+    const uint64_t a = 1000000U;
+
+    init_ctrl(&ctrl, BITRATE, 0U);
+    TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &theirs, a));
+    TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &same, a));
+    TEST_ASSERT_TRUE(can_ctrl_tx_submit(&ctrl, &same, 1U, a + 1000U));
+    run_until(&ctrl, a + bt(1000U), &s_log);
+
+    TEST_ASSERT_EQUAL_UINT32(3U, s_log.count);
+    EXPECT_LOGGED(1U, CAN_CTRL_ACTION_RX_DELIVER, a + bt(3U), a + bt(52U));
+    EXPECT_LOGGED(2U, CAN_CTRL_ACTION_TX_COMPLETE, a + bt(55U), a + bt(104U));
+}
+
+/*
+ * Only the oldest waiting received frame competes, so received frames keep their arrival
+ * order. Behind the waiting 0x2AA a received 0x000 waits; this node submits 0x078 and 0x104 at
+ * a + 1000 ns. Both win against the 0x2AA at the head: 0x078 [a + 3, a + 52], 0x104
+ * [a + 55, a + 102]. Then the received frames, in order: 0x2AA [a + 105, a + 213] and 0x000
+ * [a + 216, a + 266], although 0x000 has the smallest key of all four.
+ */
+static void test_a_received_frame_with_a_small_key_waits_behind_an_older_received_frame(void)
+{
+    can_ctrl_t ctrl;
+    const can_frame_t f000 = frame_000();
+    const can_frame_t f078 = frame_078();
+    const can_frame_t f104 = frame_104();
+    const uint64_t a = 1000000U;
+
+    wait_behind_a_received_frame(&ctrl, &f000, &f078, a);
+    TEST_ASSERT_TRUE(can_ctrl_tx_submit(&ctrl, &f104, 2U, a + 1000U));
+    run_until(&ctrl, a + bt(1000U), &s_log);
+
+    TEST_ASSERT_EQUAL_UINT32(5U, s_log.count);
+    EXPECT_LOGGED(1U, CAN_CTRL_ACTION_TX_COMPLETE, a + bt(3U), a + bt(52U));
+    EXPECT_LOGGED(2U, CAN_CTRL_ACTION_TX_COMPLETE, a + bt(55U), a + bt(102U));
+    TEST_ASSERT_EQUAL_UINT32(2U, s_log.action[2].handle);
+    EXPECT_LOGGED(3U, CAN_CTRL_ACTION_RX_DELIVER, a + bt(105U), a + bt(213U));
+    EXPECT_LOGGED(4U, CAN_CTRL_ACTION_RX_DELIVER, a + bt(216U), a + bt(266U));
+    EXPECT_FRAME(&f000, &s_log.action[4].frame);
+}
+
+/* It is this node's best mailbox that competes, and the frames of both nodes interleave by
+ * key. A received 0x078 waits behind the 0x2AA that passed; this node submits 0x104 (mailbox 0)
+ * and 0x009 (mailbox 1) at a + 1000 ns. At a + 3, 0x009 wins against 0x078 [a + 3, a + 52];
+ * at a + 55, 0x078 wins against 0x104 [a + 55, a + 104]; 0x104 goes last [a + 107, a + 154]. */
+static void test_the_best_mailbox_competes_and_the_frames_of_both_nodes_interleave_by_key(void)
+{
+    can_ctrl_t ctrl;
+    const can_frame_t theirs = frame_2aa();
+    const can_frame_t f078 = frame_078();
+    const can_frame_t f104 = frame_104();
+    const can_frame_t f009 = frame_009();
+    const uint64_t a = 1000000U;
+
+    init_ctrl(&ctrl, BITRATE, 0U);
+    TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &theirs, a));
+    TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &f078, a));
+    TEST_ASSERT_TRUE(can_ctrl_tx_submit(&ctrl, &f104, 1U, a + 1000U));
+    TEST_ASSERT_TRUE(can_ctrl_tx_submit(&ctrl, &f009, 2U, a + 1000U));
+    run_until(&ctrl, a + bt(1000U), &s_log);
+
+    TEST_ASSERT_EQUAL_UINT32(4U, s_log.count);
+    EXPECT_LOGGED(1U, CAN_CTRL_ACTION_TX_COMPLETE, a + bt(3U), a + bt(52U));
+    TEST_ASSERT_EQUAL_UINT32(2U, s_log.action[1].handle);
+    EXPECT_LOGGED(2U, CAN_CTRL_ACTION_RX_DELIVER, a + bt(55U), a + bt(104U));
+    EXPECT_LOGGED(3U, CAN_CTRL_ACTION_TX_COMPLETE, a + bt(107U), a + bt(154U));
+    TEST_ASSERT_EQUAL_UINT32(1U, s_log.action[3].handle);
+}
+
+/* A frame handed in at the very instant the bus becomes free did not have the bus before that
+ * instant: it waits and arbitrates with what is due then. This node's 0x009 and 0x078 are
+ * submitted at t0: 0x009 [t0, t0 + 49], and the bus is free again at t0 + 52, where 0x078 is
+ * due. A received 0x2AA handed in at t0 + 52 loses to it: 0x078 [t0 + 52, t0 + 101], then
+ * 0x2AA [t0 + 104, t0 + 212]. */
+static void test_a_frame_handed_in_at_the_instant_the_bus_becomes_free_arbitrates(void)
+{
+    can_ctrl_t ctrl;
+    const can_frame_t theirs = frame_2aa();
+    const can_frame_t f009 = frame_009();
+    const can_frame_t f078 = frame_078();
+    const uint64_t t0 = 1000000U;
+
+    init_ctrl(&ctrl, BITRATE, 0U);
+    TEST_ASSERT_TRUE(can_ctrl_tx_submit(&ctrl, &f009, 1U, t0));
+    TEST_ASSERT_TRUE(can_ctrl_tx_submit(&ctrl, &f078, 2U, t0));
+    EXPECT_ACTION(&ctrl, t0 + bt(49U), CAN_CTRL_ACTION_TX_COMPLETE, t0 + bt(49U));
+    TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &theirs, t0 + bt(52U)));
+    run_until(&ctrl, t0 + bt(1000U), &s_log);
+
+    TEST_ASSERT_EQUAL_UINT32(2U, s_log.count);
+    EXPECT_LOGGED(0U, CAN_CTRL_ACTION_TX_COMPLETE, t0 + bt(52U), t0 + bt(101U));
+    EXPECT_LOGGED(1U, CAN_CTRL_ACTION_RX_DELIVER, t0 + bt(104U), t0 + bt(212U));
+}
+
+/* The late-caller rule moves the start of this node's frame that won, and the received frame
+ * that lost waits for it. As in the first test of this section, 0x009 wins the free bus at
+ * a + 3; but the first poll comes at L = a + 3 + 49 bit times + 1 ns, more than a frame length
+ * later. 0x009 starts at L, [L, L + 49]; the 0x2AA follows it, [L + 52, L + 160]. */
+static void test_a_late_poll_moves_a_start_won_against_a_received_frame_and_that_frame_waits(void)
+{
+    can_ctrl_t ctrl;
+    const can_frame_t mine = frame_009();
+    const uint64_t a = 1000000U;
+    const uint64_t late = a + bt(3U + LEN_009) + 1U;
+
+    wait_behind_a_received_frame(&ctrl, NULL, &mine, a);
+    collect(&ctrl, late, &s_log);
+    TEST_ASSERT_EQUAL_UINT32(1U, s_log.count);
+    TEST_ASSERT_EQUAL_UINT64(1U, can_ctrl_stats(&ctrl)->late_resyncs);
+    run_until(&ctrl, late + bt(1000U), &s_log);
+
+    TEST_ASSERT_EQUAL_UINT32(3U, s_log.count);
+    EXPECT_LOGGED(1U, CAN_CTRL_ACTION_TX_COMPLETE, late, late + bt(49U));
+    EXPECT_LOGGED(2U, CAN_CTRL_ACTION_RX_DELIVER, late + bt(52U), late + bt(160U));
+}
+
+/*
+ * A flood from other nodes that the bus cannot carry. 64 received frames with identifiers from
+ * 0x700 (8 data bytes) are handed in at once, and 5 more every 600 bit times; this node submits
+ * a frame 0x030 every 600 bit times, 20 in all. A frame takes about 130 bit times, so the wire
+ * queue stays full and frames beyond it are overruns. Each frame of this node starts at the
+ * first start of frame after its submission: it waits at most for the received frame on the
+ * bus at that moment and its intermission, never for the backlog. The received frames still
+ * come out in the order they were handed in, and every one is either delivered or an overrun.
+ */
+#define FLOOD_PERIOD_BITS 600U
+#define FLOOD_OWN_FRAMES  20U
+#define FLOOD_REFILL      5U
+#define FLOOD_FRAMES_MAX  (CAN_CTRL_WIRE_QUEUE + (FLOOD_OWN_FRAMES * FLOOD_REFILL))
+
+typedef struct {
+    uint32_t id[FLOOD_FRAMES_MAX]; /* identifiers of the accepted frames, in order */
+    uint32_t accepted;
+    uint32_t handed;
+    uint32_t longest_bits; /* the longest frame handed in */
+} flood_t;
+
+static void flood_hand_in(can_ctrl_t *ctrl, flood_t *flood, uint64_t now_ns)
+{
+    const can_frame_t frame = base_frame(0x700U + flood->handed, 8U, 0x55U);
+    can_bits_info_t info = {0U, 0U, 0U};
+
+    TEST_ASSERT_TRUE(can_bits_exact(&frame, &info));
+
+    if (info.frame_bits > flood->longest_bits) {
+        flood->longest_bits = info.frame_bits;
+    }
+
+    if (can_ctrl_wire_rx(ctrl, &frame, now_ns)) {
+        flood->id[flood->accepted] = frame.id;
+        flood->accepted++;
+    }
+
+    flood->handed++;
+}
+
+static void test_a_flood_with_larger_keys_delays_this_node_by_one_frame_at_most(void)
+{
+    can_ctrl_t ctrl;
+    flood_t flood;
+    const can_frame_t mine = base_frame(0x030U, 8U, 0x5AU);
+    const uint64_t a = 1000000U;
+    uint32_t sent = 0U;
+    uint32_t received = 0U;
+    uint32_t waited = 0U;
+
+    (void)memset(&flood, 0, sizeof(flood));
+    init_ctrl(&ctrl, BITRATE, 0U);
+
+    for (uint32_t i = 0U; i < CAN_CTRL_WIRE_QUEUE; i++) {
+        flood_hand_in(&ctrl, &flood, a);
+    }
+
+    for (uint32_t p = 0U; p < FLOOD_OWN_FRAMES; p++) {
+        const uint64_t t = a + bt(37U + (FLOOD_PERIOD_BITS * p));
+
+        run_until(&ctrl, t, &s_log);
+        /* The backlog is there: received frames are waiting for the bus (private fields, read
+         * only to check that the scenario is what it claims to be). */
+        TEST_ASSERT_TRUE(ctrl.wire_count > ctrl.wire_placed);
+        TEST_ASSERT_TRUE(can_ctrl_tx_submit(&ctrl, &mine, p, t));
+
+        for (uint32_t i = 0U; i < FLOOD_REFILL; i++) {
+            flood_hand_in(&ctrl, &flood, t);
+        }
+    }
+
+    run_until(&ctrl, a + 100000000U, &s_log);
+
+    for (uint32_t i = 0U; i < s_log.count; i++) {
+        const can_ctrl_action_t *const action = &s_log.action[i];
+
+        if (action->kind == CAN_CTRL_ACTION_TX_COMPLETE) {
+            TEST_ASSERT_EQUAL_UINT32(sent, action->handle);
+            TEST_ASSERT_TRUE(action->start_ns >= action->submit_ns);
+            TEST_ASSERT_TRUE((action->start_ns - action->submit_ns) <=
+                             bt(flood.longest_bits + CAN_BITS_INTERMISSION));
+            waited += (action->start_ns > action->submit_ns) ? 1U : 0U;
+            sent++;
+        } else {
+            TEST_ASSERT_EQUAL_INT(CAN_CTRL_ACTION_RX_DELIVER, action->kind);
+            TEST_ASSERT_TRUE(received < flood.accepted);
+            TEST_ASSERT_EQUAL_HEX32(flood.id[received], action->frame.id);
+            received++;
+        }
+    }
+
+    TEST_ASSERT_EQUAL_UINT32(FLOOD_OWN_FRAMES, sent);
+    TEST_ASSERT_TRUE(waited > 0U);
+    TEST_ASSERT_EQUAL_UINT32(flood.accepted, received);
+    TEST_ASSERT_EQUAL_UINT64(flood.accepted, can_ctrl_stats(&ctrl)->rx_frames);
+    TEST_ASSERT_EQUAL_UINT64(flood.handed - flood.accepted, can_ctrl_stats(&ctrl)->wire_overruns);
+    TEST_ASSERT_TRUE(can_ctrl_stats(&ctrl)->wire_overruns > 0U);
 }
 
 /* ------------------------------------------------------------------- 3. late callers */
@@ -1188,6 +1463,27 @@ static void test_a_received_frame_due_to_start_at_the_instant_of_a_short_never_p
     TEST_ASSERT_EQUAL_UINT64(1U, can_ctrl_stats(&ctrl)->rx_frames);
 }
 
+/* The same with a poll at a + 3 before the short is set at that instant: the poll has put the
+ * second frame on the timeline, due to start at a + 3, and it has still not started when the
+ * short is set (free_after_started). Since received frames wait for the bus instead of being
+ * placed in advance (bug 005), this is the case of bug 004. */
+static void test_a_received_frame_placed_at_the_instant_of_a_short_never_passes(void)
+{
+    can_ctrl_t ctrl;
+    const can_frame_t frame = frame_000();
+    const uint64_t a = 1000000U;
+
+    init_ctrl(&ctrl, BITRATE, 0U);
+    TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &frame, a));
+    TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &frame, a));
+    EXPECT_ACTION(&ctrl, a + bt(3U), CAN_CTRL_ACTION_RX_DELIVER, a);
+    can_ctrl_set_fault(&ctrl, CAN_BUS_FAULT_SHORT, a + bt(3U));
+    EXPECT_SILENT_STEP(&ctrl, a + bt(3U));
+    TEST_ASSERT_EQUAL_UINT64(1U, can_ctrl_stats(&ctrl)->rx_lost_fault);
+    EXPECT_WAKEUP(&ctrl, CAN_CTRL_NO_WAKEUP);
+    TEST_ASSERT_EQUAL_UINT64(1U, can_ctrl_stats(&ctrl)->rx_frames);
+}
+
 /* A fault set in the intermission after a received frame takes effect at its end. One 0x000
  * ends at a; held dominant from a + 1, the fault takes effect at a + 3 and the first counter
  * step comes 6 bits later, at a + 9. */
@@ -1315,10 +1611,76 @@ static void test_a_short_drops_the_received_frames_that_have_not_started(void)
 }
 
 /*
+ * A fault set while a full action queue holds the model up still takes effect from the next
+ * frame, also for a received frame that had to wait and starts before the fault. 20 frames
+ * 0x000 arrive at a: frame k is [a + 53 k - 50, a + 53 k]; the first passed on a free bus, the
+ * others waited. A poll at p = a + 760 bit times without taking actions stops after 15 of
+ * them, before frame 15 [a + 745, a + 795] has started. A short set then takes effect at p, in
+ * the middle of frame 15: frame 15 passes, frames 16 to 19 never start.
+ */
+static void test_a_fault_set_while_the_model_is_held_up_spares_a_frame_that_started_before_it(void)
+{
+    can_ctrl_t ctrl;
+    const can_frame_t frame = frame_000();
+    const uint64_t a = 1000000U;
+    const uint64_t p = a + bt(760U);
+
+    init_ctrl(&ctrl, BITRATE, 0U);
+
+    for (uint32_t i = 0U; i < 20U; i++) {
+        TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &frame, a));
+    }
+
+    TEST_ASSERT_TRUE(can_ctrl_poll(&ctrl, p, NULL));
+    TEST_ASSERT_EQUAL_UINT64(15U, can_ctrl_stats(&ctrl)->rx_frames);
+    can_ctrl_set_fault(&ctrl, CAN_BUS_FAULT_SHORT, p);
+    run_until(&ctrl, p + bt(1000U), &s_log);
+
+    TEST_ASSERT_EQUAL_UINT32(16U, s_log.count);
+    EXPECT_LOGGED(15U, CAN_CTRL_ACTION_RX_DELIVER, a + bt(745U), a + bt(795U));
+    TEST_ASSERT_EQUAL_UINT64(4U, can_ctrl_stats(&ctrl)->rx_lost_fault);
+    TEST_ASSERT_EQUAL_UINT64(16U, can_ctrl_stats(&ctrl)->rx_frames);
+    EXPECT_WAKEUP(&ctrl, CAN_CTRL_NO_WAKEUP);
+}
+
+/*
+ * A frame handed in at the very instant the removal of a dominant bus takes effect waits for
+ * the bus to be released, 11 recessive bits: [r + 11, r + 61]. The bus became free long before
+ * the fault, so without it the frame would have ended at its arrival, r, inside the period of
+ * dominant bus.
+ */
+static void test_a_frame_handed_in_as_a_dominant_bus_is_released_waits_for_the_release(void)
+{
+    can_ctrl_t ctrl;
+    const can_frame_t frame = frame_000();
+    const uint64_t b = 1000000U;
+    const uint64_t r = b + 10000000U;
+
+    init_ctrl(&ctrl, BITRATE, 0U);
+    can_ctrl_set_fault(&ctrl, CAN_BUS_FAULT_STUCK_DOMINANT, b);
+    run_until(&ctrl, r, &s_log); /* the counter steps; one change to error passive */
+    can_ctrl_set_fault(&ctrl, CAN_BUS_FAULT_NONE, r);
+    TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &frame, r));
+    EXPECT_SILENT_STEP(&ctrl, r); /* the release takes effect */
+
+    /* The frame is received with REC 255: rule 8 takes the counter below 128 first. */
+    const can_ctrl_action_t change =
+        EXPECT_ACTION(&ctrl, r + bt(61U), CAN_CTRL_ACTION_STATE_CHANGED, r + bt(61U));
+
+    EXPECT_CHANGE(&change, CAN_FC_ERROR_PASSIVE, CAN_FC_ERROR_ACTIVE);
+
+    const can_ctrl_action_t got =
+        EXPECT_ACTION(&ctrl, r + bt(61U), CAN_CTRL_ACTION_RX_DELIVER, r + bt(61U));
+
+    TEST_ASSERT_EQUAL_UINT64(r + bt(11U), got.start_ns);
+}
+
+/*
  * Suspend transmission applies to the transmitter of the LAST frame on the bus. Using the
  * trajectory of the no-acknowledgment test: the node is error passive after attempt 15 (ends at
- * 941); attempt 16 is [952, 1008]. A frame received during it is placed after it, [1011, 1061],
- * and is then the last frame: attempt 17 starts after its intermission, at 1064, not at
+ * 941); attempt 16 is [952, 1008]. A frame received during it waits for the bus and starts at
+ * the end of the intermission, where this node, in its suspend, does not compete: [1011, 1061].
+ * It is then the last frame: attempt 17 starts after its intermission, at 1064, not at
  * 1008 + 11 = 1019 (which would overlap it) nor 8 bits later.
  */
 static void test_suspend_transmission_ends_when_another_node_sends_the_last_frame(void)
@@ -1902,6 +2264,40 @@ static void test_a_frame_submitted_while_the_model_is_held_up_competes_from_its_
     TEST_ASSERT_EQUAL_UINT64(0U, can_ctrl_stats(&ctrl)->late_resyncs);
 }
 
+/* Received frames keep their arrival order also while a full action queue holds the model up:
+ * a frame handed in then goes behind the frames still waiting, although the bus, as the model
+ * stands, has been free for it since long before. 20 frames 0x000 arrive at a (frame k ends at
+ * a + 53 k); a poll at `late` without taking actions stops after 15 of them. 0x009 handed in
+ * at `late` comes out after the other five, [late, late + 49]: it competes from its hand-in. */
+static void test_a_frame_handed_in_while_the_model_is_held_up_goes_behind_the_waiting_ones(void)
+{
+    can_ctrl_t ctrl;
+    const can_frame_t frame = frame_000();
+    const can_frame_t f009 = frame_009();
+    const uint64_t a = 1000000U;
+    const uint64_t late = a + 1000000000U;
+
+    init_ctrl(&ctrl, BITRATE, 0U);
+
+    for (uint32_t i = 0U; i < 20U; i++) {
+        TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &frame, a));
+    }
+
+    TEST_ASSERT_TRUE(can_ctrl_poll(&ctrl, late, NULL));
+    TEST_ASSERT_EQUAL_UINT64(15U, can_ctrl_stats(&ctrl)->rx_frames);
+    TEST_ASSERT_TRUE(can_ctrl_wire_rx(&ctrl, &f009, late));
+    run_until(&ctrl, late + bt(1000U), &s_log);
+
+    TEST_ASSERT_EQUAL_UINT32(21U, s_log.count);
+
+    for (uint32_t k = 1U; k < 20U; k++) {
+        EXPECT_LOGGED(k, CAN_CTRL_ACTION_RX_DELIVER, a + bt((53U * k) - 50U), a + bt(53U * k));
+    }
+
+    EXPECT_LOGGED(20U, CAN_CTRL_ACTION_RX_DELIVER, late, late + bt(LEN_009));
+    EXPECT_FRAME(&f009, &s_log.action[20].frame);
+}
+
 /* The same, but the queue is read 100 bit times after s, more than a frame length: the start
  * moves to that poll (late-caller rule), and by then 0x009 is there and wins arbitration. */
 static void test_a_start_moved_by_a_late_poll_is_arbitrated_among_the_frames_there_by_then(void)
@@ -2154,6 +2550,7 @@ typedef struct {
     uint32_t count;
     uint8_t fate[SCRIPT_MAX]; /* by handle (the script index): FRAME_* or 0 if never accepted */
     uint64_t start_ns;
+    uint64_t free_ns; /* end of the intermission after the last frame reported */
 } trace_t;
 
 static input_t s_script[SCRIPT_MAX];
@@ -2222,8 +2619,8 @@ static uint32_t make_script(uint32_t seed)
         in->value = count;
 
         /* Received traffic is kept well below the bus capacity apart from rare bursts: a
-         * received frame is placed ahead of any transmission that has not started, so a
-         * sustained flood would leave few transmissions to compare. */
+         * waiting received frame with a smaller key goes ahead of a transmission, so a
+         * sustained flood would leave few transmissions with large keys to compare. */
         if (pick < 55U) {
             in->kind = INPUT_SUBMIT;
         } else if (pick < 75U) {
@@ -2281,6 +2678,14 @@ static void drain(can_ctrl_t *ctrl, uint64_t now_ns, trace_t *trace)
         add_record(trace, &record);
 
         TEST_ASSERT_TRUE(action.time_ns <= now_ns);
+
+        /* One frame at a time: whoever sent them, the frames reported follow one another on
+         * the bus, each after the intermission of the one before. */
+        if ((action.kind == CAN_CTRL_ACTION_TX_COMPLETE) ||
+            (action.kind == CAN_CTRL_ACTION_RX_DELIVER)) {
+            TEST_ASSERT_TRUE(action.start_ns >= trace->free_ns);
+            trace->free_ns = action.time_ns + bt(CAN_BITS_INTERMISSION);
+        }
 
         if ((action.kind == CAN_CTRL_ACTION_TX_COMPLETE) ||
             (action.kind == CAN_CTRL_ACTION_TX_ABORTED)) {
@@ -2548,8 +2953,15 @@ int main(void)
     RUN_TEST(test_a_frame_arriving_on_a_free_bus_is_delivered_at_its_arrival);
     RUN_TEST(test_frames_arriving_faster_than_the_bit_rate_are_delivered_at_bus_speed_in_order);
     RUN_TEST(test_a_frame_arriving_during_a_transmission_is_delivered_after_it);
-    RUN_TEST(test_a_transmission_requested_while_frames_are_being_received_starts_after_them);
     RUN_TEST(test_the_wire_queue_holds_64_frames_and_counts_those_beyond_as_overruns);
+    RUN_TEST(test_a_frame_of_this_node_goes_before_a_waiting_received_frame_with_a_larger_key);
+    RUN_TEST(test_a_waiting_received_frame_with_a_smaller_key_goes_before_this_node);
+    RUN_TEST(test_with_equal_keys_the_waiting_received_frame_goes_first);
+    RUN_TEST(test_a_received_frame_with_a_small_key_waits_behind_an_older_received_frame);
+    RUN_TEST(test_the_best_mailbox_competes_and_the_frames_of_both_nodes_interleave_by_key);
+    RUN_TEST(test_a_frame_handed_in_at_the_instant_the_bus_becomes_free_arbitrates);
+    RUN_TEST(test_a_late_poll_moves_a_start_won_against_a_received_frame_and_that_frame_waits);
+    RUN_TEST(test_a_flood_with_larger_keys_delays_this_node_by_one_frame_at_most);
     RUN_TEST(test_a_poll_one_frame_length_after_the_possible_start_is_not_late);
     RUN_TEST(test_a_later_poll_moves_the_start_to_the_poll_and_counts_a_resync);
     RUN_TEST(test_a_late_poll_after_a_failed_attempt_moves_the_retransmission);
@@ -2568,10 +2980,13 @@ int main(void)
     RUN_TEST(test_a_dominant_fault_set_during_the_last_queued_frame_waits_for_its_intermission);
     RUN_TEST(test_a_frame_handed_in_is_judged_by_the_fault_last_set_before_it_takes_effect);
     RUN_TEST(test_a_received_frame_due_to_start_at_the_instant_of_a_short_never_passes);
+    RUN_TEST(test_a_received_frame_placed_at_the_instant_of_a_short_never_passes);
     RUN_TEST(test_a_fault_set_in_the_intermission_after_a_received_frame_waits_for_its_end);
     RUN_TEST(test_after_a_passive_error_flag_rule_6_counts_eight_dominant_bits);
     RUN_TEST(test_a_bus_held_dominant_ends_the_suspend_of_the_last_transmitter);
     RUN_TEST(test_a_short_drops_the_received_frames_that_have_not_started);
+    RUN_TEST(test_a_fault_set_while_the_model_is_held_up_spares_a_frame_that_started_before_it);
+    RUN_TEST(test_a_frame_handed_in_as_a_dominant_bus_is_released_waits_for_the_release);
     RUN_TEST(test_suspend_transmission_ends_when_another_node_sends_the_last_frame);
     RUN_TEST(test_a_bus_off_node_neither_sends_nor_receives_and_keeps_its_frames_until_aborted);
     RUN_TEST(test_recovery_starts_only_on_request_and_takes_1408_bit_times_on_an_idle_bus);
@@ -2591,6 +3006,7 @@ int main(void)
     RUN_TEST(test_a_ninth_frame_is_refused_while_eight_mailboxes_are_in_use);
     RUN_TEST(test_a_full_action_queue_stops_the_model_without_losing_an_action);
     RUN_TEST(test_a_frame_submitted_while_the_model_is_held_up_competes_from_its_submission);
+    RUN_TEST(test_a_frame_handed_in_while_the_model_is_held_up_goes_behind_the_waiting_ones);
     RUN_TEST(test_a_start_moved_by_a_late_poll_is_arbitrated_among_the_frames_there_by_then);
     RUN_TEST(test_injected_error_counts_saturate_instead_of_wrapping);
     RUN_TEST(test_an_input_dated_before_what_was_processed_does_not_go_back_in_time);

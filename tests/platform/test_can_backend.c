@@ -2,33 +2,52 @@
 /*
  * Tests of the CAN transports (platform/posix/can_backend*): the UDP datagram format, the UDP
  * bus between several participants on the loopback interface, and SocketCAN when the machine
- * has a vcan0 interface (the test is reported as ignored when it does not).
+ * has a vcan0 interface (FCN_TEST_CAN_INTERFACE names another; the tests are reported as
+ * ignored when it does not exist). The SocketCAN tests hold the same lock on the interface as
+ * the system tests (tests/conftest.py), so the two never count each other's frames.
  */
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "can_backend.h"
 #include "test_bus_ports.h"
 #include "unity.h"
 
+/* After can_backend.h: linux/can.h defines CAN_MAX_DLC as well, and only a definition that
+ * comes second, in a system header, is exempt from the redefinition warning. */
+#include <linux/can.h>
+#include <linux/can/raw.h>
+
 #define RECEIVE_TIMEOUT_MS 500
 
 static char s_error[160];
+static int s_interface_lock; /* the lock on the SocketCAN interface, -1 while not held */
 
 void setUp(void)
 {
     s_error[0] = '\0';
+    s_interface_lock = -1;
 }
 
 void tearDown(void)
 {
+    if (s_interface_lock >= 0) {
+        (void)flock(s_interface_lock, LOCK_UN);
+        (void)close(s_interface_lock);
+        s_interface_lock = -1;
+    }
 }
 
 /* Wait until a frame arrives or the timeout passes. */
@@ -369,6 +388,114 @@ static void test_udp_drops_datagrams_that_do_not_come_from_the_bus(void)
     node.close(&node);
 }
 
+static void test_udp_drops_datagrams_from_a_bus_port_of_another_loopback_address(void)
+{
+    /* Every 127.x.y.z address is the local machine, but the bus is 127.0.0.1 only: a datagram
+     * from a bus port number on 127.0.0.2 comes from outside the bus. */
+    const uint16_t base = test_bus_fresh_base_port();
+    const can_frame_t valid = make_frame(0x322U, 0U, 2U, 0x78U);
+    uint8_t datagram[CAN_UDP_DATAGRAM_LEN];
+    struct sockaddr_in address;
+    can_backend_t node;
+    can_frame_t received = {0};
+    const int outsider = socket(AF_INET, SOCK_DGRAM, 0);
+
+    TEST_ASSERT_TRUE_MESSAGE(can_backend_udp_open(&node, base, s_error, sizeof(s_error)), s_error);
+    TEST_ASSERT_TRUE(outsider >= 0);
+    (void)memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons((uint16_t)(base + 1U)); /* a slot of the bus, by number */
+    address.sin_addr.s_addr = htonl(0x7F000002U);    /* 127.0.0.2 */
+    TEST_ASSERT_EQUAL_INT(0, bind(outsider, (const struct sockaddr *)&address, sizeof(address)));
+
+    can_udp_encode(&valid, datagram);
+    address.sin_port = htons(base); /* the node took the first slot */
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    TEST_ASSERT_EQUAL_INT((int)sizeof(datagram),
+                          (int)sendto(outsider, datagram, sizeof(datagram), 0,
+                                      (const struct sockaddr *)&address, sizeof(address)));
+    (void)close(outsider);
+
+    TEST_ASSERT_EQUAL_INT(0, receive_within(&node, &received, 100));
+    TEST_ASSERT_EQUAL_UINT64(1U, node.rx_malformed);
+    TEST_ASSERT_EQUAL_UINT64(0U, node.rx_frames);
+    node.close(&node);
+}
+
+static void test_a_send_and_a_receive_the_socket_refuses_are_counted_with_their_error(void)
+{
+    const uint16_t base = test_bus_fresh_base_port();
+    const can_frame_t frame = make_frame(0x323U, 0U, 1U, 0x79U);
+    can_backend_t node;
+    can_frame_t received = {0};
+    int fd;
+
+    TEST_ASSERT_TRUE_MESSAGE(can_backend_udp_open(&node, base, s_error, sizeof(s_error)), s_error);
+    TEST_ASSERT_EQUAL_INT(0, node.last_error);
+
+    /* A descriptor that is not open: every system call on it fails with EBADF. */
+    fd = node.fd;
+    node.fd = -1;
+    TEST_ASSERT_FALSE(node.send(&node, &frame));
+    TEST_ASSERT_EQUAL_UINT64(1U, node.tx_failed);
+    TEST_ASSERT_EQUAL_UINT64(0U, node.tx_frames);
+    TEST_ASSERT_EQUAL_INT(EBADF, node.last_error);
+
+    node.last_error = 0;
+    TEST_ASSERT_EQUAL_INT(-1, node.recv(&node, &received));
+    TEST_ASSERT_EQUAL_UINT64(1U, node.rx_failed);
+    TEST_ASSERT_EQUAL_UINT64(0U, node.rx_frames);
+    TEST_ASSERT_EQUAL_INT(EBADF, node.last_error);
+
+    /* Nothing pending is not a failure. */
+    node.fd = fd;
+    TEST_ASSERT_EQUAL_INT(0, node.recv(&node, &received));
+    TEST_ASSERT_EQUAL_UINT64(1U, node.rx_failed);
+    node.close(&node);
+}
+
+static void test_transport_specifications_are_taken_apart(void)
+{
+    can_backend_spec_t spec;
+
+    TEST_ASSERT_TRUE(can_backend_parse_spec("udp", &spec, s_error, sizeof(s_error)));
+    TEST_ASSERT_EQUAL_INT(CAN_BACKEND_UDP, spec.kind);
+    TEST_ASSERT_EQUAL_UINT16(CAN_UDP_DEFAULT_PORT, spec.udp_base_port);
+
+    TEST_ASSERT_TRUE(can_backend_parse_spec("udp:31000", &spec, s_error, sizeof(s_error)));
+    TEST_ASSERT_EQUAL_INT(CAN_BACKEND_UDP, spec.kind);
+    TEST_ASSERT_EQUAL_UINT16(31000U, spec.udp_base_port);
+
+    TEST_ASSERT_TRUE(can_backend_parse_spec("udp:65535", &spec, s_error, sizeof(s_error)));
+    TEST_ASSERT_EQUAL_UINT16(65535U, spec.udp_base_port);
+
+    TEST_ASSERT_TRUE(can_backend_parse_spec("socketcan:vcan7", &spec, s_error, sizeof(s_error)));
+    TEST_ASSERT_EQUAL_INT(CAN_BACKEND_SOCKETCAN, spec.kind);
+    TEST_ASSERT_EQUAL_STRING("vcan7", spec.interface);
+
+    /* A port is digits and nothing else. strtoul() would take every one of these. */
+    static const char *const refused[] = {"udp: 1",
+                                          "udp:+1",
+                                          "udp:-1",
+                                          "udp:-18446744073709512516",
+                                          "udp:1 ",
+                                          "udp:0x10",
+                                          "udp:99999999999999999999999",
+                                          "udp:65536",
+                                          "udp:0",
+                                          "udp:",
+                                          "udpx",
+                                          "UDP:1000",
+                                          "udp1000"};
+
+    for (size_t i = 0U; i < (sizeof(refused) / sizeof(refused[0])); i++) {
+        s_error[0] = '\0';
+        TEST_ASSERT_FALSE_MESSAGE(
+            can_backend_parse_spec(refused[i], &spec, s_error, sizeof(s_error)), refused[i]);
+        TEST_ASSERT_NOT_NULL_MESSAGE(strstr(s_error, "unknown CAN backend"), refused[i]);
+    }
+}
+
 static void test_backend_specification_strings(void)
 {
     can_backend_t backend;
@@ -379,6 +506,9 @@ static void test_backend_specification_strings(void)
     TEST_ASSERT_FALSE(can_backend_open(&backend, "udp:0", s_error, sizeof(s_error)));
     TEST_ASSERT_FALSE(can_backend_open(&backend, "udp:70000", s_error, sizeof(s_error)));
     TEST_ASSERT_FALSE(can_backend_open(&backend, "udp:12x", s_error, sizeof(s_error)));
+    TEST_ASSERT_FALSE(
+        can_backend_open(&backend, "udp:-18446744073709512516", s_error, sizeof(s_error)));
+    TEST_ASSERT_FALSE(can_backend_open(&backend, "udp: 29500", s_error, sizeof(s_error)));
     /* A bus is 16 consecutive ports: 65520 is the last base port that has them. */
     TEST_ASSERT_FALSE(can_backend_open(&backend, "udp:65521", s_error, sizeof(s_error)));
     TEST_ASSERT_NOT_NULL(strstr(s_error, "out of range"));
@@ -399,22 +529,92 @@ static void test_backend_specification_strings(void)
 
 /* ---------------------------------------------------------------------------- SocketCAN */
 
+/* The interface the SocketCAN tests use: FCN_TEST_CAN_INTERFACE, as for the system tests, or
+ * vcan0. */
+static const char *test_interface(void)
+{
+    const char *name = getenv("FCN_TEST_CAN_INTERFACE");
+
+    return ((name != NULL) && (name[0] != '\0')) ? name : "vcan0";
+}
+
+/*
+ * One interface is shared by everything on the machine, and the tests on it count frames, so
+ * only one test may use it at a time. tests/conftest.py takes an exclusive flock() on
+ * <temporary directory>/fcn-test-<interface>.lock around every system test on it; this test
+ * takes the same lock. The directory is the one Python's tempfile.gettempdir() picks in any
+ * ordinary setup: the first of TMPDIR, TEMP and TMP that names a directory, else /tmp.
+ */
+static int lock_interface(const char *interface)
+{
+    static const char *const variables[] = {"TMPDIR", "TEMP", "TMP"};
+    const char *directory = "/tmp";
+    char path[512];
+    int fd;
+
+    for (size_t i = 0U; i < (sizeof(variables) / sizeof(variables[0])); i++) {
+        const char *value = getenv(variables[i]);
+        struct stat info;
+
+        if ((value != NULL) && (value[0] != '\0') && (stat(value, &info) == 0) &&
+            S_ISDIR(info.st_mode)) {
+            directory = value;
+            break;
+        }
+    }
+
+    (void)snprintf(path, sizeof(path), "%s/fcn-test-%s.lock", directory, interface);
+    fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    TEST_ASSERT_TRUE_MESSAGE(fd >= 0, path);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, flock(fd, LOCK_EX), path);
+    return fd;
+}
+
+/* Send one raw frame on the interface, as any program on the machine may. */
+static void send_raw(const char *interface, uint32_t can_id, uint8_t len, uint8_t byte)
+{
+    struct sockaddr_can address;
+    struct can_frame wire;
+    const int fd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+
+    TEST_ASSERT_TRUE(fd >= 0);
+    (void)memset(&address, 0, sizeof(address));
+    address.can_family = AF_CAN;
+    address.can_ifindex = (int)if_nametoindex(interface);
+    TEST_ASSERT_TRUE(address.can_ifindex > 0);
+    TEST_ASSERT_EQUAL_INT(0, bind(fd, (const struct sockaddr *)&address, sizeof(address)));
+
+    (void)memset(&wire, 0, sizeof(wire));
+    wire.can_id = can_id;
+    wire.len = len;
+    wire.data[0] = byte;
+    TEST_ASSERT_EQUAL_INT_MESSAGE((int)sizeof(wire), (int)write(fd, &wire, sizeof(wire)),
+                                  "the kernel refused the raw frame");
+    (void)close(fd);
+}
+
 static void test_socketcan_participants_exchange_frames_on_vcan0(void)
 {
+    const char *const interface = test_interface();
     can_backend_t a;
     can_backend_t b;
     can_frame_t received = {0};
 
-    if (!can_backend_socketcan_open(&a, "vcan0", s_error, sizeof(s_error))) {
+    /* First the lock, released in tearDown(): a socket opened before it would collect what
+     * the test holding the interface sends meanwhile. */
+    s_interface_lock = lock_interface(interface);
+
+    if (!can_backend_socketcan_open(&a, interface, s_error, sizeof(s_error))) {
         /* CI sets FCN_REQUIRE_SOCKETCAN: there the interface exists and must be tested. */
         if (getenv("FCN_REQUIRE_SOCKETCAN") != NULL) {
             TEST_FAIL_MESSAGE(s_error);
         }
 
-        TEST_IGNORE_MESSAGE("vcan0 is not available on this machine (see docs/wsl-vcan.md)");
+        TEST_IGNORE_MESSAGE(
+            "the interface is not available on this machine (see docs/wsl-vcan.md)");
     }
 
-    TEST_ASSERT_TRUE_MESSAGE(can_backend_socketcan_open(&b, "vcan0", s_error, sizeof(s_error)),
+    TEST_ASSERT_TRUE_MESSAGE(can_backend_socketcan_open(&b, interface, s_error, sizeof(s_error)),
                              s_error);
     TEST_ASSERT_EQUAL_STRING("socketcan", a.kind);
 
@@ -446,6 +646,46 @@ static void test_socketcan_participants_exchange_frames_on_vcan0(void)
     b.close(&b);
 }
 
+static void test_socketcan_drops_a_base_identifier_above_0x7ff(void)
+{
+    const char *const interface = test_interface();
+    const can_frame_t marker = make_frame(0x5A6U, 0U, 1U, 0x11U);
+    can_backend_t node;
+    can_frame_t received = {0};
+    bool found = false;
+
+    s_interface_lock = lock_interface(interface);
+
+    if (!can_backend_socketcan_open(&node, interface, s_error, sizeof(s_error))) {
+        if (getenv("FCN_REQUIRE_SOCKETCAN") != NULL) {
+            TEST_FAIL_MESSAGE(s_error);
+        }
+
+        TEST_IGNORE_MESSAGE(
+            "the interface is not available on this machine (see docs/wsl-vcan.md)");
+    }
+
+    /* Base format (no CAN_EFF_FLAG), but with bits above the 11 of a base identifier. The
+     * kernel passes them on. Masked to 11 bits, 0xEF0 would be 0x6F0, the node's ping, and
+     * 0x12345 would be 0x345. Then a valid frame from the same sender, which arrives after
+     * them. */
+    send_raw(interface, 0xEF0U, 1U, 0x55U);
+    send_raw(interface, 0x12345U, 1U, 0x56U);
+    send_raw(interface, marker.id, marker.dlc, marker.data[0]);
+
+    for (int attempt = 0; (attempt < 50) && !found; attempt++) {
+        TEST_ASSERT_EQUAL_INT(1, receive_within(&node, &received, RECEIVE_TIMEOUT_MS));
+        TEST_ASSERT_NOT_EQUAL_MESSAGE(0x6F0U, received.id, "0xEF0 became the ping 0x6F0");
+        TEST_ASSERT_NOT_EQUAL_MESSAGE(0x345U, received.id, "0x12345 became 0x345");
+        found = (received.id == marker.id) && (received.flags == 0U);
+    }
+
+    TEST_ASSERT_TRUE_MESSAGE(found, "the valid frame did not arrive");
+    assert_frames_equal(&marker, &received);
+    TEST_ASSERT_EQUAL_UINT64(2U, node.rx_malformed);
+    node.close(&node);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -457,7 +697,11 @@ int main(void)
     RUN_TEST(test_frames_that_do_not_fit_the_socket_buffer_are_dropped_and_counted);
     RUN_TEST(test_a_seventeenth_udp_participant_is_refused_and_a_freed_slot_is_reused);
     RUN_TEST(test_udp_drops_datagrams_that_do_not_come_from_the_bus);
+    RUN_TEST(test_udp_drops_datagrams_from_a_bus_port_of_another_loopback_address);
+    RUN_TEST(test_a_send_and_a_receive_the_socket_refuses_are_counted_with_their_error);
+    RUN_TEST(test_transport_specifications_are_taken_apart);
     RUN_TEST(test_backend_specification_strings);
     RUN_TEST(test_socketcan_participants_exchange_frames_on_vcan0);
+    RUN_TEST(test_socketcan_drops_a_base_identifier_above_0x7ff);
     return UNITY_END();
 }

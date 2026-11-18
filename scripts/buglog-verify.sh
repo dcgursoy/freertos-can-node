@@ -15,6 +15,13 @@
 #   3. every test FAILS with the patch.
 # Anything else, a build that breaks for another reason included, fails the script.
 #
+# A test whose verdict depends on the host keeping time exits with status 75 when it missed
+# only timing tolerances, twice (as scripts/test-system.sh does). Such a run neither passes nor
+# fails: the entry is reported as inconclusive, with or without the patch.
+#
+# Exit status: 0 when every entry was verified; 75 when the only problems were inconclusive
+# entries (repeat on an otherwise idle machine); 1 for anything else.
+#
 # A test script is started in the scratch tree with
 #   BUILD            build directory of the release preset of the scratch tree
 #   FCN_PYTHON       the project's Python interpreter
@@ -63,6 +70,7 @@ if ! build_scratch "$work/build.log"; then
 fi
 
 status=0
+inconclusive=0
 for entry in "${entries[@]}"; do
     id="$(basename "$entry")"
     log="$work/$id.log"
@@ -79,13 +87,21 @@ for entry in "${entries[@]}"; do
     control=0
     echo "==== without the patch" >>"$log"
     for t in "${tests[@]}"; do
-        if ! run_test "$t" "$log"; then
+        rc=0
+        run_test "$t" "$log" || rc=$?
+        if [[ "$rc" -eq 75 ]]; then
+            echo "$id: inconclusive: $(basename "$t") missed only timing tolerances WITHOUT the bug (see $log)"
+            [[ "$control" -eq 0 ]] && control=75
+        elif [[ "$rc" -ne 0 ]]; then
             echo "$id: $(basename "$t") fails WITHOUT the bug, so it cannot show the bug (see $log)"
             control=1
         fi
     done
-    if [[ "$control" -ne 0 ]]; then
+    if [[ "$control" -eq 1 ]]; then
         status=1
+        continue
+    elif [[ "$control" -eq 75 ]]; then
+        inconclusive=1
         continue
     fi
 
@@ -111,9 +127,14 @@ for entry in "${entries[@]}"; do
     else
         # 3. With the bug every test fails.
         for t in "${tests[@]}"; do
-            if run_test "$t" "$log"; then
+            rc=0
+            run_test "$t" "$log" || rc=$?
+            if [[ "$rc" -eq 0 ]]; then
                 echo "$id: NOT caught: $(basename "$t") passes with the bug re-created (see $log)"
                 status=1
+            elif [[ "$rc" -eq 75 ]]; then
+                echo "$id: inconclusive: $(basename "$t") missed only timing tolerances with the bug re-created (see $log)"
+                inconclusive=1
             else
                 echo "$id: caught by $(basename "$t")"
             fi
@@ -126,4 +147,7 @@ for entry in "${entries[@]}"; do
         exit 1
     fi
 done
+if [[ "$status" -eq 0 && "$inconclusive" -ne 0 ]]; then
+    status=75
+fi
 exit "$status"

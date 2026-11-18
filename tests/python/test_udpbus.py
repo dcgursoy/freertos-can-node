@@ -959,19 +959,28 @@ def test_recv_returns_at_once_with_a_frame_and_after_the_timeout_without(open_bu
 @pytest.mark.parametrize("timeout", [3.0, None], ids=["timeout-3-s", "no-timeout"])
 def test_a_frame_that_arrives_during_the_wait_ends_it(timeout, open_bus):
     sender, receiver = open_bus(), open_bus()
-    later = threading.Timer(0.05, sender.send, [numbered(1)])
+    sent_at: list[float] = []
+
+    def send_later() -> None:
+        sent_at.append(time.monotonic())
+        sender.send(numbered(1))
+
+    later = threading.Timer(0.05, send_later)
+    started = time.monotonic()
     later.start()
     try:
-        started = time.monotonic()
         message = receiver.recv(timeout)
-        waited = time.monotonic() - started
+        returned = time.monotonic()
     finally:
         later.join()
 
     assert message is not None and number_of(message) == 1
-    # Not before the frame was sent, and long before a timeout would have run out. The bound
-    # is 30 times the delay: it says that the wait ended, not how fast the wake-up was.
-    assert 0.04 <= waited < 1.5
+    # Not before the frame was sent (measured where it was sent, so that a host that delays
+    # this thread cannot make the wait look short), and long before a timeout would have run
+    # out: 1.5 s is 30 times the delay, it says that the wait ended, not how fast the wake-up
+    # was.
+    assert returned >= sent_at[0]
+    assert returned - started < 1.5
 
 
 def test_the_file_descriptor_is_readable_exactly_while_a_frame_waits(open_bus):

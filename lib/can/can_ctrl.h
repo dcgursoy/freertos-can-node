@@ -10,10 +10,11 @@
  * driver and the transport and adds those properties, so that throughput, bus load, latency
  * and bus-off behaviour seen by the software above are those of a bus, not of a socket.
  *
- * WHAT IT IS NOT. It works at frame granularity. It does not simulate bit timing, bit-wise
- * arbitration between nodes or the detection of errors. It is told which fault is on the bus
- * and derives what a controller would observe; the counter and state rules themselves are in
- * can_fc. The assumptions made for each fault are spelled out below, because they are
+ * WHAT IT IS NOT. It works at frame granularity. It does not simulate bit timing or the
+ * detection of errors, and it decides arbitration by comparing whole arbitration fields, not
+ * bit by bit. It is told which fault is on the bus and derives what a controller would
+ * observe; the counter and state rules themselves are in can_fc. The assumptions made for
+ * each fault, and for the frames of other nodes, are spelled out below, because they are
  * modelling decisions, not part of the standard.
  *
  * TIME. The model has no clock. Calls that depend on time take `now_ns`, a monotonic time in
@@ -25,25 +26,65 @@
  * intermission, so the modelled bus can never carry more than 100 % load.
  *
  *  - Transmit. A frame submitted with can_ctrl_tx_submit() waits in one of
- *    CAN_CTRL_TX_MAILBOXES mailboxes. When the bus is free, the pending frame with the
- *    smallest arbitration key (can_frame_arbitration_key) among those already submitted at
- *    that moment starts; mailboxes with equal keys go in submission order. It occupies the bus
- *    from its start of frame to its end of frame and is reported by can_ctrl_poll() as
+ *    CAN_CTRL_TX_MAILBOXES mailboxes and competes for the bus from its submission on. Of the
+ *    frames submitted by the moment the bus becomes free, the one with the smallest
+ *    arbitration key (can_frame_arbitration_key) competes for this node; mailboxes with equal
+ *    keys go in submission order. When it wins (see ARBITRATION) it occupies the bus from its
+ *    start of frame to its end of frame and is reported by can_ctrl_poll() as
  *    CAN_CTRL_ACTION_TX_COMPLETE at its end of frame: only then does the glue write it to
  *    the transport, because that is when a real receiver would have it.
- *  - Receive. A frame read from the transport is handed in with can_ctrl_wire_rx(). It is
- *    taken to have ended on the bus at its arrival time, or, if the bus was not free long
- *    enough before that, one frame length after the bus became free. It is reported as
- *    CAN_CTRL_ACTION_RX_DELIVER at that end of frame. Received frames keep their arrival
- *    order. A sender that ignores the bit rate therefore cannot push more than the bus could
- *    carry into the node: its frames queue here (CAN_CTRL_WIRE_QUEUE of them) and are
- *    delivered at bus speed, and beyond that they are dropped and counted as wire_overruns.
+ *  - Receive. A frame read from the transport is handed in with can_ctrl_wire_rx(). The
+ *    transport delivers a frame once another node has sent it, so the model learns of it
+ *    after the fact, and takes it to come from a node that was ready to send it one frame
+ *    length before its arrival. It goes into the wire queue (CAN_CTRL_WIRE_QUEUE frames) and
+ *    is reported as CAN_CTRL_ACTION_RX_DELIVER at its end of frame:
+ *      - If no other received frame waits and the bus has been free since before the call,
+ *        the frame passed while the bus was free. This node cannot have competed for that bus
+ *        time: a frame of its own that was allowed to start then would have started. The frame
+ *        is put on the timeline at once: it ends at its arrival, or, if the bus became free
+ *        less than one frame length before that, one frame length after the bus became free.
+ *      - Otherwise its sender is taken to be still waiting for the bus (the bus is busy, or
+ *        becomes free at the very instant of the call, or other received frames wait before
+ *        it). The frame waits in the wire queue, behind the frames that arrived before it,
+ *        and starts when it wins arbitration; it competes from the time of the call on, as a
+ *        mailbox does from its submission.
+ *    Received frames keep the order in which the transport delivered them. A sender that
+ *    ignores the bit rate therefore cannot push more than the bus could carry into the node:
+ *    its frames wait in the wire queue and are delivered at bus speed, and a frame handed in
+ *    while the queue holds CAN_CTRL_WIRE_QUEUE frames (waiting or on the timeline) is
+ *    dropped and counted as wire_overruns. The queue stands for the transmit buffers of the
+ *    other nodes: under a load above what the bus carries, it fills, and from then on the
+ *    excess of the other nodes' traffic is counted there.
  *  - Late callers. The model reports a frame no earlier than its end of frame, but the caller
  *    may poll late. If a transmission could have started more than one frame length before
  *    `now_ns`, its start is moved to `now_ns` and late_resyncs is counted, so that a stalled
- *    host never makes the model emit frames faster than the bit rate in real time.
+ *    host never makes the model emit frames faster than the bit rate in real time. Only the
+ *    start of this node's frame that won arbitration moves; received frames that lost to it
+ *    wait for it, and received frames are never moved: they are reported at their own end of
+ *    frame even when that lies before `now_ns`.
  *  - Pacing off. With bitrate 0 every bit time is zero: frames complete as soon as they are
  *    polled. This mode exists to measure the raw transport.
+ *
+ * ARBITRATION. Whenever the bus becomes free (at the end of an intermission, of a bus fault,
+ * of a recovery or of this node's suspend), the frames waiting for it compete: this node's
+ * best mailbox, if the node may transmit, and the oldest frame waiting in the wire queue. The
+ * one with the smaller arbitration key starts, as on a real bus, where every node that has a
+ * frame pending starts it at the same instant and the smaller arbitration field survives. A
+ * frame that loses waits for the next time the bus is free. With equal keys the received frame
+ * goes first. (Two nodes that send the same arbitration field break a rule of CAN: neither
+ * loses arbitration and the frames collide later in the frame. The model has to pick one.)
+ * So a backlog of lower-priority frames from other nodes, however long, delays a frame of this
+ * node by at most the frame on the bus when it was submitted, while a waiting frame of another
+ * node with a smaller key still goes first.
+ *  - Only the oldest waiting received frame competes. A frame from the transport carries no
+ *    sender, so the model cannot tell which waiting frames come from different nodes and would
+ *    arbitrate among themselves; it keeps the order the transport delivered them in. A
+ *    received frame with a small key that waits behind one with a large key therefore waits
+ *    for it, even where this node's frame goes in between.
+ *  - A received frame starts without competing when no frame of this node may start at that
+ *    instant: none is pending, the node is bus off, or it is waiting out its suspend.
+ *  - A short or a bus held dominant lets no received frame start; RECEPTION AND FAULTS says
+ *    what happens to the frames waiting when such a fault takes effect.
  *
  * TRANSMISSION ATTEMPTS AND FAULTS. The outcome of an attempt is decided by the bus fault in
  * force at its start of frame. A destroyed attempt is retried automatically, as on a real
@@ -73,12 +114,18 @@
  *  A fault that begins or ends while a frame is on the wire takes effect from the next frame.
  *
  * SUSPEND TRANSMISSION. An error-passive node that was the transmitter of the last frame on
- * the bus waits 8 further bit times after the intermission before it may start again.
+ * the bus waits 8 further bit times after the intermission before it may start again. A
+ * received frame waiting for the bus starts at the end of the intermission without competing;
+ * it is then the last frame on the bus, and the suspend is over.
  *
  * RECEPTION AND FAULTS. A frame handed to can_ctrl_wire_rx() while the node is bus off, or
  * while the bus is shorted or stuck dominant, cannot have reached this node: it is discarded
- * and counted in rx_lost_fault. An injected receive error (can_ctrl_inject_rx_errors, one per
- * frame) destroys the frame at its end: CAN_FC_RX_ERROR, nothing delivered. Otherwise
+ * and counted in rx_lost_fault. Received frames in the wire queue that have not started when
+ * a short or a dominant bus takes effect, those still waiting for the bus included, never
+ * pass either: they are discarded then and counted the same way. A frame handed in after the
+ * removal of such a fault was asked for, but before the removal takes effect, waits for the
+ * bus to be released. An injected receive error (can_ctrl_inject_rx_errors, one per frame)
+ * destroys the frame at its end: CAN_FC_RX_ERROR, nothing delivered. Otherwise
  * CAN_FC_RX_SUCCESS and the frame is delivered.
  *
  * ABORTING. can_ctrl_tx_abort_all() empties the mailboxes, as a driver does when what it
@@ -187,11 +234,12 @@ typedef struct {
 } can_ctrl_mailbox_t;
 
 typedef struct {
-    uint64_t start_ns;
-    uint64_t eof_ns;
+    uint64_t start_ns; /* on the timeline: start of frame; still waiting: UINT64_MAX */
+    uint64_t eof_ns;   /* on the timeline: end of frame */
+    uint64_t ready_ns; /* when it was handed in: it competes for the bus from then on */
     can_frame_t frame;
     uint16_t bits;
-    bool lost; /* passed while the node was bus off: on the timeline, never delivered */
+    bool lost; /* passes while the node is bus off: occupies the bus, never delivered */
 } can_ctrl_wire_slot_t;
 
 typedef struct {
@@ -219,9 +267,10 @@ typedef struct {
     bool tx_in_flight;
     bool tx_abort_marked;
 
-    can_ctrl_wire_slot_t wire[CAN_CTRL_WIRE_QUEUE];
+    can_ctrl_wire_slot_t wire[CAN_CTRL_WIRE_QUEUE]; /* received frames, in arrival order */
     uint32_t wire_head;
-    uint32_t wire_count;
+    uint32_t wire_count;  /* frames in the queue */
+    uint32_t wire_placed; /* the first wire_placed of them are on the timeline, the rest wait */
 
     uint32_t inject_tx_errors;
     uint32_t inject_rx_errors;

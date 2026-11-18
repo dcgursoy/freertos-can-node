@@ -1,6 +1,7 @@
 """The node as a process: it starts, keeps time, reports its statistics and stops cleanly."""
 from __future__ import annotations
 
+import ctypes
 import os
 import signal
 import subprocess
@@ -9,8 +10,21 @@ import time
 
 import pytest
 
+from fcn_tools.bus import ID_STATUS, open_bus, wait_for_id
 from fcn_tools.node import EXIT_OK
 from fcn_tools.timing import check_timing
+
+
+_AT_MINSIGSTKSZ = 51     # <linux/auxvec.h>
+
+
+def _min_signal_stack_bytes() -> int:
+    """The smallest signal frame the kernel builds on this CPU, as it reports it (0 on a
+    kernel that does not); then MINSIGSTKSZ, 2048, the traditional value."""
+    libc = ctypes.CDLL(None)
+    libc.getauxval.restype = ctypes.c_ulong
+    libc.getauxval.argtypes = [ctypes.c_ulong]
+    return int(libc.getauxval(_AT_MINSIGSTKSZ)) or 2048
 
 
 def test_version_names_the_node_and_the_kernel(node_binary):
@@ -54,8 +68,9 @@ def test_runs_for_the_requested_time_and_reports_statistics(start_node):
     assert stats["schema"] == "fcn.node_stats/1"
     assert stats["kernel"] == "V11.3.3"
     assert stats["tick"]["thread_seen"] is True
-    # The node stops itself after 2 s of tick time: 2000 ticks plus the last task period.
-    assert 2000 <= stats["tick"]["count"] <= 2150
+    # The node stops itself after 2 s of tick time, in the health period that ends at tick
+    # 2000, plus the few ticks of ending the scheduler. One health period more would be 2100.
+    assert 2000 <= stats["tick"]["count"] <= 2050
     assert stats["log_lines_dropped"] == 0
 
     tasks = {task["name"]: task for task in stats["tasks"]}
@@ -70,11 +85,67 @@ def test_runs_for_the_requested_time_and_reports_statistics(start_node):
     # Every task registered its real stack, and none of them is anywhere near its limit.
     for task in tasks.values():
         assert 0 < task["stack_peak_bytes"] < 256 * 1024
+        # Three different figures (platform/include/platform.h, plat_stack_info_t): what the C
+        # library and the port had in use before the task function ran, less than the peak;
+        # and the stack the task was created with, the size meant for the target, not the
+        # 512 KiB pthread stack it runs on here.
+        assert 0 < task["stack_start_bytes"] < task["stack_peak_bytes"], task
+        assert 0 < task["stack_size_bytes"] < 256 * 1024, task
+    # What each application task's own code used, its peak less the start, has to fit the
+    # stack it was created with. A tick or interrupt signal can land on a task at its deepest
+    # point, in poll mode too (the tick is SIGALRM to the running task), so one signal frame
+    # is allowed: the kernel's minimum for this CPU (AT_MINSIGSTKSZ; larger on a CPU with
+    # AVX-512) plus 512 bytes for the handler. This catches a gross regression on the host;
+    # the Cortex-M sizing is checked on the target, by configCHECK_FOR_STACK_OVERFLOW. The
+    # idle task is left out: its stack is the kernel's minimum, 2048 bytes, and on the host
+    # its own use, about 2000 bytes, is mostly the C library's nanosleep. A sanitizer build
+    # says so ("stack_instrumented"), and its figures are not checked against the budget:
+    # AddressSanitizer's redzones make every frame larger, about 6.5 KiB for can_tx against
+    # 1.9 KiB in the release build.
+    assert stats["stack_instrumented"] is (node.binary.parent.parent.name in ("asan", "tsan"))
+    signal_frame = _min_signal_stack_bytes() + 512
+    for task in tasks.values():
+        if task["name"] != "IDLE" and not stats["stack_instrumented"]:
+            used = task["stack_peak_bytes"] - task["stack_start_bytes"]
+            assert used <= task["stack_size_bytes"] + signal_frame, (task, signal_frame)
 
     log = node.log()
     assert "starting" in log
     assert "stopping after" in log
     assert "scheduler stopped" in log
+
+
+def test_the_longest_run_is_accepted(start_node):
+    # 86400 s, the limit; one more is refused (above). The run is ended early, by a stop.
+    node = start_node("--duration-s", "86400")
+    with node.sim() as sim:
+        assert sim.ping() == node.pid
+    assert node.stop() == EXIT_OK
+
+
+def test_a_stalled_host_is_accounted_as_dropped_ticks(start_node, ports):
+    bus = open_bus(f"udp:{ports.bus}")
+    try:
+        node = start_node("--duration-s", "2")
+        # The first status frame goes out at tick 10: the tick is running. (Simulation control
+        # answers earlier, before the scheduler has started.)
+        assert wait_for_id(bus, ID_STATUS, timeout=10.0) is not None
+    finally:
+        bus.shutdown()
+    # The host does not run the node for 1.5 s: far more ticks than the tick code makes up
+    # (MAX_CATCH_UP_TICKS in platform/posix/posix_tick.c, 6), so it gives them up as dropped,
+    # all at once when the node runs again.
+    node.send_signal(signal.SIGSTOP)
+    time.sleep(1.5)
+    node.send_signal(signal.SIGCONT)
+    assert node.wait(timeout=30) == EXIT_OK
+
+    tick = node.stats()["tick"]
+    # The 1500 ticks of the stall are reported as dropped, less the one that is then counted
+    # and a few for the time the signals take to arrive, however busy the host was besides.
+    # The node's time stopped with it: the run still ends after 2 s of ticks.
+    assert tick["dropped"] >= 1490, tick
+    assert 2000 <= tick["count"] <= 2050, tick
 
 
 @pytest.mark.parametrize("stop_signal", [signal.SIGTERM, signal.SIGINT])

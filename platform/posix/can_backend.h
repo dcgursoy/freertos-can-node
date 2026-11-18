@@ -11,9 +11,15 @@
  *    interface, for machines whose kernel has no vcan (the stock WSL2 kernel). The same
  *    protocol is implemented for python-can in tools/fcn_tools/udpbus.py.
  *
- * Both deliver every frame to every other participant, immediately and without error. Bit
- * timing, bus load and faults are not the backend's business; the controller model adds them
- * (lib/can/can_ctrl.h).
+ * Both deliver every frame to every other participant, immediately. Bit timing, bus load and
+ * bus faults are not the backend's business; the controller model adds them
+ * (lib/can/can_ctrl.h). A failure of the transport itself (an interface that disappears, a
+ * send buffer that is full) is reported by send() and recv(), counted with its errno, and left
+ * to the caller.
+ *
+ * Both accept only well-formed classical CAN frames: input with a wrong size, the error flag
+ * set, a length above 8, or a base-format identifier above 0x7FF is dropped and counted
+ * (rx_malformed), never passed on, so that a frame means the same on either transport.
  *
  * The UDP bus. A bus is 16 UDP ports on 127.0.0.1: base .. base+15. A participant binds the
  * first of them that is free and sends each frame as one datagram to each of the other 15.
@@ -63,9 +69,11 @@ struct can_backend {
     uint64_t tx_frames;
     uint64_t tx_failed; /**< send() calls the transport refused */
     uint64_t rx_frames;
+    uint64_t rx_failed;    /**< recv() calls that returned -1 (a socket error) */
     uint64_t rx_malformed; /**< input dropped by validation */
     uint64_t rx_overflow;  /**< packets the kernel dropped because the socket buffer was full;
                                 as of the last can_backend_refresh_counters() or close() */
+    int last_error;        /**< errno of the last failed send() or recv(); 0 if none failed */
 
     int fd; /**< for poll(); -1 when closed */
 
@@ -74,10 +82,27 @@ struct can_backend {
     uint16_t udp_own_port;
 };
 
+typedef enum { CAN_BACKEND_UDP = 0, CAN_BACKEND_SOCKETCAN = 1 } can_backend_kind_t;
+
+/** A transport specification taken apart. */
+typedef struct {
+    can_backend_kind_t kind;
+    uint16_t udp_base_port; /**< UDP: the bus's first port */
+    const char *interface;  /**< SocketCAN: points into the specification string */
+} can_backend_spec_t;
+
 /**
- * Open the backend named by `spec` ("udp:29500", "udp" for the default port,
- * "socketcan:vcan0"). On failure returns false and writes a message for the user into
- * `error`.
+ * Take apart a transport specification: "udp" (the default port), "udp:<base port>" or
+ * "socketcan:<interface>". The port is a decimal number from 1 to 65535 with nothing before or
+ * after it: no sign, no spaces. (Whether a bus fits above the port is checked when it is
+ * opened.) On failure returns false and writes a message for the user into `error`.
+ */
+bool can_backend_parse_spec(const char *spec, can_backend_spec_t *out, char *error,
+                            size_t error_len);
+
+/**
+ * Open the backend named by `spec` (see can_backend_parse_spec). On failure returns false and
+ * writes a message for the user into `error`.
  */
 bool can_backend_open(can_backend_t *backend, const char *spec, char *error, size_t error_len);
 

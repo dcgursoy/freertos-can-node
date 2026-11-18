@@ -35,7 +35,7 @@ void tearDown(void)
 {
 }
 
-/* Handler of the "demo." commands: echo | fail | long. */
+/* Handler of the "demo." commands: echo | quiet | long | longfail; anything else fails. */
 static bool demo_handler(const char *verb, const char *args, char *reply, size_t reply_len)
 {
     bool ok = true;
@@ -48,10 +48,11 @@ static bool demo_handler(const char *verb, const char *args, char *reply, size_t
         (void)snprintf(reply, reply_len, "said=%s", args);
     } else if (strcmp(verb, "quiet") == 0) {
         reply[0] = '\0';
-    } else if (strcmp(verb, "long") == 0) {
-        /* More than fits: the handler is given the size and must stay inside it. */
+    } else if ((strcmp(verb, "long") == 0) || (strcmp(verb, "longfail") == 0)) {
+        /* As much as fits: the handler is given the size and must stay inside it. */
         (void)memset(reply, 'x', reply_len - 1U);
         reply[reply_len - 1U] = '\0';
+        ok = (strcmp(verb, "long") == 0);
     } else {
         (void)snprintf(reply, reply_len, "no such demo command '%s'", verb);
         ok = false;
@@ -97,6 +98,14 @@ static const char *exchange(const char *request)
     send_request(request);
     posix_sim_service();
     return receive_reply();
+}
+
+/* One request, served, and its reply; "<no reply>" if none came, which no expected reply is. */
+static const char *exchange_text(const char *request)
+{
+    const char *reply = exchange(request);
+
+    return (reply != NULL) ? reply : "<no reply>";
 }
 
 /* --------------------------------------------------------------------------------- tests */
@@ -154,6 +163,55 @@ static void test_requests_that_are_not_token_and_command_are_refused(void)
     (void)snprintf(&long_token[40], sizeof(long_token) - 40U, " ping");
     TEST_ASSERT_EQUAL_STRING("? err malformed request", exchange(long_token));
     TEST_ASSERT_EQUAL_UINT(0U, s_handler_calls);
+}
+
+static void test_a_token_of_31_characters_comes_back_and_one_of_32_is_refused(void)
+{
+    char request[64];
+    char expected[64];
+
+    TEST_ASSERT_EQUAL_UINT(31U, POSIX_SIM_MAX_TOKEN);
+
+    (void)memset(request, 'K', POSIX_SIM_MAX_TOKEN);
+    (void)snprintf(&request[POSIX_SIM_MAX_TOKEN], sizeof(request) - POSIX_SIM_MAX_TOKEN,
+                   " demo.echo z");
+    (void)memset(expected, 'K', POSIX_SIM_MAX_TOKEN);
+    (void)snprintf(&expected[POSIX_SIM_MAX_TOKEN], sizeof(expected) - POSIX_SIM_MAX_TOKEN,
+                   " ok said=z");
+    TEST_ASSERT_EQUAL_STRING(expected, exchange(request));
+    TEST_ASSERT_EQUAL_UINT(1U, s_handler_calls);
+
+    (void)memset(request, 'K', POSIX_SIM_MAX_TOKEN + 1U);
+    (void)snprintf(&request[POSIX_SIM_MAX_TOKEN + 1U], sizeof(request) - POSIX_SIM_MAX_TOKEN - 1U,
+                   " demo.echo z");
+    TEST_ASSERT_EQUAL_STRING("? err malformed request", exchange(request));
+    TEST_ASSERT_EQUAL_UINT(1U, s_handler_calls);
+}
+
+/* A handler's reply has POSIX_SIM_MAX_DATAGRAM less the room for the token, " err " and the
+ * terminating zero; with the longest token, the longest reply of either kind still goes out
+ * whole. (Were that room too small, the datagram would be cut to POSIX_SIM_MAX_DATAGRAM - 1
+ * characters.) */
+static void test_the_longest_token_with_the_longest_reply_fits_one_datagram(void)
+{
+    const size_t text = (size_t)POSIX_SIM_MAX_DATAGRAM - (POSIX_SIM_MAX_TOKEN + 5U + 1U) - 1U;
+    char request[64];
+    const char *reply;
+
+    (void)memset(request, 'L', POSIX_SIM_MAX_TOKEN);
+    (void)snprintf(&request[POSIX_SIM_MAX_TOKEN], sizeof(request) - POSIX_SIM_MAX_TOKEN,
+                   " demo.long");
+    reply = exchange_text(request);
+    TEST_ASSERT_EQUAL_UINT(POSIX_SIM_MAX_TOKEN + 4U + text, strlen(reply));
+    TEST_ASSERT_EQUAL_STRING_LEN(" ok xxx", &reply[POSIX_SIM_MAX_TOKEN], 7U);
+    TEST_ASSERT_EQUAL_CHAR('x', reply[strlen(reply) - 1U]);
+
+    (void)snprintf(&request[POSIX_SIM_MAX_TOKEN], sizeof(request) - POSIX_SIM_MAX_TOKEN,
+                   " demo.longfail");
+    reply = exchange_text(request);
+    TEST_ASSERT_EQUAL_UINT(POSIX_SIM_MAX_TOKEN + 5U + text, strlen(reply));
+    TEST_ASSERT_EQUAL_STRING_LEN(" err xxx", &reply[POSIX_SIM_MAX_TOKEN], 8U);
+    TEST_ASSERT_EQUAL_CHAR('x', reply[strlen(reply) - 1U]);
 }
 
 static void test_a_reply_never_exceeds_one_datagram(void)
@@ -287,6 +345,8 @@ int main(void)
     RUN_TEST(test_a_failing_handler_produces_an_error_reply_with_its_message);
     RUN_TEST(test_an_unknown_command_is_an_error_and_reaches_no_handler);
     RUN_TEST(test_requests_that_are_not_token_and_command_are_refused);
+    RUN_TEST(test_a_token_of_31_characters_comes_back_and_one_of_32_is_refused);
+    RUN_TEST(test_the_longest_token_with_the_longest_reply_fits_one_datagram);
     RUN_TEST(test_a_reply_never_exceeds_one_datagram);
     RUN_TEST(test_an_oversized_request_is_cut_and_still_answered);
     RUN_TEST(test_every_waiting_request_is_served_in_one_call_in_order);

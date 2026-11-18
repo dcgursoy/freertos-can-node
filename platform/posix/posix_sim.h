@@ -16,9 +16,11 @@
  *     request:  <token> <command> [arguments...]
  *     reply:    <token> ok [key=value ...]        or        <token> err <message>
  *
- * The token is any word chosen by the client; it comes back unchanged so the client can match
- * replies to requests. Commands are named <model>.<verb>, for example "can.fault short"; a
- * model registers a handler for its prefix. "ping" is built in.
+ * The token is a word of 1 to POSIX_SIM_MAX_TOKEN characters chosen by the client; it comes
+ * back unchanged so the client can match replies to requests. A request whose token is longer,
+ * or that has no command, cannot be matched and is answered with "? err malformed request".
+ * Commands are named <model>.<verb>, for example "can.fault short"; a model registers a
+ * handler for its prefix. "ping" is built in.
  *
  * Requests are served by the hardware thread (posix_can.c), in the same thread that runs the
  * models, so a command takes effect at a well-defined point of the simulated timeline.
@@ -30,7 +32,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define POSIX_SIM_MAX_DATAGRAM 512U
+/** Longest request or reply, in bytes. A request is cut to this length; a handler's reply has
+ *  this less the token and " ok " to fit into. */
+#define POSIX_SIM_MAX_DATAGRAM 1024U
+
+/** Longest token, in characters. */
+#define POSIX_SIM_MAX_TOKEN 31U
 
 /**
  * Handles the commands of one model. `verb` is the part of the command after the prefix,

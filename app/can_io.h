@@ -39,8 +39,11 @@
 #define CAN_IO_RX_PRIORITY 6U
 #define CAN_IO_TX_PRIORITY 3U
 
-/** Most frames the receive task handles before it lets other work run. */
-#define CAN_IO_RX_BATCH 16U
+/** Most frames the receive task handles before it lets other work run for one tick. One batch
+ *  per tick has to keep up with a full bus at PLAT_CAN_MAX_BITRATE (can_io.c checks this at
+ *  compile time): 1 Mbit/s carries up to 21.3 of the shortest frames per millisecond, and
+ *  the margin above that lets the task catch up after a late tick. */
+#define CAN_IO_RX_BATCH 32U
 
 /** Number of identifiers a handler can be registered for. */
 #define CAN_IO_RX_HANDLERS 8U

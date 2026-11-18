@@ -69,3 +69,11 @@ for a password it does so on the terminal.
   warning. The comment at the top of the build script explains why that is sound here.
 - **Shared by all WSL distributions.** WSL2 runs every distribution on one kernel, so the
   module is visible from all of them, Docker Desktop's included.
+- **One test at a time on `vcan0`.** Every test run on the machine shares the interface, and
+  a test that counts frames would count another test's frames. The tests therefore hold an
+  exclusive `flock()` on `fcn-test-vcan0.lock` in the temporary directory while they use the
+  interface. That directory is the one Python's `tempfile.gettempdir()` picks: the first of
+  `TMPDIR`, `TEMP` and `TMP` that names a directory, else `/tmp`. `tests/conftest.py` holds
+  the lock around every SocketCAN system test, and `tests/platform/test_can_backend.c` around
+  its SocketCAN tests. Anything else that sends on `vcan0` while tests run should take the
+  same lock, for example `flock /tmp/fcn-test-vcan0.lock cansend vcan0 123#00`.

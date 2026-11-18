@@ -7,12 +7,14 @@
  * Everything here runs on the main thread before the scheduler starts or after it has ended,
  * which is why stdio streams are used freely; tasks never write to one.
  */
+#include <errno.h>
 #include <getopt.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "FreeRTOS.h"
@@ -28,9 +30,18 @@
 #define FCN_VERSION "unknown"
 #endif
 
+/* Whether the build has a sanitizer that adds to every stack frame (AddressSanitizer's
+ * redzones, ThreadSanitizer's calls into its runtime). The stack figures of such a build are
+ * not those of the code, and the statistics say so ("stack_instrumented"). */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define STACK_INSTRUMENTED "true"
+#else
+#define STACK_INSTRUMENTED "false"
+#endif
+
 #define DEFAULT_CAN_SPEC "udp"
 #define DEFAULT_BITRATE  500000U
-#define MAX_BITRATE      1000000U /* classical CAN ends at 1 Mbit/s */
+#define MAX_BITRATE      PLAT_CAN_MAX_BITRATE
 
 typedef struct {
     posix_config_t platform;
@@ -58,8 +69,13 @@ static void print_usage(const char *program)
                  "  --log-file PATH        write the log to PATH instead of stderr\n"
                  "  --log-level LEVEL      error, warn, info (default) or debug\n"
                  "  --version              print the version and exit\n"
-                 "  --help                 print this text and exit\n",
-                 program, (unsigned int)CAN_UDP_DEFAULT_PORT, (unsigned int)DEFAULT_BITRATE);
+                 "  --help                 print this text and exit\n"
+                 "exit status: 0 after an orderly stop; 1 on a usage or start-up error; %d when\n"
+                 "the CAN transport went away while the node ran (the statistics are written);\n"
+                 "%d when an orderly stop hung; 10 to 22 for a reset of the node\n"
+                 "(platform/include/platform.h)\n",
+                 program, (unsigned int)CAN_UDP_DEFAULT_PORT, (unsigned int)DEFAULT_BITRATE,
+                 POSIX_EXIT_CAN_TRANSPORT_LOST, POSIX_EXIT_SHUTDOWN_TIMEOUT);
 }
 
 static bool parse_log_level(const char *text, log_level_t *out)
@@ -234,10 +250,20 @@ static const char *can_state_name(uint8_t state)
 }
 
 /*
- * The "can" member. Three layers report here, and they are sampled at different moments:
- * "queue" and "driver" by the health task just before it ended the scheduler, "controller",
- * "transport" and "pacing" after the hardware thread has stopped. A frame that was on the
- * modelled bus in between is therefore counted by the controller but not by the queue.
+ * The "can" member. The layers that report here are sampled at two moments:
+ *
+ *  - by the health task, just before it ended the scheduler: "queue", and in "driver" the
+ *    counters of the CAN tasks (rx_frames, rx_unhandled, rx_batches_cut, tx_load_failed);
+ *  - after the hardware thread has stopped: "controller", "transport_counters", "pacing",
+ *    and in "driver" the counters of the controller's FIFOs (rx_fifo_overruns,
+ *    rx_fifo_pending, event_fifo_overruns, state_events_merged).
+ *
+ * In between, no task ran, but the hardware thread did. A frame transmitted then is counted
+ * by the controller and not by the queue; a frame received then went into the receive FIFO
+ * (rx_fifo_pending) or, with the FIFO full, was lost there (rx_fifo_overruns). So for the
+ * receive path the counts agree exactly:
+ *     controller.rx_frames == driver.rx_frames + driver.rx_fifo_overruns
+ *                             + driver.rx_fifo_pending
  */
 static void write_can_stats(FILE *file, const node_stats_t *stats)
 {
@@ -252,6 +278,14 @@ static void write_can_stats(FILE *file, const node_stats_t *stats)
     put_u64(file, "elapsed_ns", report.elapsed_ns, ",\n");
     (void)fprintf(file, "    \"state\": \"%s\", \"tec\": %u, \"rec\": %u,\n",
                   can_state_name(report.state), (unsigned int)report.tec, (unsigned int)report.rec);
+
+    /* Why the transport ended the run, or null. The message is strerror()'s, which contains
+     * no character that would need escaping in a JSON string. */
+    if (report.transport_error != 0) {
+        (void)fprintf(file, "    \"transport_error\": \"%s\",\n", strerror(report.transport_error));
+    } else {
+        (void)fprintf(file, "    \"transport_error\": null,\n");
+    }
 
     (void)fprintf(file, "    \"controller\": {");
     put_u64(file, "tx_frames", report.tx_frames, ", ");
@@ -270,12 +304,20 @@ static void write_can_stats(FILE *file, const node_stats_t *stats)
     put_u64(file, "tx_failed", report.transport_tx_failed, ", ");
     put_u64(file, "rx_frames", report.transport_rx_frames, ", ");
     put_u64(file, "rx_malformed", report.transport_rx_malformed, ", ");
-    put_u64(file, "rx_overflow", report.transport_rx_overflow, "},\n");
+    put_u64(file, "rx_overflow", report.transport_rx_overflow, ", ");
+    put_u64(file, "rx_failed", report.transport_rx_failed, "},\n");
 
+    /* How late the host carried out the model's times; see posix_can_stats_t. */
     (void)fprintf(file, "    \"pacing\": {");
     put_u64(file, "frames", host.frames_paced, ", ");
     put_u64(file, "lag_max_ns", host.pacing_lag_max_ns, ", ");
-    put_u64(file, "lag_mean_ns", host.pacing_lag_mean_ns, "},\n");
+    put_u64(file, "lag_mean_ns", host.pacing_lag_mean_ns, ", ");
+    put_u64(file, "wakeups", host.wakeups, ", ");
+    put_u64(file, "wakeup_lag_max_ns", host.wakeup_lag_max_ns, ", ");
+    put_u64(file, "wakeup_lag_mean_ns", host.wakeup_lag_mean_ns, ", ");
+    put_u64(file, "rx_frames", host.rx_delivered, ", ");
+    put_u64(file, "rx_lag_max_ns", host.rx_lag_max_ns, ", ");
+    put_u64(file, "rx_lag_mean_ns", host.rx_lag_mean_ns, "},\n");
 
     (void)fprintf(file, "    \"driver\": {");
     put_u64(file, "rx_frames", stats->can_io.rx_frames, ", ");
@@ -284,7 +326,8 @@ static void write_can_stats(FILE *file, const node_stats_t *stats)
     put_u64(file, "tx_load_failed", stats->can_io.tx_load_failed, ", ");
     put_u64(file, "rx_fifo_overruns", host.rx_fifo_overruns, ", ");
     put_u64(file, "event_fifo_overruns", host.event_fifo_overruns, ", ");
-    put_u64(file, "state_events_merged", host.state_events_merged, "},\n");
+    put_u64(file, "state_events_merged", host.state_events_merged, ", ");
+    put_u64(file, "rx_fifo_pending", host.rx_fifo_pending, "},\n");
 
     (void)fprintf(file, "    \"queue\": {");
     put_u64(file, "produced", stats->can_queue.produced, ", ");
@@ -319,6 +362,7 @@ static bool write_stats(const char *path, const node_options_t *options, uint64_
     (void)fprintf(file, "{\n  \"schema\": \"fcn.node_stats/1\",\n");
     (void)fprintf(file, "  \"version\": \"%s\",\n", FCN_VERSION);
     (void)fprintf(file, "  \"kernel\": \"%s\",\n", tskKERNEL_VERSION_NUMBER);
+    (void)fprintf(file, "  \"stack_instrumented\": %s,\n", STACK_INSTRUMENTED);
     (void)fprintf(file, "  \"elapsed_ns\": %llu,\n", (unsigned long long)elapsed_ns);
     (void)fprintf(file,
                   "  \"tick\": {\"mode\": \"%s\", \"rate_hz\": %u, \"count\": %llu, "
@@ -346,29 +390,114 @@ static bool write_stats(const char *path, const node_options_t *options, uint64_
 
     for (uint32_t i = 0U; i < stats->task_count; i++) {
         const node_task_stats_t *task = &stats->tasks[i];
+        /* -1: the task never registered with plat_task_enter(), so nothing is known. */
         long long stack_peak = -1;
+        long long stack_start = -1;
+        long long stack_size = -1;
 
         for (size_t k = 0U; k < stack_count; k++) {
             if (strcmp(stacks[k].name, task->name) == 0) {
                 stack_peak = (long long)stacks[k].peak_bytes;
+                stack_start = (long long)stacks[k].start_bytes;
+                stack_size = (long long)stacks[k].configured_bytes;
             }
         }
 
+        /* See plat_stack_info_t: stack_peak_bytes is the depth used of the host stack,
+         * stack_start_bytes the part of it in use before the task's code ran, and
+         * stack_size_bytes the stack the task was created with, the size meant for the
+         * target. */
         (void)fprintf(file,
                       "%s\n    {\"name\": \"%s\", \"priority\": %u, \"run_time_us\": %llu, "
-                      "\"stack_peak_bytes\": %lld}",
+                      "\"stack_peak_bytes\": %lld, \"stack_start_bytes\": %lld, "
+                      "\"stack_size_bytes\": %lld}",
                       (i == 0U) ? "" : ",", task->name, (unsigned int)task->priority,
-                      (unsigned long long)task->run_time_us, stack_peak);
+                      (unsigned long long)task->run_time_us, stack_peak, stack_start, stack_size);
     }
 
     (void)fprintf(file, "\n  ]\n}\n");
     return (fclose(file) == 0);
 }
 
+/* True if the node will be able to create or overwrite the file at `path` (NULL: no file).
+ * Checked before the run, so that a mistyped path is a start-up error and not a log that
+ * quietly goes elsewhere or statistics that are lost after an hour's run. The file itself is
+ * not created here: a node that dies before it writes its statistics leaves none. */
+static bool output_path_usable(const char *path, const char *option, char *error, size_t error_len)
+{
+    struct stat info;
+    bool usable = true;
+
+    if (path == NULL) {
+        return true;
+    }
+
+    if (stat(path, &info) == 0) {
+        if (S_ISDIR(info.st_mode)) {
+            errno = EISDIR;
+            usable = false;
+        } else {
+            usable = (access(path, W_OK) == 0);
+        }
+    } else if (errno == ENOENT) {
+        /* The file does not exist yet: its directory has to, and it has to be writable. */
+        char directory[4096];
+        const char *slash = strrchr(path, '/');
+        const size_t length = (slash == NULL) ? 0U : (size_t)(slash - path);
+
+        if (slash == NULL) {
+            usable = (access(".", W_OK | X_OK) == 0);
+        } else if (length == 0U) {
+            usable = (access("/", W_OK | X_OK) == 0);
+        } else if (length >= sizeof(directory)) {
+            errno = ENAMETOOLONG;
+            usable = false;
+        } else {
+            (void)memcpy(directory, path, length);
+            directory[length] = '\0';
+            usable = (access(directory, W_OK | X_OK) == 0);
+        }
+    } else {
+        usable = false;
+    }
+
+    if (!usable) {
+        (void)snprintf(error, error_len, "cannot write %s %s: %s", option, path, strerror(errno));
+    }
+
+    return usable;
+}
+
+/* What can be wrong with a configuration whose options each parsed: checked before anything
+ * is started. */
+static bool check_configuration(const node_options_t *options, char *error, size_t error_len)
+{
+    can_backend_spec_t spec;
+
+    if (!can_backend_parse_spec(options->can_spec, &spec, error, error_len)) {
+        return false;
+    }
+
+    /* The simulation control socket must not be one of the bus's ports. It would take a slot
+     * of the bus, receive every frame sent on it, and answer each with an error datagram. */
+    if ((spec.kind == CAN_BACKEND_UDP) && (options->sim_port != 0U) &&
+        (options->sim_port >= spec.udp_base_port) &&
+        ((uint32_t)options->sim_port < ((uint32_t)spec.udp_base_port + CAN_UDP_SLOTS))) {
+        (void)snprintf(
+            error, error_len, "--sim-port %u is one of the ports of the UDP bus %s (%u to %u)",
+            (unsigned int)options->sim_port, options->can_spec, (unsigned int)spec.udp_base_port,
+            (unsigned int)spec.udp_base_port + CAN_UDP_SLOTS - 1U);
+        return false;
+    }
+
+    return output_path_usable(options->platform.log_path, "--log-file", error, error_len) &&
+           output_path_usable(options->stats_path, "--stats-json", error, error_len);
+}
+
 int main(int argc, char **argv)
 {
     node_options_t options;
-    char error[200] = {0};
+    char error[1024] = {0}; /* room for a message that quotes a long path */
     int status;
 
     (void)memset(&options, 0, sizeof(options));
@@ -396,6 +525,11 @@ int main(int argc, char **argv)
         if ((long)getppid() != strtol(harness, NULL, 10)) {
             return EXIT_FAILURE;
         }
+    }
+
+    if (!check_configuration(&options, error, sizeof(error))) {
+        (void)fprintf(stderr, "fcn_node: %s\n", error);
+        return EXIT_FAILURE;
     }
 
     posix_platform_init(&options.platform);
@@ -426,10 +560,21 @@ int main(int argc, char **argv)
     LOG_INF("main", "scheduler stopped");
     posix_platform_shutdown();
 
-    if ((options.stats_path != NULL) && !write_stats(options.stats_path, &options, elapsed_ns)) {
+    const int transport_error = posix_can_transport_error();
+    const bool stats_written =
+        (options.stats_path == NULL) || write_stats(options.stats_path, &options, elapsed_ns);
+
+    if (!stats_written) {
         (void)fprintf(stderr, "cannot write %s\n", options.stats_path);
-        return EXIT_FAILURE;
     }
 
-    return EXIT_SUCCESS;
+    /* The run was stopped because the bus went away (posix_can.c): that is what the exit
+     * status says, whether or not the statistics could be written. */
+    if (transport_error != 0) {
+        (void)fprintf(stderr, "fcn_node: the CAN transport %s went away: %s\n", options.can_spec,
+                      strerror(transport_error));
+        return POSIX_EXIT_CAN_TRANSPORT_LOST;
+    }
+
+    return stats_written ? EXIT_SUCCESS : EXIT_FAILURE;
 }

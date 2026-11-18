@@ -7,11 +7,26 @@ sees these commands. The protocol is documented in platform/posix/posix_sim.h:
 
     request:  <token> <command> [arguments...]
     reply:    <token> ok [key=value ...]     or     <token> err <message>
+
+The node carries out every request it receives, once per datagram, and does not remember
+tokens. A request that got no answer in time may still be waiting in the node's socket (a
+host that did not run the node), so sending it again can make the node carry it out twice.
+The client therefore repeats only a command for which that does no harm; see REPEATABLE.
 """
 from __future__ import annotations
 
 import itertools
 import socket
+import time
+
+# Commands that may reach the node more than once without changing the outcome: they only
+# read (ping, can.status) or set a state to a value (can.fault). Any other command, can.inject
+# above all (it adds to the errors still to come), is sent once and waited for.
+REPEATABLE = frozenset({"ping", "can.status", "can.fault"})
+
+# Pause before sending again to a port where nothing was listening yet (a node that is still
+# starting): the request was not delivered, so it can be sent again whatever it is.
+REFUSED_PAUSE_S = 0.01
 
 
 class SimError(RuntimeError):
@@ -23,8 +38,12 @@ class SimControl:
 
     def __init__(self, port: int, timeout: float = 1.0) -> None:
         self._address = ("127.0.0.1", port)
+        self._timeout = timeout
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._socket.settimeout(timeout)
+        # Connected, so that the kernel reports a datagram nobody received (nothing bound to
+        # the port) as ConnectionRefusedError instead of letting it vanish; and so that only
+        # the node's port can answer.
+        self._socket.connect(self._address)
         self._tokens = (f"t{n}" for n in itertools.count(1))
 
     def close(self) -> None:
@@ -39,25 +58,50 @@ class SimControl:
     def request(self, command: str, retries: int = 2) -> dict[str, str]:
         """Send one command and return the reply's key=value pairs.
 
-        A datagram on the loopback interface is not lost, but the node may not have opened its
-        socket yet right after start, so the request is repeated a few times before giving up.
+        The client waits up to (retries + 1) x timeout in all. A command in REPEATABLE is sent
+        again, with a new token, each time `timeout` passes without an answer, up to `retries`
+        times; any other command is sent once and waited for the whole time. A request that
+        the kernel reports as not received (the node has not opened its socket yet, right
+        after it started) is sent again in any case.
         """
+        repeatable = command.split(" ", 1)[0] in REPEATABLE
+        deadline = time.monotonic() + self._timeout * (retries + 1)
+        unanswered = 0           # requests that may have reached the node
         last_error: Exception | None = None
-        for _ in range(retries + 1):
+        while unanswered < (retries + 1 if repeatable else 1):
+            now = time.monotonic()
+            if now >= deadline:
+                break
             token = next(self._tokens)
-            self._socket.sendto(f"{token} {command}".encode(), self._address)
+            until = min(deadline, now + self._timeout) if repeatable else deadline
             try:
-                while True:
-                    data, _ = self._socket.recvfrom(2048)
-                    words = data.decode(errors="replace").split()
-                    if not words or words[0] != token:
-                        continue  # a late reply to an earlier attempt
-                    if len(words) >= 2 and words[1] == "ok":
-                        return dict(word.split("=", 1) for word in words[2:] if "=" in word)
-                    raise SimError(f"'{command}' failed: {' '.join(words[2:])}")
-            except (socket.timeout, ConnectionRefusedError) as error:
+                self._socket.send(f"{token} {command}".encode())
+                words = self._reply(token, until)
+            except ConnectionRefusedError as error:
                 last_error = error
+                time.sleep(REFUSED_PAUSE_S)
+                continue
+            except TimeoutError as error:
+                last_error = error
+                unanswered += 1
+                continue
+            if len(words) >= 2 and words[1] == "ok":
+                return dict(word.split("=", 1) for word in words[2:] if "=" in word)
+            raise SimError(f"'{command}' failed: {' '.join(words[2:])}")
         raise SimError(f"no reply to '{command}' from {self._address}: {last_error}")
+
+    def _reply(self, token: str, until: float) -> list[str]:
+        """The words of the reply to `token`, read until the monotonic time `until`. Replies
+        with another token answer an earlier attempt and are skipped."""
+        while True:
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out")
+            self._socket.settimeout(remaining)
+            data = self._socket.recv(2048)
+            words = data.decode(errors="replace").split()
+            if words and words[0] == token:
+                return words
 
     def ping(self) -> int:
         """The node's process id; proves the node is up and serving commands."""
@@ -79,5 +123,6 @@ class SimControl:
         return self.request(f"can.fault {fault}")
 
     def can_inject(self, kind: str, count: int) -> dict[str, str]:
-        """Destroy the next `count` transmission attempts ("tx") or received frames ("rx")."""
+        """Destroy the next `count` transmission attempts ("tx") or received frames ("rx").
+        Not repeated on a timeout: the count adds to what is left (see REPEATABLE)."""
         return self.request(f"can.inject {kind} {count}")

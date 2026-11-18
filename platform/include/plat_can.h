@@ -33,6 +33,10 @@
 /** Transmit mailboxes of the controller. plat_can_tx() refuses a frame when all are in use. */
 #define PLAT_CAN_TX_MAILBOXES 8U
 
+/** Highest bit rate the controller can be configured for: classical CAN ends at 1 Mbit/s. The
+ *  driver sizes its receive path for the frame rate of a full bus at this rate. */
+#define PLAT_CAN_MAX_BITRATE 1000000U
+
 /** Received frames the controller holds for the driver before it overruns. (A peripheral's
  *  own FIFO is a few frames deep; on a target this would be that plus the ISR's buffer.) */
 #define PLAT_CAN_RX_FIFO_DEPTH 512U
@@ -108,9 +112,11 @@ bool plat_can_rx(plat_can_rx_t *out);
  *  event frees the frame's mailbox. Call from one task only. */
 bool plat_can_event(plat_can_event_t *out);
 
-/** Abort all transmit mailboxes. Every frame leaves its mailbox and is reported with exactly
- *  one event: TX_ABORTED, or TX_DONE for a frame whose transmission was already under way
- *  and succeeded. (If that transmission fails, the frame is not retried: TX_ABORTED.) */
+/** Abort all transmit mailboxes. Every frame loaded by plat_can_tx() before this call leaves
+ *  its mailbox and is reported with exactly one event: TX_ABORTED, or TX_DONE for a frame
+ *  whose transmission was already under way and succeeded. (If that transmission fails, the
+ *  frame is not retried: TX_ABORTED.) A frame loaded after this call returned is not
+ *  affected, however soon after it comes. */
 void plat_can_abort_tx(void);
 
 /** Ask a bus-off controller to start its recovery sequence. */

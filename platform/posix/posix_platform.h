@@ -132,17 +132,49 @@ bool posix_can_start(const char *backend_spec, uint32_t bitrate, char *error, si
 /** Stop the hardware thread and close the transport. Call after the scheduler has ended. */
 void posix_can_stop(void);
 
+/** Exit status of a node whose CAN transport went away while it ran (the SocketCAN interface
+ *  was deleted): the node stopped in an orderly way and wrote its statistics. An interface
+ *  that only went down does not stop the node. */
+#define POSIX_EXIT_CAN_TRANSPORT_LOST 74
+
+/** The errno that ended the transport (ENODEV or ENXIO from a send or a receive),
+ *  or 0 while it works. Once it is set, the hardware thread has asked for an orderly stop of
+ *  the node. Any thread. */
+int posix_can_transport_error(void);
+
+/**
+ * How late the host carried out the model's times, measured by the hardware thread. Each
+ * figure is the time from a moment of the model's timeline to when the thread acted on it:
+ *
+ *  - pacing: a transmitted frame's end of frame -> its write to the transport;
+ *  - wake-up: the deadline the thread slept until -> the start of the pass that served it.
+ *    This covers every host stall while the model had something due, whatever is on the bus;
+ *  - rx: a received frame's end of frame -> its delivery to the receive FIFO.
+ *
+ * A host stall while a frame waits for the bus does not show in the pacing lag: the model
+ * moves that frame's start to the late wake-up (can_ctrl late_resyncs), and the stall becomes
+ * part of the frame's start_ns - submit_ns. It does show in the wake-up lag.
+ */
 typedef struct {
-    uint64_t frames_paced;       /**< transmitted frames the figures below cover */
+    uint64_t frames_paced;       /**< transmitted frames the pacing figures cover */
     uint64_t pacing_lag_max_ns;  /**< worst lateness of a write against the modelled end of frame */
     uint64_t pacing_lag_mean_ns; /**< mean of the same */
+    uint64_t wakeups;            /**< passes that served a deadline the thread slept until */
+    uint64_t wakeup_lag_max_ns;  /**< worst lateness of such a pass against its deadline */
+    uint64_t wakeup_lag_mean_ns; /**< mean of the same */
+    uint64_t rx_delivered;       /**< received frames the rx figures cover: all the model
+                                       delivered, the ones lost to a FIFO overrun included */
+    uint64_t rx_lag_max_ns;      /**< worst lateness of a delivery against its end of frame */
+    uint64_t rx_lag_mean_ns;     /**< mean of the same */
     uint32_t rx_fifo_overruns;   /**< received frames lost because the driver did not drain */
+    uint32_t rx_fifo_pending;    /**< received frames in the FIFO, not taken by the driver */
     uint32_t event_fifo_overruns; /**< transmit outcomes that found the event FIFO full: 0, by
                                        the argument at the top of posix_can.c */
     uint32_t state_events_merged; /**< state changes not queued when they happened because the
                                        driver was far behind; the latest state was sent later */
 } posix_can_stats_t;
 
+/** The figures as of now. Any thread; after posix_can_stop() they are final. */
 void posix_can_get_stats(posix_can_stats_t *out);
 
 /** Everything the hardware side counted, for the end-of-run report. Only valid after
@@ -167,8 +199,10 @@ typedef struct {
     uint64_t transport_tx_frames;
     uint64_t transport_tx_failed;
     uint64_t transport_rx_frames;
+    uint64_t transport_rx_failed;
     uint64_t transport_rx_malformed;
     uint64_t transport_rx_overflow;
+    int transport_error; /**< see posix_can_transport_error() */
 } posix_can_report_t;
 
 void posix_can_get_report(posix_can_report_t *out);

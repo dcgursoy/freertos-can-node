@@ -7,24 +7,26 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
 
 import pytest
 
-from fcn_tools.simctl import SimControl, SimError
+from fcn_tools.simctl import REPEATABLE, SimControl, SimError
 
 LOOPBACK = "127.0.0.1"
 
 
 class FakeNode:
     """Answers each request with what `replies` maps its command to. A value is the text after
-    the token; a callable gets the request's words and returns that text, or None to stay
-    silent. Every request is recorded."""
+    the token; a callable gets the request's token and command and returns that text, None to
+    stay silent, or a list of whole datagrams to send instead. Requests are served one after
+    the other, as the node does, and every one is recorded."""
 
-    def __init__(self, replies):
+    def __init__(self, replies, port: int = 0):
         self.replies = replies
         self.requests: list[str] = []
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._socket.bind((LOOPBACK, 0))
+        self._socket.bind((LOOPBACK, port))
         self._socket.settimeout(0.05)
         self.port = self._socket.getsockname()[1]
         self._run = True
@@ -44,7 +46,10 @@ class FakeNode:
             reply = self.replies.get(command.split(" ")[0], "err unknown command")
             if callable(reply):
                 reply = reply(token, command)
-            if reply is not None:
+            if isinstance(reply, list):
+                for datagram in reply:
+                    self._socket.sendto(datagram.encode(), sender)
+            elif reply is not None:
                 self._socket.sendto(f"{token} {reply}".encode(), sender)
 
     def close(self) -> None:
@@ -57,8 +62,8 @@ class FakeNode:
 def fake_node():
     nodes: list[FakeNode] = []
 
-    def _start(replies) -> FakeNode:
-        node = FakeNode(replies)
+    def _start(replies, port: int = 0) -> FakeNode:
+        node = FakeNode(replies, port)
         nodes.append(node)
         return node
 
@@ -99,14 +104,33 @@ def test_an_error_reply_raises_with_the_nodes_message(fake_node):
 
 
 def test_a_reply_with_another_token_is_not_taken_for_the_answer(fake_node):
-    node = fake_node({"hello": "ok", "ping": lambda token, command: None})
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as stale, \
+    # The node answers with the token of an earlier request (a late reply to an attempt the
+    # client has given up on), and never with this request's token.
+    node = fake_node({"ping": lambda token, command: ["t0 ok pid=1", "x9 ok pid=2"]})
+    with SimControl(node.port, timeout=0.2) as sim:
+        with pytest.raises(SimError, match="no reply"):
+            sim.request("ping", retries=0)
+    assert node.requests == ["ping"]
+
+
+def test_a_late_reply_to_an_earlier_attempt_is_skipped_for_the_right_one(fake_node):
+    def answer_late_then_right(token, command):
+        if token == "t1":
+            return None                       # the first attempt goes unanswered ...
+        return ["t1 ok pid=1", f"{token} ok pid=2"]   # ... and its reply comes late
+
+    node = fake_node({"ping": answer_late_then_right})
+    with SimControl(node.port, timeout=0.1) as sim:
+        assert sim.ping() == 2
+    assert node.requests == ["ping", "ping"]
+
+
+def test_only_the_node_can_answer(fake_node):
+    node = fake_node({"ping": lambda token, command: None})
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as stranger, \
             SimControl(node.port, timeout=0.2) as sim:
-        assert sim.request("hello") == {}            # the client's socket now has its port
-        client_port = sim._socket.getsockname()[1]
-        # A reply with a token of an earlier request is waiting ...
-        stale.sendto(b"t1 ok pid=1", (LOOPBACK, client_port))
-        # ... and the node never answers this one: the old reply must not count for it.
+        client = sim._socket.getsockname()
+        stranger.sendto(b"t1 ok pid=666", client)     # the token the client is about to use
         with pytest.raises(SimError, match="no reply"):
             sim.request("ping", retries=0)
 
@@ -117,6 +141,54 @@ def test_a_silent_node_is_asked_again_and_then_reported(fake_node):
         with pytest.raises(SimError, match="no reply to 'ping'"):
             sim.request("ping", retries=2)
     assert node.requests == ["ping", "ping", "ping"]
+
+
+@pytest.mark.parametrize("command", ["can.inject tx 5", "can.something_new"])
+def test_a_command_that_must_not_run_twice_is_sent_once_and_waited_for(fake_node, command):
+    node = fake_node({command.split(" ")[0]: lambda token, command: None})
+    started = time.monotonic()
+    with SimControl(node.port, timeout=0.1) as sim:
+        with pytest.raises(SimError, match="no reply"):
+            sim.request(command, retries=2)
+    assert time.monotonic() - started >= 0.3          # (retries + 1) x timeout, all for one
+    assert node.requests == [command]
+
+
+def test_a_late_answer_to_a_command_that_must_not_run_twice_is_still_taken(fake_node):
+    # A node that the host did not run for longer than the client's timeout: it carries out
+    # the request when it runs again. Sending it again meanwhile would make it destroy ten
+    # transmissions instead of five.
+    def stalled(token, command):
+        time.sleep(0.25)
+        return "ok tx_errors=5"
+
+    node = fake_node({"can.inject": stalled})
+    with SimControl(node.port, timeout=0.1) as sim:
+        assert sim.can_inject("tx", 5) == {"tx_errors": "5"}
+    assert node.requests == ["can.inject tx 5"]
+
+
+def test_repeatable_commands_are_the_ones_that_read_or_set_a_state():
+    assert REPEATABLE == {"ping", "can.status", "can.fault"}
+
+
+def test_a_node_that_is_still_starting_is_asked_until_its_socket_is_open(fake_node):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.bind((LOOPBACK, 0))
+        port = probe.getsockname()[1]
+    # Nothing listens on the port for the first 0.3 s, longer than one timeout: every
+    # request until then is refused by the kernel, and only those are sent again, even for a
+    # command that must not run twice.
+    opened: list[FakeNode] = []
+    opener = threading.Timer(
+        0.3, lambda: opened.append(fake_node({"can.inject": "ok tx_errors=1"}, port)))
+    opener.start()
+    try:
+        with SimControl(port, timeout=0.2) as sim:
+            assert sim.can_inject("tx", 1) == {"tx_errors": "1"}
+    finally:
+        opener.join()
+    assert opened[0].requests == ["can.inject tx 1"]
 
 
 def test_a_node_that_answers_the_second_time_is_enough(fake_node):

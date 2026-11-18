@@ -59,9 +59,58 @@ def receive_until(bus: can.BusABC, deadline: float) -> Iterator[can.Message]:
 
 def collect(bus: can.BusABC, seconds: float,
             keep: Callable[[can.Message], bool] | None = None) -> list[can.Message]:
-    """All frames received during `seconds`, optionally only those `keep` accepts."""
+    """All frames received during `seconds`, optionally only those `keep` accepts.
+
+    The result depends on how fast the host is: use it to let frames pass, or to show that
+    nothing arrives. To get a number of frames, use collect_count()."""
     deadline = time.monotonic() + seconds
     return [m for m in receive_until(bus, deadline) if keep is None or keep(m)]
+
+
+def collect_count(bus: can.BusABC, count: int, keep: Callable[[can.Message], bool] | None = None,
+                  timeout: float = 5.0) -> list[can.Message]:
+    """The next `count` frames that `keep` accepts. Fewer only if `timeout` runs out first, a
+    bound for a node that has stopped sending, not a measurement: a test asserts the length."""
+    deadline = time.monotonic() + timeout
+    frames: list[can.Message] = []
+    for message in receive_until(bus, deadline):
+        if keep is None or keep(message):
+            frames.append(message)
+            if len(frames) == count:
+                break
+    return frames
+
+
+def collect_while(bus: can.BusABC, running: Callable[[], bool],
+                  keep: Callable[[can.Message], bool] | None = None,
+                  timeout: float = 60.0) -> list[can.Message]:
+    """Every frame received while `running()` holds (the node runs), then drain(): the frames
+    that were still on their way when it stopped. However slowly the host ran the node, this
+    listens for its whole run; `timeout` only bounds a node that never ends."""
+    deadline = time.monotonic() + timeout
+    frames: list[can.Message] = []
+    while running() and time.monotonic() < deadline:
+        message = bus.recv(timeout=0.05)
+        if message is not None and (keep is None or keep(message)):
+            frames.append(message)
+    return frames + drain(bus, keep=keep)
+
+
+def drain(bus: can.BusABC, keep: Callable[[can.Message], bool] | None = None,
+          quiet: float = 0.2, timeout: float = 10.0) -> list[can.Message]:
+    """Every frame the bus still holds, read until none has arrived for `quiet` seconds. Meant
+    for after the node has ended: what it sent is waiting in the socket by then, and a reader
+    that the host delays still gets all of it. `timeout` only bounds a sender that never
+    stops."""
+    deadline = time.monotonic() + timeout
+    frames: list[can.Message] = []
+    while time.monotonic() < deadline:
+        message = bus.recv(timeout=quiet)
+        if message is None:
+            break
+        if keep is None or keep(message):
+            frames.append(message)
+    return frames
 
 
 def wait_for(bus: can.BusABC, wanted: Callable[[can.Message], bool],
@@ -92,6 +141,9 @@ def status_fields(message: can.Message) -> tuple[int, int]:
     return struct.unpack("<II", bytes(message.data))
 
 
+# Ticks per period of the status frame (TICKER_PERIOD_MS in app/app.c at 1 kHz).
+STATUS_PERIOD_TICKS = 10
+
 # Most consecutive status values a busy host can make the node replace before they go out:
 # a host that does not run the node for 50 ms. The status message is cyclic, so a value that
 # could not leave in time is superseded by the next one (lib/can/can_txq.h), which leaves a
@@ -100,22 +152,52 @@ def status_fields(message: can.Message) -> tuple[int, int]:
 STATUS_MAX_STEP = 5
 
 
-def status_gaps(frames: list[can.Message], max_step: int = STATUS_MAX_STEP) -> int:
+def status_gaps(frames: list[can.Message], max_step: int | None = STATUS_MAX_STEP) -> int:
     """Check a sequence of status frames as received and return how many values are missing.
 
-    Asserted: the counters strictly increase, no step is larger than `max_step`, and each
-    value's tick count is consistent with its counter (10 ticks per period, give or take the
-    2 ticks a delayed task may read late). The missing values are the ones the node replaced
-    before they got out; a test compares that number with the node's own statistics.
+    Asserted:
+      - the counters strictly increase and no step is larger than `max_step`. The limit
+        depends on the host (a stall longer than STATUS_MAX_STEP periods exceeds it), so a
+        test that has no bus fault to tell apart from a stall passes None: no limit;
+      - the tick counts strictly increase, and no value carries a tick count below
+        STATUS_PERIOD_TICKS times its counter: period n of the ticker ends at tick 10 n
+        after its start (at tick 0 or later), and the tick is read after that.
+    How late after the end of its period a value was published depends on the host; that is
+    checked on the wall clock, in a test marked `timing`. The missing values are the ones the
+    node replaced before they got out; a test compares that number with the node's own
+    statistics.
     """
     fields = [status_fields(frame) for frame in frames]
+    for counter, tick in fields:
+        assert tick >= STATUS_PERIOD_TICKS * counter, f"status counter {counter} at tick {tick}"
     missing = 0
     for (c0, t0), (c1, t1) in zip(fields, fields[1:]):
         step = c1 - c0
-        assert 1 <= step <= max_step, f"status counter {c0} followed by {c1}"
-        assert abs((t1 - t0) - 10 * step) <= 2, f"counters {c0}->{c1} but ticks {t0}->{t1}"
+        assert step >= 1 and (max_step is None or step <= max_step), (
+            f"status counter {c0} followed by {c1}")
+        assert t1 > t0, f"counters {c0}->{c1} but ticks {t0}->{t1}"
         missing += step - 1
     return missing
+
+
+def status_missing_since_start(frames: list[can.Message],
+                               max_step: int | None = STATUS_MAX_STEP) -> int:
+    """status_gaps() of everything a tester heard from the node's start on, including the
+    values before the first one heard (the counter starts at 1): the number to compare with
+    the queue's count of superseded values."""
+    if not frames:
+        return 0
+    return status_fields(frames[0])[0] - 1 + status_gaps(frames, max_step)
+
+
+def status_publish_lateness(frames: list[can.Message]) -> list[int]:
+    """How many ticks after the end of its period each value was published, relative to the
+    earliest one in `frames` (the ticker's start tick is not on the bus). 0 for every value on
+    a host that runs the node in time."""
+    offsets = [tick - STATUS_PERIOD_TICKS * counter
+               for counter, tick in (status_fields(frame) for frame in frames)]
+    earliest = min(offsets)
+    return [offset - earliest for offset in offsets]
 
 
 def wait_for_id(bus: can.BusABC, arbitration_id: int, timeout: float) -> can.Message | None:

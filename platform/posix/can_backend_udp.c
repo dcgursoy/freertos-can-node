@@ -95,7 +95,7 @@ static void loopback_address(struct sockaddr_in *address, uint16_t port)
 static bool udp_send(can_backend_t *self, const can_frame_t *frame)
 {
     uint8_t datagram[CAN_UDP_DATAGRAM_LEN];
-    bool ok = true;
+    int error = 0;
 
     can_udp_encode(frame, datagram);
 
@@ -114,20 +114,22 @@ static bool udp_send(can_backend_t *self, const can_frame_t *frame)
             } while ((sent < 0) && (errno == EINTR));
 
             /* A slot nobody has bound is not an error: the datagram is simply not
-             * delivered, like a frame on a bus segment with no node attached. */
-            if ((sent < 0) && (errno != ECONNREFUSED)) {
-                ok = false;
+             * delivered, like a frame on a bus segment with no node attached. The first
+             * real error is the one reported. */
+            if ((sent < 0) && (errno != ECONNREFUSED) && (error == 0)) {
+                error = errno;
             }
         }
     }
 
-    if (ok) {
+    if (error == 0) {
         self->tx_frames++;
     } else {
+        self->last_error = error;
         self->tx_failed++;
     }
 
-    return ok;
+    return (error == 0);
 }
 
 static int udp_recv(can_backend_t *self, can_frame_t *frame)
@@ -149,7 +151,13 @@ static int udp_recv(can_backend_t *self, can_frame_t *frame)
                 continue;
             }
 
-            return ((errno == EAGAIN) || (errno == EWOULDBLOCK)) ? 0 : -1;
+            if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+                return 0;
+            }
+
+            self->last_error = errno;
+            self->rx_failed++;
+            return -1;
         }
 
         const uint16_t port = ntohs(from.sin_port);

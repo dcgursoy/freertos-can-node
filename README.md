@@ -40,7 +40,11 @@ simulated around it, so that all of it builds, runs and is tested on a laptop an
   - a thread outside the scheduler may not call the kernel, so models of peripherals reach
     tasks through lock-free rings and a simulated interrupt ([posix_irq.c](platform/posix/posix_irq.c));
   - tasks run on ordinary pthread stacks, so the kernel's stack high-water mark sees nothing.
-    [posix_stack.c](platform/posix/posix_stack.c) measures the real stack instead.
+    [posix_stack.c](platform/posix/posix_stack.c) measures the real stack instead, counted from
+    the top of each task's pthread stack. The node's statistics give each task's peak
+    (`stack_peak_bytes`), the part the C library and the port had in use before the task's
+    code ran (`stack_start_bytes`), and the stack the task was created with, the size meant
+    for the target (`stack_size_bytes`).
 
   **It does not turn Linux into a real-time system.** When a thread runs is still decided by
   the host's scheduler. Tick jitter, dropped ticks, wake-up times and interrupt latency in
@@ -72,11 +76,15 @@ of phase 2 it sends a status frame every 10 ms and answers a ping frame.
   SocketCAN, and a virtual bus over UDP on the loopback interface for machines without the
   `vcan` kernel module. The node and every Python tool select one with the same string
   (`socketcan:vcan0`, `udp:29500`). The UDP bus is also a python-can interface
-  ([tools/fcn_tools/udpbus.py](tools/fcn_tools/udpbus.py)).
-- **Controller model** ([lib/can](lib/can)). A socket delivers instantly and never fails; a
-  bus does neither. The model puts every frame on one timeline with its exact stuffed length
-  at the configured bit rate, sends the highest-priority mailbox first, and applies the fault
-  confinement rules of the Bosch CAN specification (error counters, error passive, bus off,
+  ([tools/fcn_tools/udpbus.py](tools/fcn_tools/udpbus.py)). A transport that fails while
+  the node runs is counted and logged, and one that is gone, such as a deleted SocketCAN
+  interface, stops the node with exit status 74.
+- **Controller model** ([lib/can](lib/can)). A socket delivers instantly and intact; a bus
+  does neither. The model puts every frame on one timeline with its exact stuffed length at
+  the configured bit rate. Whenever the bus becomes free, the node's highest-priority
+  mailbox and the oldest frame another node is waiting to send arbitrate, as on a real bus
+  (frames of other nodes keep the order the transport delivers them in). The model applies
+  the fault confinement rules of the Bosch CAN specification (error counters, error passive, bus off,
   recovery) to faults that the test bench injects as physical conditions: a shorted bus, a
   bus held dominant, a missing acknowledgement.
 - **Transmit queue** ([lib/can/can_txq.h](lib/can/can_txq.h)). One latest-value slot per
@@ -90,9 +98,10 @@ of phase 2 it sends a status frame every 10 ms and answers a ping frame.
 - **Simulation control** ([platform/posix/posix_sim.h](platform/posix/posix_sim.h)). Faults are
   applied to the simulated hardware through a channel of its own, the way a test bench works
   on a real device; the application has no test hooks.
-- **Tests.** Unit tests of every module of `lib/can` and `lib/crc` against published vectors
-  and independent Python implementations; system tests that run every bus test on both
-  transports (CI refuses to skip SocketCAN).
+- **Tests.** Unit tests of every module of `lib/can` and `lib/crc`, each also challenged with
+  planted defects; the CRCs and frame lengths are checked against published vectors, and
+  `can_bits` against an independent Python implementation on more than 100,000 frames; system
+  tests that run every bus test on both transports (CI refuses to skip SocketCAN).
 
 ## Build and test
 
@@ -115,13 +124,25 @@ scripts/check.sh
 ```
 
 `scripts/check.sh` runs the checks CI runs: static analysis, the debug and release builds,
-the unit and platform tests under AddressSanitizer and UndefinedBehaviorSanitizer, the unit
-tests that start threads under ThreadSanitizer, coverage of `lib/`, the system tests and the
+the unit and platform tests under AddressSanitizer and UndefinedBehaviorSanitizer, the tests
+of code shared between threads under ThreadSanitizer (the lock-free ring, and the CAN driver
+against the controller's hardware thread), coverage of `lib/`, the system tests and the
 verification of the bug log. The individual steps are `scripts/static-analysis.sh`,
 `scripts/build.sh`, `scripts/test-unit.sh`, `scripts/test-tsan.sh`, `scripts/coverage.sh`,
 `scripts/test-system.sh` and `scripts/buglog-verify.sh`. A test whose verdict depends on the
-host keeping time exits with status 75 when only a timing tolerance was missed; that status,
-and nothing else, is repeated once. The ThreadSanitizer runtime of gcc 13 needs address-space
+host keeping time reports a missed timing tolerance on its own, apart from every other failure:
+a C self-test exits with status 75, a Python test raises `TimingToleranceMissed`
+([tools/fcn_tools/timing.py](tools/fcn_tools/timing.py)). Such a test, and nothing else, is
+repeated once. If it misses its tolerance again, `scripts/test-system.sh` exits with status 75
+instead of 1, the status the C self-tests use for a missed timing tolerance: either the host
+did not keep time or the timing has regressed, and a repetition on an otherwise idle machine
+tells them apart. `scripts/buglog-verify.sh` follows the same rule: an entry whose test
+missed only timing tolerances twice, with or without the bug, is reported as inconclusive,
+and the script exits with 75 if nothing else failed. `scripts/test-system.sh` tests the
+`fcn_tools` of the checkout it runs in:
+it puts that `tools/` directory on `PYTHONPATH` and stops if Python imports the package from
+anywhere else, such as another checkout that the virtual environment's editable install
+points to. The ThreadSanitizer runtime of gcc 13 needs address-space
 randomisation off on kernels that randomise mmap with more than 28 bits (WSL2 among them);
 `scripts/test-tsan.sh` turns it off for the test run with `setarch -R`. CI adds the steps that
 belong to the runner: it checks the executable bits in the git index, creates and verifies the

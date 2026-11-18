@@ -134,8 +134,9 @@ static int peer_hears(can_frame_t *frame, int timeout_ms)
     return result;
 }
 
-/* One simulation control command; fails the test unless the reply is "ok". Returns the reply. */
-static const char *sim(const char *command)
+/* One simulation control command; fails the test unless the reply is "ok" (`ok` true) or
+ * "err" (`ok` false). Returns the reply. */
+static const char *sim_expect(const char *command, bool ok)
 {
     static char reply[POSIX_SIM_MAX_DATAGRAM + 1U];
     static unsigned int serial;
@@ -148,7 +149,7 @@ static const char *sim(const char *command)
 
     serial++;
     length = snprintf(request, sizeof(request), "t%u %s", serial, command);
-    (void)snprintf(expected, sizeof(expected), "t%u ok", serial);
+    (void)snprintf(expected, sizeof(expected), "t%u %s", serial, ok ? "ok" : "err");
     TEST_ASSERT_TRUE((length > 0) && ((size_t)length < sizeof(request)));
 
     (void)memset(&to, 0, sizeof(to));
@@ -163,6 +164,11 @@ static const char *sim(const char *command)
     reply[received] = '\0';
     TEST_ASSERT_EQUAL_INT_MESSAGE(0, strncmp(reply, expected, strlen(expected)), reply);
     return reply;
+}
+
+static const char *sim(const char *command)
+{
+    return sim_expect(command, true);
 }
 
 /* The number after " <key>=" in a simulation control reply. */
@@ -380,6 +386,13 @@ static void test_frames_leave_by_priority_at_bus_speed_and_each_is_confirmed_onc
 
     posix_can_get_stats(&stats);
     TEST_ASSERT_EQUAL_UINT64(PLAT_CAN_TX_MAILBOXES + 1U, stats.frames_paced);
+    TEST_ASSERT_TRUE(stats.pacing_lag_max_ns >= stats.pacing_lag_mean_ns);
+    /* The pass that writes a frame starts at or after its end of frame, and the thread's
+     * last sleep before it was for that end of frame or an earlier deadline: every frame
+     * written is a pass that served a deadline. */
+    TEST_ASSERT_TRUE(stats.wakeups >= 1U);
+    TEST_ASSERT_TRUE(stats.wakeup_lag_max_ns >= stats.wakeup_lag_mean_ns);
+    TEST_ASSERT_EQUAL_UINT64(0U, stats.rx_delivered);
     TEST_ASSERT_EQUAL_UINT32(0U, stats.state_events_merged);
     assert_nothing_was_lost_on_the_way_to_the_driver();
 }
@@ -434,6 +447,16 @@ static void test_received_frames_reach_the_driver_in_order_with_their_bus_time(v
     TEST_ASSERT_EQUAL_UINT16(0U, status.tec);
     TEST_ASSERT_EQUAL_UINT16(0U, status.rec);
     TEST_ASSERT_EQUAL_UINT32(0U, status.rx_fifo_overruns);
+
+    /* Each delivery was measured against its end of frame, and nothing is left in the FIFO. */
+    {
+        posix_can_stats_t stats;
+
+        posix_can_get_stats(&stats);
+        TEST_ASSERT_EQUAL_UINT64(sizeof(sent) / sizeof(sent[0]), stats.rx_delivered);
+        TEST_ASSERT_TRUE(stats.rx_lag_max_ns >= stats.rx_lag_mean_ns);
+        TEST_ASSERT_EQUAL_UINT32(0U, stats.rx_fifo_pending);
+    }
 }
 
 static void test_a_receive_fifo_that_is_not_drained_overruns_and_keeps_the_oldest_frames(void)
@@ -459,6 +482,15 @@ static void test_a_receive_fifo_that_is_not_drained_overruns_and_keeps_the_oldes
     plat_can_get_status(&status);
     TEST_ASSERT_EQUAL_UINT32((uint32_t)SENT - PLAT_CAN_RX_FIFO_DEPTH, status.rx_fifo_overruns);
 
+    /* Every frame the model delivered is accounted for: lost to the overrun or in the FIFO. */
+    {
+        posix_can_stats_t stats;
+
+        posix_can_get_stats(&stats);
+        TEST_ASSERT_EQUAL_UINT64((uint64_t)SENT, stats.rx_delivered);
+        TEST_ASSERT_EQUAL_UINT32(PLAT_CAN_RX_FIFO_DEPTH, stats.rx_fifo_pending);
+    }
+
     /* What the FIFO kept is the beginning of the sequence: the frames that found it full were
      * the ones dropped, as on a controller whose FIFO is locked against overwriting. */
     while (plat_can_rx(&received)) {
@@ -467,6 +499,13 @@ static void test_a_receive_fifo_that_is_not_drained_overruns_and_keeps_the_oldes
     }
 
     TEST_ASSERT_EQUAL_UINT32(PLAT_CAN_RX_FIFO_DEPTH, drained);
+
+    {
+        posix_can_stats_t stats;
+
+        posix_can_get_stats(&stats);
+        TEST_ASSERT_EQUAL_UINT32(0U, stats.rx_fifo_pending);
+    }
 
     /* The overrun is over as soon as there is room. */
     {
@@ -707,6 +746,161 @@ static void test_a_driver_that_falls_behind_loses_no_outcome_and_learns_the_last
     TEST_ASSERT_EQUAL_UINT32(600U, event.handle);
 }
 
+/* docs/bug-log.md, 006: the abort used to take back every request still in the transmit ring
+ * when the hardware thread served it, including requests the driver made after the abort had
+ * returned. A driver that aborts and loads a fresh frame at once, as can_io's transmit task
+ * does, lost the fresh one. */
+static void test_a_frame_loaded_right_after_an_abort_is_not_aborted(void)
+{
+    enum { ROUNDS = 50 };
+    uint32_t aborted = 0U;
+    can_frame_t heard;
+
+    for (uint32_t round = 0U; round < (uint32_t)ROUNDS; round++) {
+        const can_frame_t fresh = numbered_frame(0x321U, round);
+        plat_can_event_t event;
+
+        /* Nothing is loaded: the abort has nothing to take back. */
+        plat_can_abort_tx();
+        TEST_ASSERT_TRUE(plat_can_tx(&fresh, 1000U + round));
+        event = next_outcome();
+        TEST_ASSERT_EQUAL_UINT32(1000U + round, event.handle);
+
+        if (event.kind == PLAT_CAN_EVENT_TX_ABORTED) {
+            aborted++;
+        } else {
+            TEST_ASSERT_EQUAL_INT(PLAT_CAN_EVENT_TX_DONE, event.kind);
+            TEST_ASSERT_EQUAL_INT(1, peer_hears(&heard, (int)WAIT_MS));
+            assert_frames_equal(&fresh, &heard);
+        }
+    }
+
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0U, aborted, "frames loaded after the abort were aborted");
+    assert_nothing_was_lost_on_the_way_to_the_driver();
+}
+
+static void test_an_abort_takes_back_the_frames_loaded_before_it_and_no_other(void)
+{
+    enum { LOADED = 3 };
+    const can_frame_t fresh = make_frame(0x0A0U, 0U, 3U, 0x60U);
+    bool aborted[LOADED] = {false};
+    plat_can_event_t event;
+    can_frame_t heard;
+
+    /* Nobody acknowledges: the loaded frames stay in their mailboxes, one of them always in
+     * the middle of an attempt. */
+    (void)sim("can.fault noack");
+
+    for (uint32_t i = 0U; i < (uint32_t)LOADED; i++) {
+        const can_frame_t frame = make_frame(0x410U + i, 0U, 1U, (uint8_t)i);
+
+        TEST_ASSERT_TRUE(plat_can_tx(&frame, 30U + i));
+    }
+
+    plat_can_abort_tx();
+    TEST_ASSERT_TRUE(plat_can_tx(&fresh, 60U));
+
+    /* The three come back aborted, and only they. */
+    for (uint32_t n = 0U; n < (uint32_t)LOADED; n++) {
+        uint32_t index;
+
+        event = next_outcome();
+        TEST_ASSERT_EQUAL_INT(PLAT_CAN_EVENT_TX_ABORTED, event.kind);
+        TEST_ASSERT_NOT_EQUAL_MESSAGE(60U, event.handle, "the frame loaded after the abort");
+        TEST_ASSERT_TRUE((event.handle - 30U) < (uint32_t)LOADED);
+        index = (event.handle - 30U) % (uint32_t)LOADED;
+        TEST_ASSERT_FALSE_MESSAGE(aborted[index], "a frame was reported twice");
+        aborted[index] = true;
+    }
+
+    /* The fresh frame waits in its mailbox for an acknowledgement, and goes out once there
+     * is one: the first and only frame the network hears. */
+    (void)sim("can.status"); /* a pass of the hardware thread after the abort has run */
+
+    while (take_event(&event)) {
+        TEST_ASSERT_EQUAL_INT_MESSAGE(PLAT_CAN_EVENT_STATE, event.kind, "an outcome too early");
+    }
+
+    (void)sim("can.fault none");
+    event = next_outcome();
+    TEST_ASSERT_EQUAL_INT(PLAT_CAN_EVENT_TX_DONE, event.kind);
+    TEST_ASSERT_EQUAL_UINT32(60U, event.handle);
+    TEST_ASSERT_EQUAL_INT(1, peer_hears(&heard, (int)WAIT_MS));
+    assert_frames_equal(&fresh, &heard);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, peer_hears(&heard, 50), "an aborted frame arrived");
+    assert_nothing_was_lost_on_the_way_to_the_driver();
+}
+
+static void test_an_injection_needs_a_kind_and_a_count_above_zero(void)
+{
+    static const char *const refused[] = {"can.inject tx 0", "can.inject rx 0",   "can.inject tx",
+                                          "can.inject tx x", "can.inject both 3", "can.inject"};
+    const char *reply;
+
+    for (size_t i = 0U; i < (sizeof(refused) / sizeof(refused[0])); i++) {
+        reply = sim_expect(refused[i], false);
+        TEST_ASSERT_NOT_NULL_MESSAGE(strstr(reply, "usage: can.inject <tx|rx> <count>"),
+                                     refused[i]);
+    }
+
+    /* None of them destroyed anything: a frame goes out and comes in without an error. */
+    {
+        const can_frame_t frame = make_frame(0x1A0U, 0U, 1U, 0x70U);
+        plat_can_event_t event;
+        can_frame_t heard;
+
+        TEST_ASSERT_TRUE(plat_can_tx(&frame, 70U));
+        event = next_outcome();
+        TEST_ASSERT_EQUAL_INT(PLAT_CAN_EVENT_TX_DONE, event.kind);
+        TEST_ASSERT_EQUAL_INT(1, peer_hears(&heard, (int)WAIT_MS));
+        TEST_ASSERT_TRUE(s_peer.send(&s_peer, &frame));
+        (void)next_rx();
+    }
+
+    reply = sim("can.status");
+    TEST_ASSERT_EQUAL_UINT64(0U, sim_number(reply, "tx_failed"));
+    TEST_ASSERT_EQUAL_UINT64(0U, sim_number(reply, "rx_errors"));
+    TEST_ASSERT_EQUAL_UINT64(0U, sim_number(reply, "tec"));
+}
+
+static void test_the_status_reports_the_transport_and_the_host_lateness_in_full(void)
+{
+    const can_frame_t frame = make_frame(0x2B0U, 0U, 8U, 0x80U);
+    plat_can_event_t event;
+    can_frame_t heard;
+    posix_can_stats_t stats;
+    const char *reply;
+
+    TEST_ASSERT_TRUE(plat_can_tx(&frame, 80U));
+    event = next_outcome();
+    TEST_ASSERT_EQUAL_INT(PLAT_CAN_EVENT_TX_DONE, event.kind);
+    TEST_ASSERT_EQUAL_INT(1, peer_hears(&heard, (int)WAIT_MS));
+    /* Two received frames, so that the largest receive lag and the mean differ (they are in
+     * nanoseconds and two deliveries are never exactly as late). */
+    TEST_ASSERT_TRUE(s_peer.send(&s_peer, &frame));
+    (void)next_rx();
+    TEST_ASSERT_TRUE(s_peer.send(&s_peer, &frame));
+    (void)next_rx();
+
+    /* The keys added last are the ones a reply cut short would lose. */
+    reply = sim("can.status");
+    TEST_ASSERT_EQUAL_UINT64(1U, sim_number(reply, "transport_tx"));
+    TEST_ASSERT_EQUAL_UINT64(0U, sim_number(reply, "transport_tx_failed"));
+    TEST_ASSERT_EQUAL_UINT64(2U, sim_number(reply, "transport_rx"));
+    TEST_ASSERT_EQUAL_UINT64(0U, sim_number(reply, "transport_rx_failed"));
+    TEST_ASSERT_TRUE(sim_number(reply, "wakeup_lag_max_ns") >=
+                     sim_number(reply, "wakeup_lag_mean_ns"));
+    TEST_ASSERT_TRUE(sim_number(reply, "rx_lag_max_ns") >= sim_number(reply, "rx_lag_mean_ns"));
+    TEST_ASSERT_NOT_NULL(strstr(reply, " rx_lag_mean_ns="));
+    /* The receive lag is recorded before the frame enters the FIFO, and nothing has been
+     * received since: the figures in the reply are the final ones, exactly. */
+    posix_can_get_stats(&stats);
+    TEST_ASSERT_EQUAL_UINT64(stats.rx_lag_max_ns, sim_number(reply, "rx_lag_max_ns"));
+    TEST_ASSERT_EQUAL_UINT64(stats.rx_lag_mean_ns, sim_number(reply, "rx_lag_mean_ns"));
+    TEST_ASSERT_EQUAL_UINT64(2U, stats.rx_delivered);
+    TEST_ASSERT_TRUE(strlen(reply) < POSIX_SIM_MAX_DATAGRAM);
+}
+
 int main(void)
 {
     struct sockaddr_in any;
@@ -745,6 +939,10 @@ int main(void)
     RUN_TEST(test_a_frame_nobody_acknowledges_stays_until_the_driver_aborts_it);
     RUN_TEST(test_a_shorted_bus_ends_in_bus_off_and_recovery_waits_for_the_request);
     RUN_TEST(test_a_driver_that_falls_behind_loses_no_outcome_and_learns_the_last_state);
+    RUN_TEST(test_a_frame_loaded_right_after_an_abort_is_not_aborted);
+    RUN_TEST(test_an_abort_takes_back_the_frames_loaded_before_it_and_no_other);
+    RUN_TEST(test_an_injection_needs_a_kind_and_a_count_above_zero);
+    RUN_TEST(test_the_status_reports_the_transport_and_the_host_lateness_in_full);
 
     failures = UNITY_END();
     (void)close(s_sim_client);

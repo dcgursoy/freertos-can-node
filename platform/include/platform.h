@@ -58,11 +58,32 @@ void plat_task_enter(const char *name);
 /** Peak stack depth of one registered task. */
 typedef struct {
     char name[16];
-    /** Deepest use seen since plat_task_enter(). The measurement has a floor: use below it
-     *  is reported as the floor itself. On the host the floor is 512 bytes (4096 in a
-     *  sanitizer build), so that value means "at most that much". */
+    /** Deepest use seen since plat_task_enter(), counted from the top of the stack the task
+     *  runs on, so the frame of the task function itself is included.
+     *
+     *  On the host that is the task's pthread stack, and the figure also holds start_bytes,
+     *  what lies above the task function. The measurement has a floor: the depth of the
+     *  stack at plat_task_enter() plus 512 bytes (4096 in a sanitizer build) left unpainted
+     *  below it. Less use is reported as the floor itself, so a peak at the floor means "at
+     *  most that much". The floor is a constant of the host and the build, a little different
+     *  per task because the frames of the task functions differ: about 5 KiB in the release
+     *  and debug builds and 9 KiB in the asan build of the development laptop (glibc 2.39). */
     uint32_t peak_bytes;
-    uint32_t size_bytes; /**< total stack available to the task */
+    /** Part of peak_bytes that was in use before the task's own code ran: the depth at which
+     *  the function that called plat_task_enter() was entered. On the host it is the C
+     *  library's thread descriptor and static TLS and the frames of the thread's and the
+     *  port's start functions, the same for every task the port starts (4432 bytes in the
+     *  release build of the development laptop); peak_bytes - start_bytes is what the task's
+     *  code used. For a task that registers from a helper (the idle task, from its hook) it
+     *  also holds the frames between the task function and that helper. 0 if it could not be
+     *  found out. */
+    uint32_t start_bytes;
+    /** Size of the stack the task really runs on: on the host its pthread stack, which is
+     *  not the stack it was created with. */
+    uint32_t size_bytes;
+    /** Size of the stack the task was created with (its uxStackDepth words), the size meant
+     *  for the target. On the host the task's code never runs on it. */
+    uint32_t configured_bytes;
 } plat_stack_info_t;
 
 /** Fill `out` with one entry per registered task; returns the number of entries written.

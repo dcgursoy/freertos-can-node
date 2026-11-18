@@ -1,6 +1,6 @@
 --- a/platform/posix/posix_irq.c
 +++ b/platform/posix/posix_irq.c
-@@ -71,11 +71,6 @@
+@@ -79,11 +79,6 @@
   * passed on unchanged. */
  int __wrap_pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)
  {

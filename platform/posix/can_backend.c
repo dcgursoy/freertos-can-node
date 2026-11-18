@@ -2,6 +2,7 @@
 /* Chooses the transport from a "kind:argument" specification. */
 #include "can_backend.h"
 
+#include <errno.h>
 #include <linux/sock_diag.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,33 +25,73 @@ void can_backend_refresh_counters(can_backend_t *backend)
     }
 }
 
-bool can_backend_open(can_backend_t *backend, const char *spec, char *error, size_t error_len)
+/* A port number: decimal digits only, 1 to 65535. strtoul() alone would also take leading
+ * spaces, a sign, and a negative number wrapped around to a large one. */
+static bool parse_port(const char *digits, uint16_t *out)
 {
-    static const char udp_prefix[] = "udp";
-    static const char socketcan_prefix[] = "socketcan:";
+    bool ok = false;
 
-    if (strncmp(spec, socketcan_prefix, sizeof(socketcan_prefix) - 1U) == 0) {
-        return can_backend_socketcan_open(backend, &spec[sizeof(socketcan_prefix) - 1U], error,
-                                          error_len);
-    }
-
-    if (strcmp(spec, udp_prefix) == 0) {
-        return can_backend_udp_open(backend, (uint16_t)CAN_UDP_DEFAULT_PORT, error, error_len);
-    }
-
-    if ((strncmp(spec, udp_prefix, sizeof(udp_prefix) - 1U) == 0) &&
-        (spec[sizeof(udp_prefix) - 1U] == ':')) {
-        const char *digits = &spec[sizeof(udp_prefix)];
+    if ((digits[0] >= '0') && (digits[0] <= '9')) {
         char *end = NULL;
-        const unsigned long port = strtoul(digits, &end, 10);
+        unsigned long port;
 
-        if ((end != digits) && (*end == '\0') && (port > 0UL) && (port <= 65535UL)) {
-            return can_backend_udp_open(backend, (uint16_t)port, error, error_len);
+        errno = 0;
+        port = strtoul(digits, &end, 10);
+
+        if ((errno == 0) && (*end == '\0') && (port > 0UL) && (port <= 65535UL)) {
+            *out = (uint16_t)port;
+            ok = true;
         }
     }
 
-    (void)snprintf(error, error_len,
-                   "unknown CAN backend '%s' (use udp, udp:<base port> or socketcan:<interface>)",
-                   spec);
-    return false;
+    return ok;
+}
+
+bool can_backend_parse_spec(const char *spec, can_backend_spec_t *out, char *error,
+                            size_t error_len)
+{
+    static const char udp_prefix[] = "udp";
+    static const char socketcan_prefix[] = "socketcan:";
+    bool ok = false;
+
+    (void)memset(out, 0, sizeof(*out));
+
+    if (strncmp(spec, socketcan_prefix, sizeof(socketcan_prefix) - 1U) == 0) {
+        out->kind = CAN_BACKEND_SOCKETCAN;
+        out->interface = &spec[sizeof(socketcan_prefix) - 1U];
+        ok = true;
+    } else if (strcmp(spec, udp_prefix) == 0) {
+        out->kind = CAN_BACKEND_UDP;
+        out->udp_base_port = (uint16_t)CAN_UDP_DEFAULT_PORT;
+        ok = true;
+    } else if ((strncmp(spec, udp_prefix, sizeof(udp_prefix) - 1U) == 0) &&
+               (spec[sizeof(udp_prefix) - 1U] == ':')) {
+        out->kind = CAN_BACKEND_UDP;
+        ok = parse_port(&spec[sizeof(udp_prefix)], &out->udp_base_port);
+    } else {
+        ok = false;
+    }
+
+    if (!ok) {
+        (void)snprintf(
+            error, error_len,
+            "unknown CAN backend '%s' (use udp, udp:<base port> or socketcan:<interface>)", spec);
+    }
+
+    return ok;
+}
+
+bool can_backend_open(can_backend_t *backend, const char *spec, char *error, size_t error_len)
+{
+    can_backend_spec_t parsed;
+
+    if (!can_backend_parse_spec(spec, &parsed, error, error_len)) {
+        return false;
+    }
+
+    if (parsed.kind == CAN_BACKEND_SOCKETCAN) {
+        return can_backend_socketcan_open(backend, parsed.interface, error, error_len);
+    }
+
+    return can_backend_udp_open(backend, parsed.udp_base_port, error, error_len);
 }

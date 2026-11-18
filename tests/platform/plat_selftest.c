@@ -1722,11 +1722,60 @@ static void shallow_task(void *arg)
     }
 }
 
+/* A task that keeps a large buffer in its own body, the usual firmware pattern. The task
+ * function allocates its whole frame, the buffer with it, before its first statement, so the
+ * buffer lies above the frame of plat_task_enter(): a depth counted from there leaves it out.
+ * Not instrumented: AddressSanitizer would move the buffer to its fake stack. The stack depth
+ * it is created with differs from the other tasks' so that the report has to give each task
+ * its own; on the host it has nothing to do with the buffer (the code runs on a pthread
+ * stack). */
+#define BODY_BUFFER_BYTES     (16U * 1024U)
+#define BODY_TASK_STACK_WORDS ((size_t)3U * (size_t)configMINIMAL_STACK_SIZE)
+
+static volatile uint32_t s_body_result;
+static StackType_t s_body_stack[BODY_TASK_STACK_WORDS]; /* static: the kernel heap is small */
+static StaticTask_t s_body_tcb;
+
+__attribute__((no_sanitize("address"))) static void body_buffer_task(void *arg)
+{
+    volatile uint8_t buffer[BODY_BUFFER_BYTES];
+
+    (void)arg;
+    plat_task_enter("body");
+
+    for (uint32_t i = 0U; i < BODY_BUFFER_BYTES; i++) {
+        buffer[i] = (uint8_t)i;
+    }
+
+    s_body_result = buffer[BODY_BUFFER_BYTES - 1U];
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(10U));
+    }
+}
+
+/* EXIT_FAILURE unless the report gives the task the stack it was created with. */
+static int check_configured(const plat_stack_info_t *info, size_t words)
+{
+    const uint32_t expected = (uint32_t)(words * sizeof(StackType_t));
+    int status = EXIT_SUCCESS;
+
+    if (info->configured_bytes != expected) {
+        (void)fprintf(stderr, "task %s: configured stack reported as %u bytes, created with %u\n",
+                      info->name, (unsigned int)info->configured_bytes, (unsigned int)expected);
+        status = EXIT_FAILURE;
+    }
+
+    return status;
+}
+
 static int cmd_stack(void)
 {
     plat_stack_info_t info[8];
     uint32_t deep = 0U;
     uint32_t shallow = 0U;
+    uint32_t body = 0U;
+    uint32_t starts[3] = {0U, 0U, 0U}; /* start_bytes of deep, shallow, body */
     bool idle_seen = false;
     bool dead_stack_read = false;
     int status = EXIT_SUCCESS;
@@ -1734,6 +1783,8 @@ static int cmd_stack(void)
     init_platform(POSIX_TICK_LOCKED, POSIX_IRQ_SIGNAL, NULL);
     create_task(deep_task, "deep", 3U, NULL);
     create_task(shallow_task, "shallow", 3U, NULL);
+    (void)xTaskCreateStatic(body_buffer_task, "body", BODY_TASK_STACK_WORDS, NULL, 3U, s_body_stack,
+                            &s_body_tcb);
     create_task(stopper_task, "stopper", 5U, NULL);
     posix_platform_run();
     posix_platform_shutdown();
@@ -1741,19 +1792,32 @@ static int cmd_stack(void)
     const size_t count = plat_stack_report(info, sizeof(info) / sizeof(info[0]));
 
     print_report_head("stack");
-    (void)printf("\"burned_bytes\": %u, \"tasks\": [", BURN_LEVELS * BURN_BLOCK_BYTES);
+    (void)printf("\"burned_bytes\": %u, \"body_buffer_bytes\": %u, \"tasks\": [",
+                 BURN_LEVELS * BURN_BLOCK_BYTES, BODY_BUFFER_BYTES);
 
     for (size_t i = 0U; i < count; i++) {
-        (void)printf("%s{\"name\": \"%s\", \"peak_bytes\": %u, \"size_bytes\": %u}",
+        (void)printf("%s{\"name\": \"%s\", \"peak_bytes\": %u, \"start_bytes\": %u, "
+                     "\"size_bytes\": %u, \"configured_bytes\": %u}",
                      (i == 0U) ? "" : ", ", info[i].name, (unsigned int)info[i].peak_bytes,
-                     (unsigned int)info[i].size_bytes);
+                     (unsigned int)info[i].start_bytes, (unsigned int)info[i].size_bytes,
+                     (unsigned int)info[i].configured_bytes);
 
         if (strcmp(info[i].name, "deep") == 0) {
             deep = info[i].peak_bytes;
+            starts[0] = info[i].start_bytes;
+            status = worse(status, check_configured(&info[i], TASK_STACK_WORDS));
         } else if (strcmp(info[i].name, "shallow") == 0) {
             shallow = info[i].peak_bytes;
+            starts[1] = info[i].start_bytes;
+            status = worse(status, check_configured(&info[i], TASK_STACK_WORDS));
+        } else if (strcmp(info[i].name, "body") == 0) {
+            body = info[i].peak_bytes;
+            starts[2] = info[i].start_bytes;
+            status = worse(status, check_configured(&info[i], BODY_TASK_STACK_WORDS));
         } else if (strcmp(info[i].name, "IDLE") == 0) {
             idle_seen = true;
+            /* configKERNEL_PROVIDED_STATIC_MEMORY: the kernel's idle stack has the minimum */
+            status = worse(status, check_configured(&info[i], configMINIMAL_STACK_SIZE));
         } else {
             /* any other task is reported but not judged by name */
         }
@@ -1771,13 +1835,41 @@ static int cmd_stack(void)
     /* The deep task must show at least what it deliberately used, and clearly more than the
      * task that used nothing. The slack covers signal frames and sanitizer overhead. The
      * shallow task must have been measured at all: an unregistered task is not in the report
-     * and leaves `shallow` at zero (a registered one reports at least the scan's floor). */
+     * and leaves `shallow` at zero (a registered one reports at least the scan's floor); what
+     * its own code used must stay small. */
     const uint32_t burned = BURN_LEVELS * BURN_BLOCK_BYTES;
 
     if ((deep < burned) || (deep > (burned + (48U * 1024U))) || (shallow == 0U) ||
-        (shallow > (16U * 1024U)) || (deep < (shallow + (burned / 2U)))) {
+        (shallow > (starts[1] + (16U * 1024U))) || (deep < (shallow + (burned / 2U)))) {
         (void)fprintf(stderr, "stack measurement implausible: deep %u, shallow %u, burned %u\n",
                       (unsigned int)deep, (unsigned int)shallow, (unsigned int)burned);
+        status = EXIT_FAILURE;
+    }
+
+    /* The buffer in the body task's own frame must be counted: at least its size, and clearly
+     * more than the task that uses nothing (half the buffer leaves room for a signal frame
+     * that lands on one task and not the other). A depth counted from plat_task_enter()
+     * reports this task at the floor, like the shallow one. */
+    if ((body < BODY_BUFFER_BYTES) || (body < (shallow + (BODY_BUFFER_BYTES / 2U))) ||
+        (body > (shallow + BODY_BUFFER_BYTES + (16U * 1024U)))) {
+        (void)fprintf(stderr,
+                      "a buffer in the task function's own frame is not measured: body task %u "
+                      "bytes, shallow task %u, buffer %u\n",
+                      (unsigned int)body, (unsigned int)shallow, (unsigned int)BODY_BUFFER_BYTES);
+        status = EXIT_FAILURE;
+    }
+
+    /* These three tasks call plat_task_enter() from their task functions, which the port
+     * starts the same way, so the part in use before their code ran is the same, not zero,
+     * and below the floor of the task that uses nothing. What remains for the body task is
+     * its own code's use, the buffer included. */
+    if ((starts[0] == 0U) || (starts[0] != starts[1]) || (starts[0] != starts[2]) ||
+        (starts[0] >= shallow) || (body < (starts[2] + BODY_BUFFER_BYTES))) {
+        (void)fprintf(stderr,
+                      "start of the task functions wrong: deep %u, shallow %u, body %u bytes "
+                      "(shallow peak %u, body peak %u)\n",
+                      (unsigned int)starts[0], (unsigned int)starts[1], (unsigned int)starts[2],
+                      (unsigned int)shallow, (unsigned int)body);
         status = EXIT_FAILURE;
     }
 

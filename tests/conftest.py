@@ -14,7 +14,8 @@ through the simulation control channel. Every test gets
 
 With --timing-report FILE, every failed test is listed in FILE as "miss <test>" if it failed
 only on a timing tolerance (fcn_tools.timing) and as "fail <test>" otherwise; that is how
-scripts/test-system.sh decides whether a repetition is allowed.
+fcn_tools.timing.run_with_one_retry, which scripts/test-system.sh runs, decides whether a
+repetition is allowed. tests/python/test_harness.py checks both with a copy of this file.
 
 Tests that use the `can_spec` or `open_link` fixture run once per transport: on the UDP bus and
 on SocketCAN. The SocketCAN run is skipped on a machine without the interface, unless

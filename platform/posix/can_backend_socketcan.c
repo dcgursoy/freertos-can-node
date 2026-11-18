@@ -44,6 +44,8 @@ static bool socketcan_send(can_backend_t *self, const can_frame_t *frame)
         return true;
     }
 
+    /* A raw CAN socket writes a whole frame or nothing; EIO stands for a short write. */
+    self->last_error = (written < 0) ? errno : EIO;
     self->tx_failed++;
     return false;
 }
@@ -59,16 +61,27 @@ static int socketcan_recv(can_backend_t *self, can_frame_t *frame)
                 continue;
             }
 
-            return ((errno == EAGAIN) || (errno == EWOULDBLOCK)) ? 0 : -1;
+            if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+                return 0;
+            }
+
+            self->last_error = errno;
+            self->rx_failed++;
+            return -1;
         }
 
         const bool extended = (wire.can_id & CAN_EFF_FLAG) != 0U;
         const bool remote = (wire.can_id & CAN_RTR_FLAG) != 0U;
 
-        /* Error frames are a status report of a real controller's driver; a virtual
-         * interface never produces them, and anything else malformed is dropped. */
+        /* Dropped: a short read; an error frame (a status report of a real controller's
+         * driver, which a virtual interface never produces); a length above 8; and a
+         * base-format identifier above 0x7FF. The kernel passes the last one on unchanged
+         * (cansend vcan0 EF0#55 sends it), and masking it to 11 bits would turn it into
+         * another, valid identifier: 0xEF0 would become the ping 0x6F0. The UDP transport
+         * drops the same frame, so it means nothing on either. */
         if ((received != (ssize_t)sizeof(wire)) || ((wire.can_id & CAN_ERR_FLAG) != 0U) ||
-            (wire.len > CAN_MAX_DLC)) {
+            (wire.len > CAN_MAX_DLC) ||
+            (!extended && ((wire.can_id & CAN_EFF_MASK) > CAN_SFF_MASK))) {
             self->rx_malformed++;
             continue;
         }

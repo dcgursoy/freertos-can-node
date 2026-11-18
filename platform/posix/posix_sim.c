@@ -11,7 +11,10 @@
 #include <unistd.h>
 
 #define SIM_MAX_HANDLERS 8U
-#define SIM_MAX_TOKEN    32U
+
+/* What the reply datagram needs besides the handler's text: the longest token, " err " (the
+ * longer of " ok " and " err ") and the terminating zero. */
+#define SIM_REPLY_OVERHEAD (POSIX_SIM_MAX_TOKEN + 5U + 1U)
 
 typedef struct {
     const char *prefix;
@@ -133,7 +136,7 @@ void posix_sim_service(void)
 
     for (;;) {
         char request[POSIX_SIM_MAX_DATAGRAM];
-        char reply[POSIX_SIM_MAX_DATAGRAM - SIM_MAX_TOKEN - 8U];
+        char reply[POSIX_SIM_MAX_DATAGRAM - SIM_REPLY_OVERHEAD];
         char datagram[POSIX_SIM_MAX_DATAGRAM];
         struct sockaddr_in from;
         socklen_t from_len = sizeof(from);
@@ -165,7 +168,7 @@ void posix_sim_service(void)
 
         reply[0] = '\0';
 
-        if ((token[0] == '\0') || (command[0] == '\0') || (strlen(token) >= SIM_MAX_TOKEN)) {
+        if ((token[0] == '\0') || (command[0] == '\0') || (strlen(token) > POSIX_SIM_MAX_TOKEN)) {
             len = snprintf(datagram, sizeof(datagram), "? err malformed request");
         } else if (dispatch(command, args, reply, sizeof(reply))) {
             len = snprintf(datagram, sizeof(datagram), "%s ok%s%s", token,

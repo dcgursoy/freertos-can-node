@@ -34,9 +34,39 @@
  *    room (tell_state). A slow driver sees fewer changes, never a stale last one: a bus off
  *    it was never told about would never be recovered from.
  *
- * Timing. A frame is written to the transport when the hardware thread wakes up at the
- * frame's modelled end of frame. How late that wake-up is (the host's scheduling latency) is
- * the pacing error; it is measured here and reported, never hidden in the model's own times.
+ * Abort. plat_can_abort_tx() affects the frames loaded before it, as a mailbox abort request
+ * does on hardware, and none loaded after it, however soon. A request is on its way to a
+ * mailbox for a while (in the tx ring), so the abort cannot simply empty the ring: every
+ * request carries a submission serial, the abort records the serial it was made at, and the
+ * hardware thread aborts the requests below that mark and loads the others (serve_driver).
+ *
+ * Timing. The model's times are exact; when the host carries them out is not. The thread
+ * measures how late it is in three places and reports it (posix_can_get_stats, can.status),
+ * without changing the model's times:
+ *
+ *  - pacing: a transmitted frame is written to the transport when the thread wakes up at the
+ *    frame's modelled end of frame; the lag is the time from that end of frame to the write;
+ *  - wake-up: a pass of the thread that serves a deadline it slept until is late by the time
+ *    from the deadline to the start of the pass;
+ *  - rx: a received frame reaches the receive FIFO late by the time from its modelled end of
+ *    frame to the delivery.
+ *
+ * The pacing lag alone does not show a host stall during which a frame waited for the bus
+ * (behind received frames, for example): the model moves that frame's start to the late
+ * wake-up (late_resyncs in can_ctrl), its end of frame is then on time again, and the stall
+ * becomes queueing time of the frame (start_ns - submit_ns). The wake-up lag shows it.
+ *
+ * Transport failures. The model decides what happens on the modelled bus; the transport only
+ * carries the result to the other processes. A frame the transport refuses has still been
+ * transmitted as far as the model and the driver are concerned (TX_DONE). The failure is
+ * counted (the transport's tx_failed and rx_failed), logged (the first at once, then at most
+ * once a second) and reported in can.status. A failure that means the interface is gone
+ * (ENODEV or ENXIO: a deleted SocketCAN interface, from which the socket has been unbound)
+ * also stops the node in an orderly way, since nothing will be sent or received again; it
+ * then exits with POSIX_EXIT_CAN_TRANSPORT_LOST. An interface that is only down (ENETDOWN)
+ * is a failure like any other: the socket stays bound and works again once the interface is
+ * up, and so does the node. No bus fault is ever derived from a transport failure: the
+ * bus faults belong to simulation control and the tests.
  */
 #include "posix_platform.h"
 
@@ -72,6 +102,9 @@
  * whatever arrives. What is left stays in the socket for the next pass, which follows at once. */
 #define TRANSPORT_READS_PER_PASS 256U
 
+/* After the first transport failure is logged, the next report waits at least this long. */
+#define TRANSPORT_REPORT_INTERVAL_NS 1000000000ULL
+
 #define COMMAND_ABORT_TX 0x1U
 #define COMMAND_RESTART  0x2U
 
@@ -90,13 +123,36 @@ _Static_assert(EVENT_RING_ENTRIES >= (2U * PLAT_CAN_TX_MAILBOXES), "event ring t
 typedef struct {
     can_frame_t frame;
     uint32_t handle;
+    uint32_t serial; /* submission order: s_tx_serial when plat_can_tx() took the request */
 } tx_request_t;
 
+/* A lateness figure: written by the hardware thread only, read by any thread. */
+typedef struct {
+    _Atomic uint64_t max_ns;
+    _Atomic uint64_t sum_ns;
+    _Atomic uint64_t samples;
+} lag_stats_t;
+
+static const char TAG[] = "can-hw";
+
 static can_backend_t s_backend;
+static char s_spec[64];      /* the transport specification, for log messages */
 static can_ctrl_t s_ctrl;    /* touched by the hardware thread only */
 static uint64_t s_pass_ns;   /* hardware thread only: the time of the current pass of its loop */
+static uint64_t s_due_ns;    /* hardware thread only: the deadline its last sleep was for */
 static uint8_t s_told_state; /* hardware thread only: the error state the driver was last sent */
 static uint32_t s_bitrate;
+
+/* Hardware thread only: the transmit request taken from the ring and not yet loaded into a
+ * mailbox, if any. The ring can only be popped, and the loops in serve_driver() have to see a
+ * request before they decide what to do with it, so it waits here until they have. */
+static tx_request_t s_next_request;
+static bool s_next_request_held;
+
+/* Hardware thread only: transport failures since the last log line, and when the next line
+ * may be written. */
+static uint64_t s_failures_unreported;
+static uint64_t s_next_report_ns;
 
 static uint8_t s_tx_storage[TX_RING_ENTRIES * sizeof(tx_request_t)];
 static uint8_t s_rx_storage[RX_RING_ENTRIES * sizeof(plat_can_rx_t)];
@@ -118,6 +174,11 @@ static void *s_isr_context;
  * use as the driver has to see them. Counted up by plat_can_tx(), down by plat_can_event(). */
 static _Atomic uint32_t s_tx_outstanding;
 
+/* The serial the next transmit request gets, and the serial at which the last abort was
+ * made: a request with a lower serial was made before that abort. */
+static _Atomic uint32_t s_tx_serial;
+static _Atomic uint32_t s_abort_mark;
+
 /* Published by the hardware thread for readers in other threads. */
 static _Atomic uint16_t s_tec;
 static _Atomic uint16_t s_rec;
@@ -125,13 +186,89 @@ static _Atomic uint8_t s_state;
 static _Atomic uint32_t s_rx_fifo_overruns;
 static _Atomic uint32_t s_event_fifo_overruns;
 static _Atomic uint32_t s_state_events_merged;
-static _Atomic uint64_t s_pacing_lag_max_ns;
-static _Atomic uint64_t s_pacing_lag_sum_ns;
-static _Atomic uint64_t s_pacing_samples;
+static _Atomic int s_transport_error;
+static lag_stats_t s_pacing;
+static lag_stats_t s_wakeup;
+static lag_stats_t s_rx_lag;
 static uint64_t s_started_ns;
 static uint64_t s_stopped_ns;
 
 /* ------------------------------------------------------------------ hardware thread side */
+
+static void lag_reset(lag_stats_t *stats)
+{
+    atomic_store(&stats->max_ns, 0U);
+    atomic_store(&stats->sum_ns, 0U);
+    atomic_store(&stats->samples, 0U);
+}
+
+static void lag_record(lag_stats_t *stats, uint64_t lag_ns)
+{
+    /* One writer: a load and a store are enough for the maximum. */
+    if (lag_ns > atomic_load(&stats->max_ns)) {
+        atomic_store(&stats->max_ns, lag_ns);
+    }
+
+    (void)atomic_fetch_add(&stats->sum_ns, lag_ns);
+    (void)atomic_fetch_add(&stats->samples, 1U);
+}
+
+static uint64_t lag_mean(const lag_stats_t *stats)
+{
+    const uint64_t samples = atomic_load(&stats->samples);
+
+    return (samples > 0U) ? (atomic_load(&stats->sum_ns) / samples) : 0U;
+}
+
+/* How long ago `model_ns` was, now; 0 if it is still ahead. */
+static uint64_t lateness(uint64_t model_ns)
+{
+    const uint64_t now_ns = posix_monotonic_ns();
+
+    return (now_ns > model_ns) ? (now_ns - model_ns) : 0U;
+}
+
+/* True if serial `a` was taken before serial `b`. The difference is read as a signed number
+ * so that the comparison holds across the wrap of the counter: requests that are in flight
+ * at the same time are never more than a few serials apart. */
+static bool serial_before(uint32_t a, uint32_t b)
+{
+    return ((a - b) & 0x80000000U) != 0U;
+}
+
+/* ENODEV: the interface was unregistered under the socket, which the kernel then unbinds;
+ * ENXIO: a send on such an unbound socket. Not ENETDOWN: a bound socket survives its
+ * interface going down and up. */
+static bool transport_is_gone(int error)
+{
+    return (error == ENODEV) || (error == ENXIO);
+}
+
+/* A send() or recv() of the transport failed; s_backend.last_error says why. (strerror() of
+ * the GNU C library returns a constant string for every errno it knows, so this thread may
+ * call it.) */
+static void transport_failed(const char *operation, uint64_t now_ns)
+{
+    const int error = s_backend.last_error;
+
+    s_failures_unreported++;
+
+    if (now_ns >= s_next_report_ns) {
+        LOG_WRN(TAG, "transport %s: %s failed: %s (failures since the last report: %llu)", s_spec,
+                operation, strerror(error), (unsigned long long)s_failures_unreported);
+        s_failures_unreported = 0U;
+        s_next_report_ns = now_ns + TRANSPORT_REPORT_INTERVAL_NS;
+    }
+
+    if (transport_is_gone(error) && (atomic_load(&s_transport_error) == 0)) {
+        atomic_store(&s_transport_error, error);
+        LOG_ERR(TAG, "transport %s is gone (%s): stopping the node", s_spec, strerror(error));
+        /* The same orderly stop as a SIGTERM from outside: the health task ends the
+         * scheduler and main() writes the statistics. Sent to the process, not raised: this
+         * thread blocks every signal, so one sent to it alone would never be delivered. */
+        (void)kill(getpid(), SIGTERM);
+    }
+}
 
 static void raise_irq(uint32_t causes)
 {
@@ -208,19 +345,6 @@ static void publish_status(void)
     atomic_store(&s_rec, can_ctrl_rec(&s_ctrl));
 }
 
-static void record_pacing_lag(uint64_t model_eof_ns)
-{
-    const uint64_t now_ns = posix_monotonic_ns();
-    const uint64_t lag_ns = (now_ns > model_eof_ns) ? (now_ns - model_eof_ns) : 0U;
-
-    if (lag_ns > atomic_load(&s_pacing_lag_max_ns)) {
-        atomic_store(&s_pacing_lag_max_ns, lag_ns);
-    }
-
-    (void)atomic_fetch_add(&s_pacing_lag_sum_ns, lag_ns);
-    (void)atomic_fetch_add(&s_pacing_samples, 1U);
-}
-
 /* Take every action the model has due and carry it out. */
 static void run_model(uint64_t now_ns)
 {
@@ -234,9 +358,13 @@ static void run_model(uint64_t now_ns)
         switch (action.kind) {
         case CAN_CTRL_ACTION_TX_COMPLETE:
             /* The frame has reached its end of frame on the modelled bus: now, and only
-             * now, the other participants get it. */
-            (void)s_backend.send(&s_backend, &action.frame);
-            record_pacing_lag(action.time_ns);
+             * now, the other participants get it. If the transport refuses it, the frame
+             * has still been transmitted on the modelled bus (see the top of this file). */
+            if (!s_backend.send(&s_backend, &action.frame)) {
+                transport_failed("send", now_ns);
+            }
+
+            lag_record(&s_pacing, lateness(action.time_ns));
             event.kind = PLAT_CAN_EVENT_TX_DONE;
             event.handle = action.handle;
             event.submit_ns = action.submit_ns;
@@ -250,6 +378,7 @@ static void run_model(uint64_t now_ns)
 
             received.frame = action.frame;
             received.eof_ns = action.time_ns;
+            lag_record(&s_rx_lag, lateness(action.time_ns));
 
             if (spsc_ring_push(&s_rx_ring, &received)) {
                 raise_irq(PLAT_CAN_IRQ_RX);
@@ -287,34 +416,63 @@ static void run_model(uint64_t now_ns)
     publish_status();
 }
 
-static void serve_driver(uint64_t now_ns)
+/* The oldest transmit request not yet loaded, or NULL if there is none. It stays the oldest
+ * until take_request() is called. */
+static const tx_request_t *peek_request(void)
+{
+    if (!s_next_request_held) {
+        s_next_request_held = spsc_ring_pop(&s_tx_ring, &s_next_request);
+    }
+
+    return s_next_request_held ? &s_next_request : NULL;
+}
+
+/* Done with the request peek_request() returned. */
+static void take_request(void)
+{
+    s_next_request_held = false;
+}
+
+/* The commands the driver has left since the last call.
+ *
+ * The wake-up is reset first and the commands are looked at afterwards. A request made after
+ * this read writes the eventfd again, so the poll at the end of the pass returns at once:
+ * nothing can arrive unseen between looking and sleeping. Taking the commands first would
+ * leave such a gap: a command set after the exchange and before the read would have its
+ * wake-up consumed here and wait for the thread's next pass. The value read is not needed. */
+static uint32_t take_commands(void)
 {
     uint64_t wake_count;
-    uint32_t commands;
 
-    /* Reset the wake-up first and look at what the driver left afterwards. A request made
-     * after this read writes the eventfd again, so the poll at the end of the pass returns at
-     * once: nothing can arrive unseen between looking and sleeping. Taking the commands
-     * first would leave such a gap: a command set after the exchange and before the read
-     * would have its wake-up consumed here and wait for the thread's next pass. The value
-     * read is not needed. */
     (void)!read(s_wake_fd, &wake_count, sizeof(wake_count));
-    commands = atomic_exchange(&s_commands, 0U);
+    return atomic_exchange(&s_commands, 0U);
+}
 
+static void serve_driver(uint32_t commands, uint64_t now_ns)
+{
     if ((commands & COMMAND_ABORT_TX) != 0U) {
+        /* Read after the command: plat_can_abort_tx() stores the mark before it sets the
+         * command, so this is the mark of the abort being served or of a later one. A later
+         * one has set the command again, and nothing is loaded until it is served (below). */
+        const uint32_t mark = atomic_load(&s_abort_mark);
         uint32_t handles[CAN_CTRL_TX_MAILBOXES];
         const uint32_t removed = can_ctrl_tx_abort_all(&s_ctrl, handles, CAN_CTRL_TX_MAILBOXES);
-        tx_request_t request;
+        const tx_request_t *request;
 
+        /* Every frame in the mailboxes was loaded before the abort (see the loading loop). */
         for (uint32_t i = 0U; i < removed; i++) {
             report_aborted(handles[i], now_ns);
         }
 
-        /* A request that is still on its way to a mailbox was made before the abort and is
-         * aborted with the rest. Without this it would be loaded after the abort, sit in its
-         * mailbox through the bus-off and go out stale after recovery. */
-        while (spsc_ring_pop(&s_tx_ring, &request)) {
-            report_aborted(request.handle, now_ns);
+        /* A request still on its way to a mailbox that was made before the abort is aborted
+         * with the rest. Without this it would be loaded after the abort, sit in its mailbox
+         * through a bus-off and go out stale after recovery. A request made after the abort
+         * stays: the ring is in submission order, so the first such request ends the drain,
+         * and the loading loop takes it and the ones behind it. */
+        for (request = peek_request(); (request != NULL) && serial_before(request->serial, mark);
+             request = peek_request()) {
+            report_aborted(request->handle, now_ns);
+            take_request();
         }
     }
 
@@ -323,18 +481,31 @@ static void serve_driver(uint64_t now_ns)
     }
 
     /* Move transmit requests into the controller's mailboxes. The driver never queues more
-     * than there are mailboxes, so the loop cannot leave a request stranded for long. */
+     * than there are mailboxes, so the loop cannot leave a request stranded for long.
+     *
+     * Nothing is loaded while an abort is pending: the next pass serves it first. So when an
+     * abort is served, the mailboxes hold only frames that were made before it. The request
+     * is taken from the ring first and the commands are looked at afterwards, in that order.
+     * plat_can_abort_tx() sets its command before the driver pushes any later request, so a
+     * request taken here that was made after an abort finds that abort's command set, unless
+     * the abort has been served already (at the top of this pass or earlier). It is then held
+     * until the abort is served, and the drain keeps it, since its serial is not before the
+     * mark. Looking at the commands before taking the request would leave a gap: an abort
+     * and a new request could both come between the look and the take, and the new frame
+     * would be loaded here and then taken back by the abort. */
     while (can_ctrl_tx_pending(&s_ctrl) < CAN_CTRL_TX_MAILBOXES) {
-        tx_request_t request;
+        const tx_request_t *request = peek_request();
 
-        if (!spsc_ring_pop(&s_tx_ring, &request)) {
+        if ((request == NULL) || ((atomic_load(&s_commands) & COMMAND_ABORT_TX) != 0U)) {
             break;
         }
 
-        if (!can_ctrl_tx_submit(&s_ctrl, &request.frame, request.handle, now_ns)) {
+        if (!can_ctrl_tx_submit(&s_ctrl, &request->frame, request->handle, now_ns)) {
             /* An invalid frame: give the mailbox back to the driver. */
-            report_aborted(request.handle, now_ns);
+            report_aborted(request->handle, now_ns);
         }
+
+        take_request();
     }
 }
 
@@ -342,10 +513,21 @@ static void read_transport(uint64_t now_ns)
 {
     can_frame_t frame;
     uint32_t reads = 0U;
+    int result = 0;
 
-    while ((reads < TRANSPORT_READS_PER_PASS) && (s_backend.recv(&s_backend, &frame) == 1)) {
+    while (reads < TRANSPORT_READS_PER_PASS) {
+        result = s_backend.recv(&s_backend, &frame);
+
+        if (result != 1) {
+            break;
+        }
+
         (void)can_ctrl_wire_rx(&s_ctrl, &frame, now_ns);
         reads++;
+    }
+
+    if (result < 0) {
+        transport_failed("receive", now_ns);
     }
 }
 
@@ -359,17 +541,32 @@ static void *hardware_main(void *arg)
         struct pollfd fds[3];
         nfds_t count = 2U;
 
+        /* The driver's commands first, then the time: a command is applied at a time no
+         * earlier than the moment it was made. (Taken the other way round, a restart made just
+         * after the time was read would start its recovery before it was requested.) */
+        const uint32_t commands = take_commands();
+
         /* One time for everything done in this pass, simulation control commands included:
          * the model requires that the times it is given never go backwards. */
         s_pass_ns = posix_monotonic_ns();
+
+        /* A pass that starts at or after the deadline the thread slept until serves that
+         * deadline, whatever ended the sleep. One that starts before it was woken early, by
+         * input or by the MAX_SLEEP_NS limit, and is not late for anything. */
+        if ((s_due_ns != CAN_CTRL_NO_WAKEUP) && (s_pass_ns >= s_due_ns)) {
+            lag_record(&s_wakeup, s_pass_ns - s_due_ns);
+        }
+
         posix_sim_service();
-        serve_driver(s_pass_ns);
+        serve_driver(commands, s_pass_ns);
         read_transport(s_pass_ns);
         run_model(s_pass_ns);
 
         const uint64_t wake_ns = can_ctrl_next_wakeup(&s_ctrl);
         const uint64_t now_ns = posix_monotonic_ns();
         uint64_t sleep_ns = MAX_SLEEP_NS;
+
+        s_due_ns = wake_ns;
 
         if (wake_ns != CAN_CTRL_NO_WAKEUP) {
             sleep_ns = (wake_ns > now_ns) ? (wake_ns - now_ns) : 0U;
@@ -423,17 +620,20 @@ static bool sim_can_handler(const char *verb, const char *args, char *reply, siz
 
     if (strcmp(verb, "status") == 0) {
         const can_ctrl_stats_t *stats = can_ctrl_stats(&s_ctrl);
-        const uint64_t samples = atomic_load(&s_pacing_samples);
+        int length;
 
         can_backend_refresh_counters(&s_backend);
 
-        (void)snprintf(
+        /* New keys go at the end, so that a reader of the old ones is not disturbed. */
+        length = snprintf(
             reply, reply_len,
             "state=%s tec=%u rec=%u fault=%s tx=%llu tx_failed=%llu tx_aborted=%llu rx=%llu "
             "rx_errors=%llu rx_lost_fault=%llu wire_overruns=%llu bus_off=%llu late_resyncs=%llu "
             "busy_ns=%llu elapsed_ns=%llu rx_fifo_overruns=%u transport_tx=%llu transport_rx=%llu "
             "transport_malformed=%llu transport_overflow=%llu pacing_lag_max_ns=%llu "
-            "pacing_lag_mean_ns=%llu",
+            "pacing_lag_mean_ns=%llu transport_tx_failed=%llu transport_rx_failed=%llu "
+            "wakeup_lag_max_ns=%llu wakeup_lag_mean_ns=%llu rx_lag_max_ns=%llu "
+            "rx_lag_mean_ns=%llu",
             state_name(can_ctrl_state(&s_ctrl)), (unsigned int)can_ctrl_tec(&s_ctrl),
             (unsigned int)can_ctrl_rec(&s_ctrl), fault_name(can_ctrl_fault(&s_ctrl)),
             (unsigned long long)stats->tx_frames, (unsigned long long)stats->tx_attempts_failed,
@@ -445,9 +645,20 @@ static bool sim_can_handler(const char *verb, const char *args, char *reply, siz
             (unsigned int)atomic_load(&s_rx_fifo_overruns), (unsigned long long)s_backend.tx_frames,
             (unsigned long long)s_backend.rx_frames, (unsigned long long)s_backend.rx_malformed,
             (unsigned long long)s_backend.rx_overflow,
-            (unsigned long long)atomic_load(&s_pacing_lag_max_ns),
-            (unsigned long long)((samples > 0U) ? (atomic_load(&s_pacing_lag_sum_ns) / samples)
-                                                : 0U));
+            (unsigned long long)atomic_load(&s_pacing.max_ns),
+            (unsigned long long)lag_mean(&s_pacing), (unsigned long long)s_backend.tx_failed,
+            (unsigned long long)s_backend.rx_failed,
+            (unsigned long long)atomic_load(&s_wakeup.max_ns),
+            (unsigned long long)lag_mean(&s_wakeup),
+            (unsigned long long)atomic_load(&s_rx_lag.max_ns),
+            (unsigned long long)lag_mean(&s_rx_lag));
+
+        /* A reply cut short would lose the keys at its end without anyone noticing. */
+        if ((length < 0) || ((size_t)length >= reply_len)) {
+            (void)snprintf(reply, reply_len, "the status does not fit into a reply");
+            return false;
+        }
+
         return true;
     }
 
@@ -547,6 +758,7 @@ bool plat_can_tx(const can_frame_t *frame, uint32_t handle)
 
         request.frame = *frame;
         request.handle = handle;
+        request.serial = atomic_fetch_add(&s_tx_serial, 1U);
         (void)atomic_fetch_add(&s_tx_outstanding, 1U);
 
         if (spsc_ring_push(&s_tx_ring, &request)) {
@@ -586,6 +798,11 @@ static void send_command(uint32_t command)
 
 void plat_can_abort_tx(void)
 {
+    /* The mark first, then the command: a hardware thread that sees the command sees this
+     * mark or a later one. Requests with a serial below the mark were made before this call.
+     * (The driver calls this and plat_can_tx() from one task, which orders them. For calls
+     * from two tasks at the same time, which came first is not defined anyway.) */
+    atomic_store(&s_abort_mark, atomic_load(&s_tx_serial));
     send_command(COMMAND_ABORT_TX);
 }
 
@@ -626,21 +843,29 @@ bool posix_can_start(const char *backend_spec, uint32_t bitrate, char *error, si
     (void)spsc_ring_init(&s_event_ring, s_event_storage, (uint32_t)sizeof(plat_can_event_t),
                          EVENT_RING_ENTRIES);
 
+    (void)snprintf(s_spec, sizeof(s_spec), "%s", backend_spec);
     s_bitrate = bitrate;
     s_started_ns = posix_monotonic_ns();
     s_pass_ns = s_started_ns;
+    s_due_ns = CAN_CTRL_NO_WAKEUP;
     can_ctrl_init(&s_ctrl, &config, s_started_ns);
     s_told_state = (uint8_t)can_ctrl_state(&s_ctrl);
     s_stopped_ns = 0U;
+    s_next_request_held = false;
+    s_failures_unreported = 0U;
+    s_next_report_ns = 0U;
     atomic_store(&s_tx_outstanding, 0U);
+    atomic_store(&s_tx_serial, 0U);
+    atomic_store(&s_abort_mark, 0U);
     atomic_store(&s_commands, 0U);
     atomic_store(&s_irq_causes, 0U);
     atomic_store(&s_rx_fifo_overruns, 0U);
     atomic_store(&s_event_fifo_overruns, 0U);
     atomic_store(&s_state_events_merged, 0U);
-    atomic_store(&s_pacing_lag_max_ns, 0U);
-    atomic_store(&s_pacing_lag_sum_ns, 0U);
-    atomic_store(&s_pacing_samples, 0U);
+    atomic_store(&s_transport_error, 0);
+    lag_reset(&s_pacing);
+    lag_reset(&s_wakeup);
+    lag_reset(&s_rx_lag);
     publish_status();
     posix_irq_attach(CAN_IRQ_LINE, can_irq, NULL);
     posix_sim_register("can.", sim_can_handler);
@@ -673,6 +898,11 @@ void posix_can_stop(void)
     }
 }
 
+int posix_can_transport_error(void)
+{
+    return atomic_load(&s_transport_error);
+}
+
 void posix_can_get_report(posix_can_report_t *out)
 {
     const can_ctrl_stats_t *stats = can_ctrl_stats(&s_ctrl);
@@ -697,18 +927,26 @@ void posix_can_get_report(posix_can_report_t *out)
     out->transport_tx_frames = s_backend.tx_frames;
     out->transport_tx_failed = s_backend.tx_failed;
     out->transport_rx_frames = s_backend.rx_frames;
+    out->transport_rx_failed = s_backend.rx_failed;
     out->transport_rx_malformed = s_backend.rx_malformed;
     out->transport_rx_overflow = s_backend.rx_overflow;
+    out->transport_error = atomic_load(&s_transport_error);
 }
 
 void posix_can_get_stats(posix_can_stats_t *out)
 {
-    const uint64_t samples = atomic_load(&s_pacing_samples);
-
-    out->pacing_lag_max_ns = atomic_load(&s_pacing_lag_max_ns);
-    out->pacing_lag_mean_ns = (samples > 0U) ? (atomic_load(&s_pacing_lag_sum_ns) / samples) : 0U;
-    out->frames_paced = samples;
+    (void)memset(out, 0, sizeof(*out));
+    out->frames_paced = atomic_load(&s_pacing.samples);
+    out->pacing_lag_max_ns = atomic_load(&s_pacing.max_ns);
+    out->pacing_lag_mean_ns = lag_mean(&s_pacing);
+    out->wakeups = atomic_load(&s_wakeup.samples);
+    out->wakeup_lag_max_ns = atomic_load(&s_wakeup.max_ns);
+    out->wakeup_lag_mean_ns = lag_mean(&s_wakeup);
+    out->rx_delivered = atomic_load(&s_rx_lag.samples);
+    out->rx_lag_max_ns = atomic_load(&s_rx_lag.max_ns);
+    out->rx_lag_mean_ns = lag_mean(&s_rx_lag);
     out->rx_fifo_overruns = atomic_load(&s_rx_fifo_overruns);
+    out->rx_fifo_pending = spsc_ring_count(&s_rx_ring);
     out->event_fifo_overruns = atomic_load(&s_event_fifo_overruns);
     out->state_events_merged = atomic_load(&s_state_events_merged);
 }

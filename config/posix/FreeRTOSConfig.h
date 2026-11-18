@@ -76,6 +76,9 @@
 #define configUSE_TICK_HOOK            1
 #define configUSE_MALLOC_FAILED_HOOK   1
 #define configCHECK_FOR_STACK_OVERFLOW 2
+/* The TCB keeps the top of each stack buffer: posix_stack.c reports every task's configured
+ * stack size from it. */
+#define configRECORD_STACK_HIGH_ADDRESS 1
 
 /* ---------------------------------------------------------- run-time stats and tracing */
 #define configGENERATE_RUN_TIME_STATS               1
