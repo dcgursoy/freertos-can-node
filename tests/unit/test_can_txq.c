@@ -112,14 +112,53 @@ static const can_txq_stats_t *stats(void)
     return can_txq_stats(&s_queue);
 }
 
-/* The identity of the header, from the queue's own counters. */
+/* A copy of the counters of one of the 16 slots; a slot without counters fails the test. */
+static can_txq_slot_stats_t slot_counts(uint8_t slot)
+{
+    const can_txq_slot_stats_t *counts = can_txq_slot_stats(&s_queue, slot);
+    can_txq_slot_stats_t copy = {0U, 0U, 0U, 0U};
+
+    if (counts == NULL) {
+        TEST_FAIL_MESSAGE("a slot below 16 has no counters");
+    } else {
+        copy = *counts;
+    }
+
+    return copy;
+}
+
+/* The identities of the header, from the queue's own counters: the queue's, each slot's, and
+ * how the two relate. The slots' counters are a share of the queue's: their superseded values
+ * add up to the queue's, and the rest of each is a part of the queue's figure, the event
+ * frames being the other part. */
 static void check_accounting(void)
 {
     const can_txq_stats_t *s = stats();
+    uint64_t produced = 0U;
+    uint64_t sent = 0U;
+    uint64_t superseded = 0U;
+    uint64_t pending = 0U;
 
     TEST_ASSERT_EQUAL_UINT64_MESSAGE(s->produced,
                                      s->sent + s->superseded + s->dropped + s->expired + s->pending,
                                      "produced = sent + superseded + dropped + expired + pending");
+
+    for (uint8_t slot = 0U; slot < 16U; slot++) {
+        const can_txq_slot_stats_t c = slot_counts(slot);
+
+        TEST_ASSERT_EQUAL_UINT64_MESSAGE(c.produced, c.sent + c.superseded + c.pending,
+                                         "slot: produced = sent + superseded + pending");
+        TEST_ASSERT_TRUE_MESSAGE(c.pending <= 2U, "a slot holds at most two values");
+        produced += c.produced;
+        sent += c.sent;
+        superseded += c.superseded;
+        pending += c.pending;
+    }
+
+    TEST_ASSERT_EQUAL_UINT64_MESSAGE(s->superseded, superseded, "superseded: the slots' sum");
+    TEST_ASSERT_TRUE_MESSAGE(produced <= s->produced, "produced: the slots' share");
+    TEST_ASSERT_TRUE_MESSAGE(sent <= s->sent, "sent: the slots' share");
+    TEST_ASSERT_TRUE_MESSAGE(pending <= s->pending, "pending: the slots' share");
 }
 
 /* The calls of the queue, each followed by the accounting check. */
@@ -220,6 +259,22 @@ static void expect_counts(UNITY_LINE_TYPE line, uint64_t produced, uint64_t sent
 
 #define EXPECT_COUNTS(produced, sent, superseded, dropped, expired, pending)                       \
     expect_counts(__LINE__, (produced), (sent), (superseded), (dropped), (expired), (pending))
+
+/* The four counters of one slot, in the order of its identity:
+ *     produced = sent + superseded + pending */
+static void expect_slot_counts(UNITY_LINE_TYPE line, uint8_t slot, uint64_t produced, uint64_t sent,
+                               uint64_t superseded, uint32_t pending)
+{
+    const can_txq_slot_stats_t c = slot_counts(slot);
+
+    UNITY_TEST_ASSERT_EQUAL_UINT64(produced, c.produced, line, "slot produced");
+    UNITY_TEST_ASSERT_EQUAL_UINT64(sent, c.sent, line, "slot sent");
+    UNITY_TEST_ASSERT_EQUAL_UINT64(superseded, c.superseded, line, "slot superseded");
+    UNITY_TEST_ASSERT_EQUAL_UINT32(pending, c.pending, line, "slot pending");
+}
+
+#define EXPECT_SLOT_COUNTS(slot, produced, sent, superseded, pending)                              \
+    expect_slot_counts(__LINE__, (slot), (produced), (sent), (superseded), (pending))
 
 /* The queue hands out exactly this frame. Returns its handle. */
 static uint32_t expect_next_frame(UNITY_LINE_TYPE line, uint64_t now_ns,
@@ -561,6 +616,64 @@ static void test_an_aborted_value_returns_to_its_slot_when_no_newer_one_waits(vo
     EXPECT_DONE_CYCLIC(handle, 7U, 0x170U, 5353U);
     EXPECT_NOTHING(0U);
     EXPECT_COUNTS(2U, 1U, 1U, 0U, 0U, 0U);
+}
+
+/*
+ * Each slot keeps the accounts of its own message while another message and an event frame
+ * share the queue with it:
+ *
+ *   slot 2 (0x200)   values 1, 2, 3   1 sent (3) + 2 superseded (1 in its mailbox, 2 in the slot)
+ *   slot 5 (0x100)   value 1          1 sent
+ *   FIFO   (0x050)   one frame        1 sent, in no slot's accounts
+ *
+ * which makes the queue's 5 produced = 3 sent + 2 superseded. A slot beyond the 16 has no
+ * counters.
+ */
+static void test_each_slot_accounts_for_the_values_of_its_own_message(void)
+{
+    uint32_t slot5_value;
+    uint32_t slot2_value;
+    uint32_t event;
+
+    start(3U, 0U);
+
+    TEST_ASSERT_TRUE(publish(2U, 0x200U, 1U, 1000U));
+    TEST_ASSERT_TRUE(publish(5U, 0x100U, 1U, 1100U));
+    slot5_value = EXPECT_NEXT(0U, 0x100U, 1U);
+    slot2_value = EXPECT_NEXT(0U, 0x200U, 1U);
+    EXPECT_SLOT_COUNTS(2U, 1U, 0U, 0U, 1U);
+    EXPECT_SLOT_COUNTS(5U, 1U, 0U, 0U, 1U);
+
+    /* Value 2 waits behind value 1, which is in a mailbox: two pending values of one slot.
+     * Value 3 then replaces value 2 in the slot. */
+    TEST_ASSERT_TRUE(publish(2U, 0x200U, 2U, 2000U));
+    EXPECT_SLOT_COUNTS(2U, 2U, 0U, 0U, 2U);
+    TEST_ASSERT_TRUE(publish(2U, 0x200U, 3U, 3000U));
+    EXPECT_SLOT_COUNTS(2U, 3U, 0U, 1U, 2U);
+    TEST_ASSERT_TRUE(enqueue(0x050U, 9U, 3500U));
+
+    EXPECT_DONE_CYCLIC(slot5_value, 5U, 0x100U, 1100U);
+    EXPECT_SLOT_COUNTS(5U, 1U, 1U, 0U, 0U);
+
+    /* Value 1 comes back from its mailbox and finds value 3 waiting: it ends there. */
+    TEST_ASSERT_TRUE(aborted(slot2_value));
+    EXPECT_SLOT_COUNTS(2U, 3U, 0U, 2U, 1U);
+
+    event = EXPECT_NEXT(0U, 0x050U, 9U);
+    slot2_value = EXPECT_NEXT(0U, 0x200U, 3U);
+    EXPECT_DONE_CYCLIC(slot2_value, 2U, 0x200U, 3000U);
+    EXPECT_DONE_EVENT(event, 0x050U, 3500U);
+
+    EXPECT_SLOT_COUNTS(2U, 3U, 1U, 2U, 0U);
+    EXPECT_SLOT_COUNTS(5U, 1U, 1U, 0U, 0U);
+    for (uint8_t slot = 0U; slot < 16U; slot++) {
+        if ((slot != 2U) && (slot != 5U)) {
+            EXPECT_SLOT_COUNTS(slot, 0U, 0U, 0U, 0U);
+        }
+    }
+    EXPECT_COUNTS(5U, 3U, 2U, 0U, 0U, 0U);
+    TEST_ASSERT_NULL(can_txq_slot_stats(&s_queue, 16U));
+    TEST_ASSERT_NULL(can_txq_slot_stats(&s_queue, 255U));
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -2904,6 +3017,10 @@ typedef struct {
     uint64_t superseded;
     uint64_t dropped;
     uint64_t expired;
+    /* The counters of each slot. */
+    uint64_t slot_produced[16];
+    uint64_t slot_sent[16];
+    uint64_t slot_superseded[16];
 
     uint64_t bus_off_since_ns;
     uint64_t recovered_at_ns;
@@ -3008,9 +3125,11 @@ static void model_expire(uint64_t now_ns)
 static void model_publish(uint32_t slot, const can_frame_t *frame, uint64_t stamp_ns)
 {
     s_model.produced++;
+    s_model.slot_produced[slot]++;
 
     if (s_model.waiting[slot].present) {
         s_model.superseded++; /* the value that waited is replaced */
+        s_model.slot_superseded[slot]++;
     }
 
     s_model.waiting[slot].stamp_ns = stamp_ns;
@@ -3159,6 +3278,11 @@ static uint32_t model_find(uint32_t handle)
 static void model_done(uint32_t source)
 {
     s_model.sent++;
+
+    if (source < SOURCE_EVENT) {
+        s_model.slot_sent[source]++;
+    }
+
     model_loaded(source)->present = false;
 }
 
@@ -3181,6 +3305,7 @@ static void model_aborted(uint32_t source)
     } else if (s_model.waiting[source].present) {
         /* A newer value waits: the aborted one is not worth sending any more. */
         s_model.superseded++;
+        s_model.slot_superseded[source]++;
         s_seen.aborts_superseded++;
     } else {
         s_model.waiting[source] = s_model.loaded[source];
@@ -3368,6 +3493,18 @@ static void check_against_model(void)
     TEST_ASSERT_EQUAL_UINT64_MESSAGE(s_model.dropped, s->dropped, s_step_text);
     TEST_ASSERT_EQUAL_UINT64_MESSAGE(s_model.expired, s->expired, s_step_text);
     TEST_ASSERT_EQUAL_UINT32_MESSAGE(model_pending(), s->pending, s_step_text);
+
+    /* The same for each slot: a value waiting in it and one in a mailbox are its pending. */
+    for (uint8_t slot = 0U; slot < 16U; slot++) {
+        const can_txq_slot_stats_t c = slot_counts(slot);
+        const uint32_t pending =
+            (s_model.waiting[slot].present ? 1U : 0U) + (s_model.loaded[slot].present ? 1U : 0U);
+
+        TEST_ASSERT_EQUAL_UINT64_MESSAGE(s_model.slot_produced[slot], c.produced, s_step_text);
+        TEST_ASSERT_EQUAL_UINT64_MESSAGE(s_model.slot_sent[slot], c.sent, s_step_text);
+        TEST_ASSERT_EQUAL_UINT64_MESSAGE(s_model.slot_superseded[slot], c.superseded, s_step_text);
+        TEST_ASSERT_EQUAL_UINT32_MESSAGE(pending, c.pending, s_step_text);
+    }
 
     /* The bus-off policy. */
     TEST_ASSERT_EQUAL_UINT32_MESSAGE(s_model.bus_off_count, s->bus_off_count, s_step_text);
@@ -4286,6 +4423,7 @@ int main(void)
     RUN_TEST(test_a_value_in_a_mailbox_is_not_replaced_and_the_new_value_waits_for_it);
     RUN_TEST(test_the_waiting_value_is_loaded_once_the_earlier_one_is_aborted);
     RUN_TEST(test_an_aborted_value_returns_to_its_slot_when_no_newer_one_waits);
+    RUN_TEST(test_each_slot_accounts_for_the_values_of_its_own_message);
 
     RUN_TEST(test_enqueue_refuses_an_invalid_frame_and_does_not_count_it);
     RUN_TEST(test_events_come_out_in_the_order_they_went_in);

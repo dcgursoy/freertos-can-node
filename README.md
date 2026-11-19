@@ -7,7 +7,7 @@ measurements on CAN and takes fail-safe A/B firmware updates over the same bus. 
 as a Linux process on the FreeRTOS POSIX port, and its CAN controller, flash and sensors are
 simulated around it, so that all of it builds, runs and is tested on a laptop and in CI.
 
-> **Work in progress: phases 0 and 1 of 8 are done.** This page is a placeholder until the
+> **Work in progress: phases 0 to 2 of 8 are done.** This page is a placeholder until the
 > last phase. The sections below describe only what exists today and quote no results; the
 > final README will take every number from `results/*.json`.
 
@@ -17,8 +17,8 @@ simulated around it, so that all of it builds, runs and is tested on a laptop an
 |---|---|---|
 | 0 | Repository, FreeRTOS kernel, build presets, host platform layer, unit tests, sanitizers, coverage, static analysis, CI | done |
 | 1 | CAN stack: CRCs, frame bit timing, controller model with fault confinement, transmit queue, SocketCAN and UDP transports, CAN tasks | done |
-| 2 | Application: tasks and IPC, DBC, end-to-end protection, telemetry | next |
-| 3 | Fault handling: trouble codes, watchdogs, bus-off recovery | |
+| 2 | Application: tasks and IPC, DBC, end-to-end protection, telemetry | done |
+| 3 | Fault handling: trouble codes, watchdogs, bus-off recovery | next |
 | 4 | Simulated NOR flash, bootloader, A/B update logic | |
 | 5 | ISO-TP, UDS download, end-to-end update | |
 | 6 | Measurements and plots | |
@@ -103,6 +103,72 @@ of phase 2 it sends a status frame every 10 ms and answers a ping frame.
   `can_bits` against an independent Python implementation on more than 100,000 frames; system
   tests that run every bus test on both transports (CI refuses to skip SocketCAN).
 
+## What phase 2 adds
+
+The node is now a battery-module telemetry node. It measures its module through a sensor front
+end, judges and filters the readings, and publishes them on CAN in seven cyclic messages, four
+of them protected end to end; a tester can switch the protected telemetry off and on with a
+protected command. [docs/architecture.md](docs/architecture.md) describes the tasks and how
+they work together, [docs/can-protocol.md](docs/can-protocol.md) the messages and the protection.
+No timing of the application has been measured yet; that is phase 6.
+
+- **Messages in a DBC** ([dbc/fcn.dbc](dbc/fcn.dbc)). Every frame the node sends or accepts,
+  with cycle times, value tables with "signal not available" codes, and the Data IDs of the
+  messages protected end to end. [tools/gen_can_db.py](tools/gen_can_db.py) generates the C
+  codec in [app/gen](app/gen) from it: a struct of raw values and a pack/unpack pair per message,
+  and factor and offset as exact fractions that the hand-written conversions `_Static_assert`
+  on. Before generating, it refuses a DBC with overlapping signals, signals outside the DLC, a
+  misplaced E2E header, or Data IDs whose CRCs collide. The generated code is checked in,
+  compiled with the project's warnings and checked by the MISRA addon. CI fails when it no
+  longer matches the DBC (`scripts/codegen-check.sh`; regenerate with `--update`). The codec is
+  tested against cantools on random values for every message, and the generator on signals of
+  every length from 1 to 32 bits.
+- **End-to-end protection** ([lib/e2e](lib/e2e/e2e_p11.h)). AUTOSAR E2E Profile 11, variant
+  11A, and the E2E state machine, written from the AUTOSAR specifications: BMS_PackStatus, the
+  two cell-voltage messages and BMS_Temperatures carry a CRC over a Data ID that is never sent
+  and a rolling counter. The published test vectors are reproduced, and the C code is compared
+  with an independent Python implementation ([tools/fcn_tools/e2e.py](tools/fcn_tools/e2e.py))
+  on more than 20,000 requests. Where the specification leaves a case open, the project's
+  decision and its reason are in [docs/can-protocol.md](docs/can-protocol.md#end-to-end-protection).
+- **Sensor front end** ([docs/sensor-model.md](docs/sensor-model.md)). The node reads its
+  module through [plat_sensor.h](platform/include/plat_sensor.h). On the host, a deterministic
+  model stands behind it: a 20 s load profile, cell voltages that follow the current through each
+  cell's internal resistance, and seeded noise (`--sensor-seed`; the same seed gives the same
+  readings, whatever the host's timing). Faults are applied through simulation control as on a
+  bench (`sensor.set`, `sensor.open`, `sensor.offline`, `sensor.clear`).
+- **Battery-module logic** ([lib/bms](lib/bms/bms.h)). Plausibility of every reading, a
+  first-order fixed-point filter per channel with exact rounding and a proof that it cannot
+  overflow, and the pack summary and state (STARTUP, NORMAL, FAULT), all in integer arithmetic.
+- **The application** ([app/app.c](app/app.c), tasks in [app/app_tasks.h](app/app_tasks.h)). Five
+  tasks: `can_rx` (priority 6) for received frames and the command's supervision, `sensor` (5)
+  every 10 ms, `process` (4) released by the sensor's samples, `can_tx` (3) below the tasks whose
+  frames it sends, and `health` (2) every 100 ms. The sensor task posts samples to a queue; the
+  processing task runs lib/bms under a mutex with priority inheritance and publishes the
+  protected telemetry; interrupts reach the CAN tasks by task notification. Every kernel object
+  of the application is allocated statically. The conversions to the DBC's raw values are in
+  one place, [app/signals.c](app/signals.c), with a compile-time check of every factor, offset
+  and SNA code they rely on.
+- **Commands** ([app/command.c](app/command.c)). The node checks TESTER_Command with Profile 11
+  and the E2E state machine, for every frame and for every 100 ms without one, and acts on it
+  only while the stream is VALID. CmdTelemetryOn switches the protected telemetry off and on.
+- **A schedulability check of the real task set** ([tools/fcn_tools/sched.py](tools/fcn_tools/sched.py)).
+  Response-time analysis for fixed priorities, in exact arithmetic, with priority-inheritance
+  blocking, release jitter and non-preemptive sections, and the utilisation bounds only where
+  their assumptions hold. The node writes its task table into its statistics and a system test checks it; the
+  execution-time budgets in it are design figures until phase 6 measures them
+  ([docs/architecture.md](docs/architecture.md#schedulability)).
+- **Telemetry on the bus, decoded** ([tools/fcn_tools/decode.py](tools/fcn_tools/decode.py)).
+  Frames decoded with cantools from the DBC and every protected one checked end to end;
+  `python -m fcn_tools.monitor udp:29500` prints them live.
+- **Tests.** Unit tests of every new module, each challenged with planted defects. System tests
+  on both transports ([tests/system/test_telemetry.py](tests/system/test_telemetry.py)) account
+  for every cyclic frame against the node's own statistics, check every protected frame with the
+  independent Python implementation, compare the decoded values with the sensor model, apply
+  every sensor fault through simulation control and look for it in the next frame, and send
+  TESTER_Command frames with a wrong CRC, a repeated or jumping counter, another message's Data
+  ID or the wrong length, which the node must count and never act on, and a stream that stops,
+  which the node must not trust again until it has proved itself.
+
 ## Build and test
 
 Ubuntu 24.04 (natively, or under WSL2):
@@ -123,11 +189,13 @@ cd freertos-can-node && scripts/setup-python.sh
 scripts/check.sh
 ```
 
-`scripts/check.sh` runs the checks CI runs: static analysis, the debug and release builds,
-the unit and platform tests under AddressSanitizer and UndefinedBehaviorSanitizer, the tests
-of code shared between threads under ThreadSanitizer (the lock-free ring, and the CAN driver
-against the controller's hardware thread), coverage of `lib/`, the system tests and the
-verification of the bug log. The individual steps are `scripts/static-analysis.sh`,
+`scripts/check.sh` runs the checks CI runs: that the code generated from the DBC is current,
+static analysis, the debug and release builds, the unit and platform tests under
+AddressSanitizer and UndefinedBehaviorSanitizer, the tests of code shared between threads
+under ThreadSanitizer (the lock-free ring, the CAN driver against the controller's hardware
+thread, and the sensor model read by one thread while another serves its simulation control
+commands), coverage of `lib/`, the system tests and the verification of the bug log. The
+individual steps are `scripts/codegen-check.sh`, `scripts/static-analysis.sh`,
 `scripts/build.sh`, `scripts/test-unit.sh`, `scripts/test-tsan.sh`, `scripts/coverage.sh`,
 `scripts/test-system.sh` and `scripts/buglog-verify.sh`. A test whose verdict depends on the
 host keeping time reports a missed timing tolerance on its own, apart from every other failure:
@@ -152,18 +220,23 @@ SocketCAN interface `vcan0`, and runs the timing benchmark for the record.
 
 ```
 lib/             portable C11 modules: no OS calls, no malloc; covered by the unit tests
-app/             the FreeRTOS application: tasks and their IPC
+app/             the FreeRTOS application: tasks and their IPC (app.c), the conversions to the
+                 DBC (signals.c), the frames (telemetry.c), the command receiver (command.c);
+                 gen/ is generated from the DBC by tools/gen_can_db.py
+dbc/             the CAN messages (fcn.dbc), the source of app/gen/ and of the Python decoders
 platform/        include/ is what the application expects from a platform;
                  posix/ implements it on Linux under the FreeRTOS POSIX port
 config/          FreeRTOSConfig.h, MISRA deviation list
 cmake/           the compiler settings every project target gets
 tests/           unit/ (Unity), platform/ (tests of the host layer), python/ (pytest, tools),
                  system/ (pytest, the node as a process), tools/ (C helpers the tests call)
-tools/           Python package: node and bus control, UDP bus for python-can, result files
+tools/           Python package: node and bus control, UDP bus for python-can, decoding and
+                 E2E checks, the schedulability check, result files; the codec generator
 bench/           measurement scripts; they write results/
 results/         measured data (JSON with provenance) and plots; host timing only
 scripts/         one script per build, test and analysis step
-docs/            the simulated CAN bus, bug log, MISRA deviations, notes on WSL
+docs/            the application, the CAN protocol, the simulated CAN bus, the sensor model,
+                 bug log, MISRA deviations, notes on WSL
 third_party/     FreeRTOS-Kernel and Unity, pinned submodules
 ```
 

@@ -56,14 +56,17 @@ endfunction()
 
 # ---------------------------------------------------------------- host I/O without a kernel
 # Unity tests of the parts of the host layer that do not need FreeRTOS.
-#   test_can_backend  the UDP datagram format, the UDP bus between participants, and
-#                     SocketCAN on vcan0 (reported as "ignored" where the machine has no
-#                     vcan0, as a failure where FCN_REQUIRE_SOCKETCAN is set, as in CI)
-#   test_posix_sim    the simulation control protocol
-foreach(_test IN ITEMS can_backend posix_sim)
+#   test_can_backend   the UDP datagram format, the UDP bus between participants, and
+#                      SocketCAN on vcan0 (reported as "ignored" where the machine has no
+#                      vcan0, as a failure where FCN_REQUIRE_SOCKETCAN is set, as in CI)
+#   test_posix_sim     the simulation control protocol
+#   test_posix_sensor  the sensor front-end model and its "sensor." commands, also served
+#                      from a thread of their own while the test reads (run under TSan too)
+find_package(Threads REQUIRED)
+foreach(_test IN ITEMS can_backend posix_sim posix_sensor)
     add_executable(test_${_test} test_${_test}.c)
     target_compile_definitions(test_${_test} PRIVATE _POSIX_C_SOURCE=200809L)
-    target_link_libraries(test_${_test} PRIVATE fcn_host_io unity)
+    target_link_libraries(test_${_test} PRIVATE fcn_host_io unity Threads::Threads)
     fcn_target_defaults(test_${_test} NO_COVERAGE)
     add_test(NAME platform_${_test} COMMAND test_${_test})
     set_tests_properties(platform_${_test} PROPERTIES

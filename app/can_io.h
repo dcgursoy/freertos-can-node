@@ -35,7 +35,7 @@
 #include "can/can_frame.h"
 #include "can/can_txq.h"
 
-/** Priorities of the two tasks (the application's priority table is in app.c). */
+/** Priorities of the two tasks (the application's priority table is in app_tasks.h). */
 #define CAN_IO_RX_PRIORITY 6U
 #define CAN_IO_TX_PRIORITY 3U
 
@@ -58,11 +58,22 @@
  */
 typedef void (*can_io_rx_handler_t)(const can_frame_t *frame, uint64_t eof_ns);
 
+/**
+ * Called in the receive task at the end of each period of the receive cycle (see
+ * can_io_on_rx_cycle), after the frames that had arrived by then. Keep it short, like a frame
+ * handler.
+ */
+typedef void (*can_io_cycle_handler_t)(void);
+
 typedef struct {
     uint32_t rx_frames;      /**< frames taken from the controller */
     uint32_t rx_unhandled;   /**< of those, frames no handler was registered for */
     uint32_t rx_batches_cut; /**< times the receive task stopped at CAN_IO_RX_BATCH */
     uint32_t tx_load_failed; /**< times the controller refused a frame the queue handed out */
+    uint32_t rx_cycles;      /**< calls of the receive cycle handler */
+    /** periods of the receive cycle that ended without a call of their own, because the task
+     *  ran more than a period late (a host stall): one call stood for several periods */
+    uint32_t rx_cycles_skipped;
 } can_io_stats_t;
 
 /** Create the two tasks and connect the interrupt. Call once, before the scheduler starts. */
@@ -72,6 +83,24 @@ void can_io_start(void);
  *  starts. Returns false if the table is full. */
 bool can_io_on_frame(uint32_t id, bool extended, can_io_rx_handler_t handler);
 
+/**
+ * Have `handler` called in the receive task at the end of every period of `period_ms` of tick
+ * time, counted from the task's start: the receive cycle of a supervised cyclic message, whose
+ * handler can then tell a period in which no frame arrived. The frames received up to the end
+ * of a period are handled before the period's call. The receive task waits for frames no
+ * longer than to the end of the current period, so a call is late only when the task is.
+ *
+ * A call is never repeated for periods the task missed: when it runs more than a period late,
+ * one call stands for every period that ended since the previous call, and the others are
+ * counted in rx_cycles_skipped. On a target the receive task, the most urgent one, does not
+ * fall a period behind; on the host it does when the host stalls the node, and the frames that
+ * were held up arrive at once afterwards.
+ *
+ * One cycle handler; `period_ms` below one tick counts as one tick. Call before the scheduler
+ * starts.
+ */
+void can_io_on_rx_cycle(uint32_t period_ms, can_io_cycle_handler_t handler);
+
 /** Publish the current value of a cyclic message (see can_txq_publish). Any task. */
 bool can_io_publish(uint8_t slot, const can_frame_t *frame, uint64_t stamp_ns);
 
@@ -80,5 +109,9 @@ bool can_io_send_event(const can_frame_t *frame);
 
 /** Copies of the counters. Any task. */
 void can_io_get_stats(can_io_stats_t *io, can_txq_stats_t *queue);
+
+/** Copies of the counters of every cyclic slot of the transmit queue (can_txq_slot_stats).
+ *  Any task. */
+void can_io_get_slot_stats(can_txq_slot_stats_t slots[CAN_TXQ_CYCLIC_SLOTS]);
 
 #endif /* FCN_CAN_IO_H */

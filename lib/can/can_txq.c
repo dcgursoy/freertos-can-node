@@ -28,7 +28,9 @@
  *     stats.pending is the number of these frames. Every step that moves a frame or ends its
  *     life adjusts the counters in the same call, so
  *         produced = sent + superseded + dropped + expired + pending
- *     holds after every call, not only once the queue has drained.
+ *     holds after every call, not only once the queue has drained. The counters of a slot
+ *     (slot_stats) move in the same calls, so a slot's own identity holds after every call
+ *     too: its pending is 1 for a waiting value plus 1 for a value in a mailbox.
  *   - At most config.mailboxes mailbox records are in use: at most one per cyclic slot, which
  *     slot.in_mailbox mirrors, and at most one for an event frame, which event_in_mailbox
  *     mirrors and event_record points to.
@@ -241,15 +243,19 @@ bool can_txq_publish(can_txq_t *queue, uint8_t slot, const can_frame_t *frame, u
 
     if ((slot < CAN_TXQ_CYCLIC_SLOTS) && (frame != NULL) && can_frame_is_valid(frame)) {
         can_txq_slot_t *entry = &queue->slots[slot];
+        can_txq_slot_stats_t *counts = &queue->slot_stats[slot];
 
         queue->stats.produced++;
+        counts->produced++;
 
         if (entry->waiting) {
             /* The value that was waiting will never go out: the new one takes its place. */
             queue->stats.superseded++;
+            counts->superseded++;
         } else {
             entry->waiting = true;
             queue->stats.pending++;
+            counts->pending++;
         }
 
         /* An earlier value that is already in a mailbox is not touched: it is noted in its
@@ -420,6 +426,8 @@ bool can_txq_on_tx_done(can_txq_t *queue, uint32_t handle, can_txq_done_t *info)
 
         if (record->cyclic) {
             queue->slots[record->slot].in_mailbox = false;
+            queue->slot_stats[record->slot].sent++;
+            queue->slot_stats[record->slot].pending--;
         } else {
             queue->event_in_mailbox = false;
         }
@@ -447,6 +455,8 @@ bool can_txq_on_tx_aborted(can_txq_t *queue, uint32_t handle)
                  * newest is worth sending, so this one ends here. */
                 queue->stats.superseded++;
                 queue->stats.pending--;
+                queue->slot_stats[record->slot].superseded++;
+                queue->slot_stats[record->slot].pending--;
             } else {
                 entry->value = record->item;
                 entry->waiting = true;
@@ -679,4 +689,15 @@ uint64_t can_txq_next_deadline(const can_txq_t *queue)
 const can_txq_stats_t *can_txq_stats(const can_txq_t *queue)
 {
     return &queue->stats;
+}
+
+const can_txq_slot_stats_t *can_txq_slot_stats(const can_txq_t *queue, uint8_t slot)
+{
+    const can_txq_slot_stats_t *counts = NULL;
+
+    if (slot < CAN_TXQ_CYCLIC_SLOTS) {
+        counts = &queue->slot_stats[slot];
+    }
+
+    return counts;
 }

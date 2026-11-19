@@ -141,8 +141,21 @@ def status_fields(message: can.Message) -> tuple[int, int]:
     return struct.unpack("<II", bytes(message.data))
 
 
-# Ticks per period of the status frame (TICKER_PERIOD_MS in app/app.c at 1 kHz).
+# Ticks per period of the status frame (APP_SENSOR_PERIOD_MS in app/app_tasks.h at 1 kHz).
 STATUS_PERIOD_TICKS = 10
+
+# The status frame's name in the DBC and in the node's statistics ("telemetry.messages").
+STATUS_MESSAGE = "BMS_Heartbeat"
+
+
+def status_queue_counts(stats: dict) -> dict:
+    """The transmit queue's counters of the status frame alone (produced, sent, superseded,
+    pending), from the node's statistics. They obey produced = sent + superseded + pending.
+
+    The queue's own counters ("can.queue") count every frame the node sends; since phase 2
+    that is more than the status frame, so a test that accounts for status values takes the
+    counters of its slot."""
+    return stats["telemetry"]["messages"][STATUS_MESSAGE]["queue"]
 
 # Most consecutive status values a busy host can make the node replace before they go out:
 # a host that does not run the node for 50 ms. The status message is cyclic, so a value that

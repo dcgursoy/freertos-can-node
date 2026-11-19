@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from fcn_tools.simctl import REPEATABLE, SimControl, SimError
+from fcn_tools.simctl import REPEATABLE, SENSOR_CHANNELS, SimControl, SimError
 
 LOOPBACK = "127.0.0.1"
 
@@ -169,7 +169,85 @@ def test_a_late_answer_to_a_command_that_must_not_run_twice_is_still_taken(fake_
 
 
 def test_repeatable_commands_are_the_ones_that_read_or_set_a_state():
-    assert REPEATABLE == {"ping", "can.status", "can.fault"}
+    assert REPEATABLE == {"ping", "can.status", "can.fault", "sensor.status", "sensor.set",
+                          "sensor.open", "sensor.offline", "sensor.clear"}
+
+
+# ------------------------------------------------------------------- sensor front-end model
+
+
+def test_sensor_channels_are_the_current_eight_cells_and_four_temperatures():
+    assert SENSOR_CHANNELS == ("current", "cell1", "cell2", "cell3", "cell4", "cell5", "cell6",
+                               "cell7", "cell8", "temp1", "temp2", "temp3", "temp4")
+
+
+def test_sensor_status_converts_numbers_negative_ones_included_and_keeps_words(fake_node):
+    node = fake_node({"sensor.status": "ok seed=42 offline=on current_reads=120 cell_reads=60 "
+                                       "temp_reads=12 unanswered=32 current=-7 cell1=model "
+                                       "cell2=4300 temp1=-123 temp4=open"})
+    with SimControl(node.port) as sim:
+        assert sim.sensor_status() == {
+            "seed": 42, "offline": "on", "current_reads": 120, "cell_reads": 60,
+            "temp_reads": 12, "unanswered": 32, "current": -7, "cell1": "model", "cell2": 4300,
+            "temp1": -123, "temp4": "open"}
+    assert node.requests == ["sensor.status"]
+
+
+def test_sensor_commands_carry_their_arguments(fake_node):
+    node = fake_node({"sensor.set": "ok cell3=4300 t_ns=5", "sensor.open": "ok temp2=open t_ns=6",
+                      "sensor.offline": "ok offline=on t_ns=7",
+                      "sensor.clear": "ok cleared=all offline=off t_ns=8"})
+    with SimControl(node.port) as sim:
+        assert sim.sensor_set("cell3", 4300) == {"cell3": "4300", "t_ns": "5"}
+        sim.sensor_set("current", -2147483648)
+        assert sim.sensor_open("temp2") == {"temp2": "open", "t_ns": "6"}
+        assert sim.sensor_offline() == {"offline": "on", "t_ns": "7"}
+        sim.sensor_offline(True)
+        sim.sensor_offline(False)
+        assert sim.sensor_clear() == {"cleared": "all", "offline": "off", "t_ns": "8"}
+        sim.sensor_clear("cell3")
+    assert node.requests == ["sensor.set cell3 4300", "sensor.set current -2147483648",
+                             "sensor.open temp2", "sensor.offline on", "sensor.offline on",
+                             "sensor.offline off", "sensor.clear", "sensor.clear cell3"]
+
+
+@pytest.mark.parametrize("value", [3.7, "12", True, None])
+def test_sensor_set_takes_only_a_whole_number_and_sends_nothing_otherwise(fake_node, value):
+    node = fake_node({"sensor.set": "ok cell1=1 t_ns=1"})
+    with SimControl(node.port) as sim:
+        with pytest.raises(TypeError, match="whole number"):
+            sim.sensor_set("cell1", value)
+    assert node.requests == []
+
+
+def test_a_refused_sensor_command_raises_with_the_nodes_message(fake_node):
+    node = fake_node({"sensor.set": "err unknown channel 'cell9' (current, cell1..cell8, "
+                                    "temp1..temp4)"})
+    with SimControl(node.port) as sim:
+        with pytest.raises(SimError, match="unknown channel 'cell9'"):
+            sim.sensor_set("cell9", 1)
+    assert node.requests == ["sensor.set cell9 1"]   # an answer: not asked again
+
+
+@pytest.mark.parametrize("call, command", [
+    (lambda sim: sim.sensor_status(), "sensor.status"),
+    (lambda sim: sim.sensor_set("cell1", 5), "sensor.set cell1 5"),
+    (lambda sim: sim.sensor_open("cell1"), "sensor.open cell1"),
+    (lambda sim: sim.sensor_offline(True), "sensor.offline on"),
+    (lambda sim: sim.sensor_clear(), "sensor.clear"),
+])
+def test_a_sensor_command_is_asked_again_when_the_first_attempt_goes_unanswered(fake_node, call,
+                                                                               command):
+    attempts = []
+
+    def second_time(token, request):
+        attempts.append(token)
+        return "ok seed=1" if len(attempts) >= 2 else None
+
+    node = fake_node({command.split(" ")[0]: second_time})
+    with SimControl(node.port, timeout=0.1) as sim:
+        call(sim)
+    assert node.requests == [command, command]
 
 
 def test_a_node_that_is_still_starting_is_asked_until_its_socket_is_open(fake_node):

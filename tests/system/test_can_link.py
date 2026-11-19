@@ -1,8 +1,10 @@
 """The CAN path of the node, end to end, on both transports.
 
-What these tests rely on in the phase 1 application (app/app.c): a status frame every 10 ms
-that carries a period counter and the tick count of the moment it was published, and a ping
-frame that is answered with a pong carrying the same payload.
+What these tests rely on in the application (app/app.c): a status frame (BMS_Heartbeat) every
+10 ms that carries a period counter and the tick count of the moment it was published, and a
+ping frame that is answered with a pong carrying the same payload. The node sends other cyclic
+messages besides (the telemetry of phase 2); values of the status frame are accounted for with
+the counters of its own slot of the transmit queue (fcn_tools.bus.status_queue_counts).
 
 Assertions are made on counts, order and the node's own time (ticks). Wall-clock assertions are
 confined to the tests marked `timing`. A test that waits for frames waits for a number of them
@@ -22,7 +24,7 @@ import pytest
 
 from fcn_tools.bus import (ID_PING, collect_count, collect_while, drain, is_pong, is_status,
                            open_bus, status_fields, status_gaps, status_missing_since_start,
-                           status_publish_lateness, wait_for, wait_for_id)
+                           status_publish_lateness, status_queue_counts, wait_for, wait_for_id)
 from fcn_tools.node import EXIT_OK
 from fcn_tools.simctl import SimControl, SimError
 from fcn_tools.timing import check_timing
@@ -43,7 +45,7 @@ def test_every_status_value_is_on_the_bus_or_accounted_for(open_link):
                                                  keep=is_status)
     assert link.node.wait(timeout=20) == EXIT_OK
     stats = link.node.stats()
-    queue = stats["can"]["queue"]
+    queue = status_queue_counts(stats)
 
     # The tester was on the bus before the node started, so it heard every value that left
     # the node, from value 1 on. The values are in order, one per period of the task in the
@@ -232,7 +234,7 @@ def test_every_participant_sees_every_frame(open_link, can_spec):
 
 def test_the_counters_of_all_layers_agree_after_a_run(open_link):
     link = open_link("--duration-s", "2")
-    heard = [link.first_status]
+    heard = link.before_first_status + [link.first_status]
     pings = 12
 
     for n in range(pings):
@@ -247,8 +249,10 @@ def test_the_counters_of_all_layers_agree_after_a_run(open_link):
     # Everything else the node sends until it stops, and what was still on its way then.
     heard += collect_while(link.bus, lambda: link.node.running)
     assert link.node.wait(timeout=20) == EXIT_OK
-    stats = link.node.stats()["can"]
+    node_stats = link.node.stats()
+    stats = node_stats["can"]
     queue, controller, driver = stats["queue"], stats["controller"], stats["driver"]
+    messages = node_stats["telemetry"]["messages"].values()
 
     # The transmit queue loses nothing without saying so ...
     assert queue["produced"] == (queue["sent"] + queue["superseded"] + queue["dropped"]
@@ -258,26 +262,27 @@ def test_the_counters_of_all_layers_agree_after_a_run(open_link):
     # host stalled the node, each one visible as a gap in what the tester heard.
     assert queue["dropped"] == 0 and queue["expired"] == 0
     assert status_missing_since_start([m for m in heard if is_status(m)],
-                                      max_step=None) == queue["superseded"]
+                                      max_step=None) == status_queue_counts(node_stats)["superseded"]
     assert queue["bus_off_count"] == 0 and queue["restart_requests"] == 0
-    # At most a status value in a mailbox and its successor waiting for it: the pongs were
-    # all heard before the node stopped.
-    assert queue["pending"] <= 2
+    # At most a value of each cyclic message in a mailbox and its successor waiting for it,
+    # and no event frame: the pongs were all heard before the node stopped.
+    assert all(message["queue"]["pending"] <= 2 for message in messages)
+    assert queue["pending"] == sum(message["queue"]["pending"] for message in messages)
 
     # The queue was sampled a moment before the controller stopped, so the controller may
-    # have finished the one frame that was still pending.
+    # have finished frames that were still pending.
     assert queue["sent"] <= controller["tx_frames"] <= queue["sent"] + queue["pending"]
-    # With no bus fault, a frame is aborted only when a status value that waited in its
-    # mailbox for a whole period (a host stall) is called back for its successor, and the
-    # queue counts that value as superseded.
+    # With no bus fault, frames are aborted only when the queue calls the mailboxes back
+    # because a value waited in its mailbox for a whole period (a host stall); each recall
+    # aborts at most the three mailboxes (CAN_IO_TX_MAILBOXES).
     assert controller["tx_attempts_failed"] == 0
-    assert controller["tx_aborted"] <= queue["superseded"]
+    assert controller["tx_aborted"] <= 3 * queue["recall_requests"]
     assert stats["state"] == "active" and stats["tec"] == 0 and stats["rec"] == 0
 
     # Every frame the controller completed was written to the transport and reached the tester.
     transport = stats["transport_counters"]
     assert transport["tx_frames"] == controller["tx_frames"] and transport["tx_failed"] == 0
-    assert sum(1 for m in heard if is_status(m) or is_pong(m)) == controller["tx_frames"]
+    assert len(heard) == controller["tx_frames"]
     assert sum(1 for m in heard if is_pong(m)) == pings
 
     # Every ping passed transport, controller and driver exactly once.

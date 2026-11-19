@@ -13,6 +13,9 @@ step() {
     echo "################################################################ $*"
 }
 
+step "generated code: app/gen and the test table are what dbc/fcn.dbc gives"
+"$here/codegen-check.sh"
+
 step "static analysis"
 "$here/static-analysis.sh"
 

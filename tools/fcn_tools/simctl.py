@@ -1,7 +1,7 @@
 """Client of the node's simulation control channel.
 
-The simulated hardware around the node (the CAN bus, later the sensors, the flash and the
-power supply) is controlled through a UDP socket on the loopback interface, the way a test
+The simulated hardware around the node (the CAN bus, the sensor front end, later the flash and
+the power supply) is controlled through a UDP socket on the loopback interface, the way a test
 bench controls relays and signal generators around a real device. The firmware itself never
 sees these commands. The protocol is documented in platform/posix/posix_sim.h:
 
@@ -16,13 +16,25 @@ The client therefore repeats only a command for which that does no harm; see REP
 from __future__ import annotations
 
 import itertools
+import re
 import socket
 import time
 
 # Commands that may reach the node more than once without changing the outcome: they only
-# read (ping, can.status) or set a state to a value (can.fault). Any other command, can.inject
-# above all (it adds to the errors still to come), is sent once and waited for.
-REPEATABLE = frozenset({"ping", "can.status", "can.fault"})
+# read (ping, can.status, sensor.status) or set a state to a value (can.fault and the other
+# sensor commands: a channel held, opened or cleared twice, or the front end taken off line
+# twice, ends as it would after once). Any other command, can.inject above all (it adds to the
+# errors still to come), is sent once and waited for.
+REPEATABLE = frozenset({"ping", "can.status", "can.fault",
+                        "sensor.status", "sensor.set", "sensor.open", "sensor.offline",
+                        "sensor.clear"})
+
+# The channels of the sensor front-end model (platform/posix/posix_sensor.c).
+SENSOR_CHANNELS = ("current",
+                   *(f"cell{n}" for n in range(1, 9)),
+                   *(f"temp{n}" for n in range(1, 5)))
+
+_INTEGER = re.compile(r"-?[0-9]+")
 
 # Pause before sending again to a port where nothing was listening yet (a node that is still
 # starting): the request was not delivered, so it can be sent again whatever it is.
@@ -126,3 +138,38 @@ class SimControl:
         """Destroy the next `count` transmission attempts ("tx") or received frames ("rx").
         Not repeated on a timeout: the count adds to what is left (see REPEATABLE)."""
         return self.request(f"can.inject {kind} {count}")
+
+    # --------------------------------------------------------------- sensor front-end model
+    #
+    # Channels are named as in SENSOR_CHANNELS; values are in the units of plat_sensor.h: mA
+    # (positive when discharging), mV, and tenths of a degree Celsius. docs/sensor-model.md
+    # describes the model and what each fault does.
+
+    def sensor_status(self) -> dict:
+        """Seed, off-line state, read counters and every channel's mode.
+
+        Whole numbers are converted to int, negative ones included (a held value); `offline`
+        (on, off) and a channel's `model` or `open` stay strings."""
+        reply = self.request("sensor.status")
+        return {key: (int(value) if _INTEGER.fullmatch(value) else value)
+                for key, value in reply.items()}
+
+    def sensor_set(self, channel: str, value: int) -> dict[str, str]:
+        """Hold `channel` at `value`: the front end reports exactly that, as a valid reading,
+        until the channel is cleared. Any value of the channel's type is accepted, also one
+        the real sensor could not deliver."""
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"a sensor value is a whole number, not {value!r}")
+        return self.request(f"sensor.set {channel} {value}")
+
+    def sensor_open(self, channel: str) -> dict[str, str]:
+        """Let the front end declare `channel` invalid (an open sense wire)."""
+        return self.request(f"sensor.open {channel}")
+
+    def sensor_offline(self, offline: bool = True) -> dict[str, str]:
+        """Take the whole front end off line (it answers no read), or bring it back."""
+        return self.request(f"sensor.offline {'on' if offline else 'off'}")
+
+    def sensor_clear(self, channel: str | None = None) -> dict[str, str]:
+        """End the fault of `channel`, or with no channel every fault, off line included."""
+        return self.request("sensor.clear" if channel is None else f"sensor.clear {channel}")

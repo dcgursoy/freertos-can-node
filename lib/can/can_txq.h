@@ -83,8 +83,15 @@
  *
  *     produced = sent + superseded + dropped + expired + pending
  *
- * where pending counts the frames waiting in slots, in the FIFO and in mailboxes. The unit
- * tests assert this after every step of randomised scenarios.
+ * where pending counts the frames waiting in slots, in the FIFO and in mailboxes. The same
+ * holds for every cyclic slot on its own (can_txq_slot_stats), without the two terms that only
+ * event frames have:
+ *
+ *     produced = sent + superseded + pending          (one slot)
+ *
+ * so that one message can be accounted for frame by frame while others share the queue. The
+ * slots' superseded values add up to the queue's. The unit tests assert all of this after
+ * every step of randomised scenarios.
  *
  * TIME. Every time is a uint64_t count of nanoseconds on the caller's clock, passed in; the
  * queue reads no clock of its own. A deadline at or beyond UINT64_MAX is never reached, which
@@ -138,6 +145,17 @@ typedef struct {
      *  a message's own period it can grow with every publish. */
     uint64_t recall_requests;
 } can_txq_stats_t;
+
+/** The counters of one cyclic slot: the share of can_txq_stats_t that belongs to its message.
+ *  A cyclic value is never dropped and never expires, so produced = sent + superseded +
+ *  pending holds for each slot at every moment. */
+typedef struct {
+    uint64_t produced;   /**< values can_txq_publish() accepted for the slot */
+    uint64_t sent;       /**< of those, confirmed transmitted */
+    uint64_t superseded; /**< of those, replaced by a newer value before they went out */
+    /** of those, waiting now: 0, 1 or 2 (a value in a mailbox and its successor in the slot) */
+    uint32_t pending;
+} can_txq_slot_stats_t;
 
 /** What can_txq_on_tx_done() tells the caller about the frame that went out. */
 typedef struct {
@@ -197,6 +215,7 @@ typedef struct {
     uint64_t bus_off_since_ns;  /* start of the hold-off while restart_pending */
     uint64_t recovered_at_ns;   /* start of the stable time while holdoff_reset_pending */
     can_txq_stats_t stats;
+    can_txq_slot_stats_t slot_stats[CAN_TXQ_CYCLIC_SLOTS];
 } can_txq_t;
 
 /**
@@ -281,5 +300,9 @@ uint32_t can_txq_poll(can_txq_t *queue, uint64_t now_ns);
 uint64_t can_txq_next_deadline(const can_txq_t *queue);
 
 const can_txq_stats_t *can_txq_stats(const can_txq_t *queue);
+
+/** The counters of cyclic slot `slot` (see ACCOUNTING); NULL if `slot` is not below
+ *  CAN_TXQ_CYCLIC_SLOTS. */
+const can_txq_slot_stats_t *can_txq_slot_stats(const can_txq_t *queue, uint8_t slot);
 
 #endif /* FCN_CAN_TXQ_H */

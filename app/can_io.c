@@ -59,6 +59,11 @@ static TaskHandle_t s_tx_task;
 
 static rx_entry_t s_rx_table[CAN_IO_RX_HANDLERS];
 
+/* The receive cycle (can_io_on_rx_cycle): set before the scheduler starts, read only by the
+ * receive task afterwards. */
+static can_io_cycle_handler_t s_rx_cycle_handler;
+static TickType_t s_rx_cycle_ticks;
+
 /* The transmit queue is shared by the producers and the transmit task. Every access is a
  * few dozen instructions on a small structure, so it is guarded by a critical section rather
  * than a mutex: shorter than the mutex calls would be, and usable from any priority. */
@@ -103,17 +108,61 @@ static void dispatch(const plat_can_rx_t *received)
     }
 }
 
+/* Ticks the receive task may wait for a notification: the idle wait, or less if the period of
+ * the receive cycle that began at `cycle_start` ends sooner (0 if it has ended). Differences
+ * of tick counts, so that a tick count that wraps does no harm. */
+static TickType_t rx_wait_ticks(TickType_t cycle_start)
+{
+    TickType_t wait = pdMS_TO_TICKS(RX_IDLE_WAIT_MS);
+
+    if (s_rx_cycle_handler != NULL) {
+        const TickType_t elapsed = xTaskGetTickCount() - cycle_start;
+        const TickType_t left = (elapsed < s_rx_cycle_ticks) ? (s_rx_cycle_ticks - elapsed) : 0U;
+
+        if (left < wait) {
+            wait = left;
+        }
+    }
+
+    return wait;
+}
+
+/* The end of a period of the receive cycle, if it has come: one call of the handler, however
+ * many periods have ended since `cycle_start`. Returns the start of the period now running. */
+static TickType_t run_rx_cycle(TickType_t cycle_start)
+{
+    TickType_t start = cycle_start;
+
+    if (s_rx_cycle_handler != NULL) {
+        const TickType_t elapsed = xTaskGetTickCount() - cycle_start;
+
+        if (elapsed >= s_rx_cycle_ticks) {
+            const TickType_t periods = elapsed / s_rx_cycle_ticks;
+
+            s_rx_cycle_handler();
+            s_stats.rx_cycles++;
+            s_stats.rx_cycles_skipped += (uint32_t)(periods - 1U);
+            start = cycle_start + (periods * s_rx_cycle_ticks);
+        }
+    }
+
+    return start;
+}
+
 static void rx_task(void *arg)
 {
+    TickType_t cycle_start;
+
     (void)arg;
     plat_task_enter("can_rx");
+    cycle_start = xTaskGetTickCount();
 
     for (;;) {
         uint32_t bits = 0U;
         uint32_t handled = 0U;
         plat_can_rx_t received;
 
-        (void)xTaskNotifyWait(0U, UINT32_MAX, &bits, pdMS_TO_TICKS(RX_IDLE_WAIT_MS));
+        (void)xTaskNotifyWait(0U, UINT32_MAX, &bits, rx_wait_ticks(cycle_start));
 
         /* Drain the controller's FIFO, but only a bounded number of frames per activation:
          * this task outranks every other, and its execution time per activation has to have
@@ -131,6 +180,10 @@ static void rx_task(void *arg)
             vTaskDelay(1U);
             (void)xTaskNotify(s_rx_task, NOTIFY_RX_PENDING, eSetBits);
         }
+
+        /* After the frames, so that a frame that arrived before the end of a period counts
+         * in that period. */
+        cycle_start = run_rx_cycle(cycle_start);
     }
 }
 
@@ -292,6 +345,14 @@ bool can_io_on_frame(uint32_t id, bool extended, can_io_rx_handler_t handler)
     return registered;
 }
 
+void can_io_on_rx_cycle(uint32_t period_ms, can_io_cycle_handler_t handler)
+{
+    const TickType_t ticks = pdMS_TO_TICKS(period_ms);
+
+    s_rx_cycle_ticks = (ticks > 0U) ? ticks : 1U;
+    s_rx_cycle_handler = handler;
+}
+
 bool can_io_publish(uint8_t slot, const can_frame_t *frame, uint64_t stamp_ns)
 {
     bool accepted;
@@ -332,6 +393,17 @@ void can_io_get_stats(can_io_stats_t *io, can_txq_stats_t *queue)
 
     if (queue != NULL) {
         *queue = *can_txq_stats(&s_queue);
+    }
+
+    taskEXIT_CRITICAL();
+}
+
+void can_io_get_slot_stats(can_txq_slot_stats_t slots[CAN_TXQ_CYCLIC_SLOTS])
+{
+    taskENTER_CRITICAL();
+
+    for (uint8_t slot = 0U; slot < CAN_TXQ_CYCLIC_SLOTS; slot++) {
+        slots[slot] = *can_txq_slot_stats(&s_queue, slot);
     }
 
     taskEXIT_CRITICAL();

@@ -2,17 +2,20 @@
 find_package(Threads REQUIRED)
 
 # The parts of the host layer that know nothing about FreeRTOS: the CAN transports (SocketCAN,
-# UDP) and the simulation control socket. A library of their own, so that their tests link
-# without a kernel.
+# UDP), the simulation control socket and the model of the sensor front end (plat_sensor.h). A
+# library of their own, so that their tests link without a kernel.
 add_library(fcn_host_io STATIC
     can_backend.c
     can_backend_socketcan.c
     can_backend_udp.c
+    posix_sensor.c
     posix_sim.c)
-target_include_directories(fcn_host_io PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(fcn_host_io PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/platform/include")
 # struct ifreq and the SO_RXQ_OVFL socket option.
 target_compile_definitions(fcn_host_io PRIVATE _GNU_SOURCE)
-target_link_libraries(fcn_host_io PUBLIC fcn_can)
+target_link_libraries(fcn_host_io PUBLIC fcn_can fcn_bms)
 fcn_target_defaults(fcn_host_io)
 
 # An OBJECT library on purpose: the kernel calls back into this code (hooks, the assert

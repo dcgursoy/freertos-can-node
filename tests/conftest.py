@@ -23,6 +23,7 @@ FCN_REQUIRE_SOCKETCAN is set (CI sets it), in which case a missing interface is 
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import os
 import re
@@ -30,6 +31,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 import can
 import pytest
@@ -159,10 +161,14 @@ def start_node(workdir, node_binary, ports):
 # ------------------------------------------------------------------------------- the bus
 
 
-@pytest.fixture(params=["udp", pytest.param("socketcan", marks=pytest.mark.socketcan)])
-def can_spec(request, ports) -> str:
-    """The bus of this test, once per transport."""
-    if request.param == "udp":
+#: The transports every bus test runs on, as fixture parameters.
+TRANSPORTS = ["udp", pytest.param("socketcan", marks=pytest.mark.socketcan)]
+
+
+@contextlib.contextmanager
+def _transport(kind: str, ports: PortBlock) -> Iterator[str]:
+    """The bus specification of one transport ("udp" or "socketcan") while it is in use."""
+    if kind == "udp":
         yield f"udp:{ports.bus}"
         return
 
@@ -184,6 +190,22 @@ def can_spec(request, ports) -> str:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+@pytest.fixture(params=TRANSPORTS)
+def can_spec(request, ports) -> str:
+    """The bus of this test, once per transport."""
+    with _transport(request.param, ports) as spec:
+        yield spec
+
+
+@pytest.fixture(scope="session")
+def transport():
+    """transport(kind, ports): the context manager behind can_spec, for a fixture of a wider
+    scope than one test (a run that several tests of a module look at). The SocketCAN
+    interface is locked only inside the `with` block: release it before the tests run, or a
+    test that takes can_spec waits for it for ever."""
+    return _transport
+
+
 @dataclass
 class Link:
     """A running node and the tester's end of its bus."""
@@ -191,7 +213,11 @@ class Link:
     bus: can.BusABC
     node: NodeProcess
     spec: str
-    first_status: can.Message   # the first frame the node sent
+    first_status: can.Message   # the first status frame (BMS_Heartbeat) the node sent
+    # What the node sent before it: the frames that won the bus in the same tick. Phase 2
+    # publishes BMS_PackStatus (0x020) and others with the first heartbeat (0x030), and a lower
+    # identifier goes first. With these, a tester has every frame the node sent.
+    before_first_status: list[can.Message]
 
 
 @pytest.fixture
@@ -199,8 +225,8 @@ def open_link(can_spec, start_node):
     """Factory: open_link(*node_args) starts a node on the test's bus and returns a Link.
 
     The tester's end of the bus is opened before the node starts, so the tester sees every
-    frame from the first one, and the link is handed out once that first frame has arrived:
-    tests never sleep to wait for the node.
+    frame from the first one, and the link is handed out once the first status frame has
+    arrived, with the frames that came before it: tests never sleep to wait for the node.
     """
     buses: list[can.BusABC] = []
 
@@ -208,11 +234,20 @@ def open_link(can_spec, start_node):
         bus = bus_module.open_bus(can_spec)
         buses.append(bus)
         node = start_node(*node_args, can=can_spec)
-        first = bus_module.wait_for_id(bus, bus_module.ID_STATUS, timeout=5.0)
+        before: list[can.Message] = []
+
+        def is_first_status(message: can.Message) -> bool:
+            if bus_module.is_status(message):
+                return True
+            before.append(message)
+            return False
+
+        first = bus_module.wait_for(bus, is_first_status, timeout=5.0)
         if first is None:
             pytest.fail("the node sent no status frame within 5 s of its start\n"
                         f"--- stderr\n{node.stderr()}\n--- log\n{node.log()}", pytrace=False)
-        return Link(bus=bus, node=node, spec=can_spec, first_status=first)
+        return Link(bus=bus, node=node, spec=can_spec, first_status=first,
+                    before_first_status=before)
 
     yield _open
 

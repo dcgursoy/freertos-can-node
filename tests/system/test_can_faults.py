@@ -17,7 +17,8 @@ import can
 import pytest
 
 from fcn_tools.bus import (ID_PING, collect, collect_count, drain, is_pong, is_status,
-                           status_fields, status_gaps, status_missing_since_start, wait_for)
+                           status_fields, status_gaps, status_missing_since_start,
+                           status_queue_counts, wait_for)
 from fcn_tools.node import EXIT_OK
 from fcn_tools.timing import check_timing
 
@@ -225,23 +226,28 @@ def test_destroyed_transmissions_are_repeated_and_nothing_is_lost(open_link):
     assert link.node.stop() == EXIT_OK
     # Everything the node sent, from its first frame to its last: the tester's socket kept
     # what it did not read during the test.
-    heard = [link.first_status] + drain(link.bus)
-    stats = link.node.stats()["can"]
+    heard = link.before_first_status + [link.first_status] + drain(link.bus)
+    node_stats = link.node.stats()
+    stats = node_stats["can"]
     controller, queue = stats["controller"], stats["queue"]
-    # Each destroyed attempt was repeated: nothing was given up, nothing went bus off. A frame
-    # is aborted only when a status value that waited in its mailbox for a whole period (a
-    # host stall) is called back for its successor, which the queue counts as superseded.
+    status_queue = status_queue_counts(node_stats)
+    # Each destroyed attempt was repeated: nothing was given up, nothing went bus off. Frames
+    # are aborted only when the queue calls the mailboxes back because a value waited in its
+    # mailbox for a whole period (a host stall); each recall aborts at most the three
+    # mailboxes.
     assert controller["tx_attempts_failed"] == 5
-    assert controller["tx_aborted"] <= queue["superseded"] and queue["bus_off_count"] == 0
+    assert controller["tx_aborted"] <= 3 * queue["recall_requests"]
+    assert queue["bus_off_count"] == 0
     assert queue["dropped"] == 0 and queue["expired"] == 0
     # And nothing was lost on the way: every frame the controller completed reached the
-    # tester, in order, and every value that never left was replaced by its successor in the
-    # node and counted as such, up to the last one the node produced.
+    # tester, in order, and every status value that never left was replaced by its successor
+    # in the node and counted as such, up to the last one the node produced.
     assert stats["transport_counters"]["tx_frames"] == controller["tx_frames"]
-    assert all(is_status(m) for m in heard) and len(heard) == controller["tx_frames"]
-    assert status_missing_since_start(heard, max_step=None) == queue["superseded"]
-    last_counter = status_fields(heard[-1])[0]
-    assert last_counter <= queue["produced"] <= last_counter + queue["pending"]
+    assert len(heard) == controller["tx_frames"]
+    status_frames = [m for m in heard if is_status(m)]
+    assert status_missing_since_start(status_frames, max_step=None) == status_queue["superseded"]
+    last_counter = status_fields(status_frames[-1])[0]
+    assert last_counter <= status_queue["produced"] <= last_counter + status_queue["pending"]
 
 
 def test_a_command_is_carried_out_once_even_if_the_node_answers_late(open_link):

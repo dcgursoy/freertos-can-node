@@ -21,9 +21,11 @@
 #include "task.h"
 
 #include "app.h"
+#include "app_tasks.h"
 #include "can_backend.h"
 #include "plat_can.h"
 #include "posix_platform.h"
+#include "posix_sensor.h"
 #include "posix_sim.h"
 
 #ifndef FCN_VERSION
@@ -49,6 +51,7 @@ typedef struct {
     const char *stats_path;
     const char *can_spec;
     uint32_t bitrate;
+    uint32_t sensor_seed;
     uint16_t sim_port;
 } node_options_t;
 
@@ -61,6 +64,8 @@ static void print_usage(const char *program)
                  "                         0 switches the bus model's pacing off\n"
                  "  --sim-port N           serve simulation control (fault injection) on UDP\n"
                  "                         port N of the loopback interface (default: off)\n"
+                 "  --sensor-seed N        seed of the sensor model's noise, 0 to 4294967295\n"
+                 "                         (default %u); the same seed gives the same readings\n"
                  "  --duration-s N         stop after N seconds of tick time (default and 0: run\n"
                  "                         until SIGINT or SIGTERM)\n"
                  "  --stats-json PATH      write run statistics to PATH on an orderly stop\n"
@@ -75,7 +80,8 @@ static void print_usage(const char *program)
                  "%d when an orderly stop hung; 10 to 22 for a reset of the node\n"
                  "(platform/include/platform.h)\n",
                  program, (unsigned int)CAN_UDP_DEFAULT_PORT, (unsigned int)DEFAULT_BITRATE,
-                 POSIX_EXIT_CAN_TRANSPORT_LOST, POSIX_EXIT_SHUTDOWN_TIMEOUT);
+                 (unsigned int)POSIX_SENSOR_DEFAULT_SEED, POSIX_EXIT_CAN_TRANSPORT_LOST,
+                 POSIX_EXIT_SHUTDOWN_TIMEOUT);
 }
 
 static bool parse_log_level(const char *text, log_level_t *out)
@@ -130,6 +136,7 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         OPT_CAN,
         OPT_BITRATE,
         OPT_SIM_PORT,
+        OPT_SENSOR_SEED,
         OPT_VERSION,
         OPT_HELP
     };
@@ -143,6 +150,7 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         {"can", required_argument, NULL, OPT_CAN},
         {"bitrate", required_argument, NULL, OPT_BITRATE},
         {"sim-port", required_argument, NULL, OPT_SIM_PORT},
+        {"sensor-seed", required_argument, NULL, OPT_SENSOR_SEED},
         {"version", no_argument, NULL, OPT_VERSION},
         {"help", no_argument, NULL, OPT_HELP},
         {NULL, 0, NULL, 0}};
@@ -213,6 +221,14 @@ static int parse_options(int argc, char **argv, node_options_t *options)
                 result = 2;
             }
             break;
+        case OPT_SENSOR_SEED:
+            if (parse_number(optarg, 4294967295UL, &number)) {
+                options->sensor_seed = (uint32_t)number;
+            } else {
+                (void)fprintf(stderr, "invalid --sensor-seed: %s (0 to 4294967295)\n", optarg);
+                result = 2;
+            }
+            break;
         case OPT_VERSION:
             (void)printf("fcn_node %s (FreeRTOS %s)\n", FCN_VERSION, tskKERNEL_VERSION_NUMBER);
             result = 1;
@@ -240,6 +256,16 @@ static int parse_options(int argc, char **argv, node_options_t *options)
 static void put_u64(FILE *file, const char *key, uint64_t value, const char *separator)
 {
     (void)fprintf(file, "\"%s\": %llu%s", key, (unsigned long long)value, separator);
+}
+
+static void put_i64(FILE *file, const char *key, int64_t value, const char *separator)
+{
+    (void)fprintf(file, "\"%s\": %lld%s", key, (long long)value, separator);
+}
+
+static void put_bool(FILE *file, const char *key, bool value, const char *separator)
+{
+    (void)fprintf(file, "\"%s\": %s%s", key, value ? "true" : "false", separator);
 }
 
 static const char *can_state_name(uint8_t state)
@@ -324,6 +350,8 @@ static void write_can_stats(FILE *file, const node_stats_t *stats)
     put_u64(file, "rx_unhandled", stats->can_io.rx_unhandled, ", ");
     put_u64(file, "rx_batches_cut", stats->can_io.rx_batches_cut, ", ");
     put_u64(file, "tx_load_failed", stats->can_io.tx_load_failed, ", ");
+    put_u64(file, "rx_cycles", stats->can_io.rx_cycles, ", ");
+    put_u64(file, "rx_cycles_skipped", stats->can_io.rx_cycles_skipped, ", ");
     put_u64(file, "rx_fifo_overruns", host.rx_fifo_overruns, ", ");
     put_u64(file, "event_fifo_overruns", host.event_fifo_overruns, ", ");
     put_u64(file, "state_events_merged", host.state_events_merged, ", ");
@@ -340,6 +368,188 @@ static void write_can_stats(FILE *file, const node_stats_t *stats)
     put_u64(file, "restart_requests", stats->can_queue.restart_requests, ", ");
     put_u64(file, "recall_requests", stats->can_queue.recall_requests, ", ");
     put_u64(file, "holdoff_ms", stats->can_queue.holdoff_ms, "}\n  },\n");
+}
+
+/*
+ * "task_table": the task table of the node (app/task_table.c) in the input schema of the
+ * schedulability check, so that `python -m fcn_tools.sched` can read the member as it is. The
+ * strings of the table contain no character that would need escaping.
+ */
+static void write_task_table(FILE *file)
+{
+    size_t count = 0U;
+    const app_task_budget_t *table = app_task_table(&count);
+
+    (void)fprintf(file,
+                  "  \"task_table\": {\n    \"schema\": \"fcn.task_table/1\",\n"
+                  "    \"wcet_basis\": \"design\",\n    \"description\": \"%s\",\n"
+                  "    \"tasks\": [",
+                  app_task_table_description());
+
+    for (size_t i = 0U; i < count; i++) {
+        const app_task_budget_t *task = &table[i];
+
+        (void)fprintf(file, "%s\n      {\"name\": \"%s\", \"priority\": %u, \"kind\": \"%s\", ",
+                      (i == 0U) ? "" : ",", task->name, (unsigned int)task->priority,
+                      task->periodic ? "periodic" : "sporadic");
+        put_u64(file, task->periodic ? "period_us" : "min_interarrival_us", task->period_us, ", ");
+        put_u64(file, "deadline_us", task->deadline_us, ", ");
+        put_u64(file, "wcet_us", task->wcet_us, ", ");
+        put_u64(file, "jitter_us", task->jitter_us, ", ");
+        put_u64(file, "nonpreemptive_us", task->nonpreemptive_us, ", ");
+        (void)fprintf(file, "\"critical_sections\": [");
+
+        if (task->mutex != NULL) {
+            (void)fprintf(file, "{\"resource\": \"%s\", \"length_us\": %u}", task->mutex,
+                          (unsigned int)task->mutex_us);
+        }
+
+        (void)fprintf(file, "]}");
+    }
+
+    (void)fprintf(file, "\n    ]\n  },\n");
+}
+
+static const char *pack_state_name(bms_state_t state)
+{
+    static const char *const names[] = {"STARTUP", "NORMAL", "FAULT"};
+
+    return ((uint32_t)state <= (uint32_t)BMS_STATE_FAULT) ? names[state] : "unknown";
+}
+
+static const char *sm_state_name(e2e_sm_state_t state)
+{
+    static const char *const names[] = {"DEINIT", "NODATA", "INIT", "VALID", "INVALID"};
+
+    return ((uint32_t)state <= (uint32_t)E2E_SM_INVALID) ? names[state] : "unknown";
+}
+
+/* "sensor", "sample_queue", "process" and "pack": the measurement chain, as the health task
+ * captured it when it ended the run. */
+static void write_measurement_stats(FILE *file, const node_stats_t *stats)
+{
+    const node_sensor_stats_t *sensor = &stats->sensor;
+    const node_process_stats_t *process = &stats->process;
+    const bms_pack_t *pack = &stats->pack;
+
+    (void)fprintf(file, "  \"sensor\": {");
+    put_u64(file, "periods", sensor->periods, ", ");
+    put_u64(file, "overruns", sensor->overruns, ", ");
+    (void)fprintf(file, "\"reads\": {");
+    put_u64(file, "current", sensor->current_reads, ", ");
+    put_u64(file, "cells", sensor->cell_reads, ", ");
+    put_u64(file, "temps", sensor->temp_reads, "}, ");
+    (void)fprintf(file, "\"unanswered\": {");
+    put_u64(file, "current", sensor->current_unanswered, ", ");
+    put_u64(file, "cells", sensor->cell_unanswered, ", ");
+    put_u64(file, "temps", sensor->temp_unanswered, "}},\n");
+
+    (void)fprintf(file, "  \"sample_queue\": {");
+    put_u64(file, "length", APP_SAMPLE_QUEUE_LENGTH, ", ");
+    put_u64(file, "posted", sensor->samples_posted, ", ");
+    put_u64(file, "full", sensor->queue_full, ", ");
+    put_u64(file, "high_water", process->high_water, "},\n");
+
+    (void)fprintf(file, "  \"process\": {");
+    put_u64(file, "samples", process->samples, ", ");
+    put_u64(file, "timeouts", process->timeouts, ", ");
+    put_u64(file, "backlog", process->backlog, "},\n");
+
+    (void)fprintf(file, "  \"pack\": {\"state\": \"%s\", ", pack_state_name(pack->state));
+    put_u64(file, "updates", pack->updates, ", ");
+    put_i64(file, "current_ma", pack->current_ma, ", ");
+    put_bool(file, "current_valid", pack->current_valid, ", ");
+    put_u64(file, "pack_mv", pack->pack_mv, ", ");
+    put_bool(file, "pack_valid", pack->pack_valid, ",\n    ");
+    (void)fprintf(file, "\"cell_mv\": [");
+    for (uint32_t i = 0U; i < BMS_CELLS; i++) {
+        (void)fprintf(file, "%s%u", (i == 0U) ? "" : ", ", (unsigned int)pack->cell_mv[i]);
+    }
+    (void)fprintf(file, "], ");
+    put_u64(file, "cell_valid", pack->cell_valid, ", ");
+    (void)fprintf(file, "\"temp_dc\": [");
+    for (uint32_t i = 0U; i < BMS_TEMPS; i++) {
+        (void)fprintf(file, "%s%d", (i == 0U) ? "" : ", ", (int)pack->temp_dc[i]);
+    }
+    (void)fprintf(file, "], ");
+    put_u64(file, "temp_valid", pack->temp_valid, ",\n    ");
+    put_u64(file, "min_cell_mv", pack->min_cell_mv, ", ");
+    put_u64(file, "min_cell", pack->min_cell, ", ");
+    put_u64(file, "max_cell_mv", pack->max_cell_mv, ", ");
+    put_u64(file, "max_cell", pack->max_cell, ",\n    ");
+    put_u64(file, "flagged_readings", pack->flagged_readings, ", ");
+    put_u64(file, "implausible_readings", pack->implausible_readings, ", ");
+    put_u64(file, "lost_samples", pack->lost_samples, ", ");
+    put_u64(file, "sequence_errors", pack->sequence_errors, "},\n");
+}
+
+/* "telemetry": the switch, and per cyclic message what the application did with it and what
+ * its slot of the transmit queue did (the queue's counters were captured with "can.queue"). */
+static void write_telemetry_stats(FILE *file, const node_stats_t *stats)
+{
+    (void)fprintf(file, "  \"telemetry\": {");
+    put_bool(file, "enabled", stats->telemetry_on, ", ");
+    (void)fprintf(file, "\"messages\": {");
+
+    for (uint32_t i = 0U; i < NODE_STATS_MESSAGES; i++) {
+        const node_message_stats_t *message = &stats->messages[i];
+
+        (void)fprintf(file, "%s\n    \"%s\": {", (i == 0U) ? "" : ",",
+                      (message->name != NULL) ? message->name : "unknown");
+        put_u64(file, "id", message->id, ", ");
+        put_u64(file, "slot", message->slot, ", ");
+        put_u64(file, "cycle_ms", message->cycle_ms, ", ");
+
+        if (message->protected_e2e) {
+            put_u64(file, "e2e_data_id", message->data_id, ", ");
+        } else {
+            (void)fprintf(file, "\"e2e_data_id\": null, ");
+        }
+
+        put_bool(file, "gated", message->gated, ", ");
+        put_u64(file, "published", message->published, ", ");
+        put_u64(file, "suppressed", message->suppressed, ", ");
+        put_u64(file, "failed", message->failed, ",\n      ");
+        (void)fprintf(file, "\"queue\": {");
+        put_u64(file, "produced", message->queue.produced, ", ");
+        put_u64(file, "sent", message->queue.sent, ", ");
+        put_u64(file, "superseded", message->queue.superseded, ", ");
+        put_u64(file, "pending", message->queue.pending, "}}");
+    }
+
+    (void)fprintf(file, "\n  }},\n");
+}
+
+/* "command": the receiver of TESTER_Command (app/command.h). */
+static void write_command_stats(FILE *file, const node_stats_t *stats)
+{
+    const command_rx_t *command = &stats->command;
+
+    (void)fprintf(file, "  \"command\": {");
+    put_u64(file, "frames", command->frames, ", ");
+    put_u64(file, "cycles", command->cycles, ", ");
+    put_u64(file, "checks", command->checks, ", ");
+    put_u64(file, "check_errors", command->check_errors, ", ");
+    put_u64(file, "sm_errors", command->sm_errors, ",\n    ");
+    (void)fprintf(file, "\"status\": {");
+    put_u64(file, "OK", command->status.ok, ", ");
+    put_u64(file, "OKSOMELOST", command->status.ok_some_lost, ", ");
+    put_u64(file, "REPEATED", command->status.repeated, ", ");
+    put_u64(file, "WRONGSEQUENCE", command->status.wrong_sequence, ", ");
+    put_u64(file, "ERROR", command->status.error, ", ");
+    put_u64(file, "NONEWDATA", command->status.no_new_data, "},\n    ");
+    (void)fprintf(file, "\"sm_state\": \"%s\", ", sm_state_name(command->sm.sm_state));
+    put_u64(file, "sm_ok_count", command->sm.ok_count, ", ");
+    put_u64(file, "sm_error_count", command->sm.error_count, ", ");
+    put_u64(file, "accepted", command->accepted, ", ");
+    put_u64(file, "ignored", command->ignored, ", ");
+    put_bool(file, "telemetry_on", command->telemetry_on, ", ");
+
+    if (command->have_command) {
+        put_u64(file, "clear_faults_seq", command->clear_faults_seq, "}\n");
+    } else {
+        (void)fprintf(file, "\"clear_faults_seq\": null}\n");
+    }
 }
 
 static bool write_stats(const char *path, const node_options_t *options, uint64_t elapsed_ns)
@@ -410,12 +620,18 @@ static bool write_stats(const char *path, const node_options_t *options, uint64_
         (void)fprintf(file,
                       "%s\n    {\"name\": \"%s\", \"priority\": %u, \"run_time_us\": %llu, "
                       "\"stack_peak_bytes\": %lld, \"stack_start_bytes\": %lld, "
-                      "\"stack_size_bytes\": %lld}",
+                      "\"stack_size_bytes\": %lld, \"overruns\": %u}",
                       (i == 0U) ? "" : ",", task->name, (unsigned int)task->priority,
-                      (unsigned long long)task->run_time_us, stack_peak, stack_start, stack_size);
+                      (unsigned long long)task->run_time_us, stack_peak, stack_start, stack_size,
+                      (unsigned int)task->overruns);
     }
 
-    (void)fprintf(file, "\n  ]\n}\n");
+    (void)fprintf(file, "\n  ],\n");
+    write_task_table(file);
+    write_measurement_stats(file, stats);
+    write_telemetry_stats(file, stats);
+    write_command_stats(file, stats);
+    (void)fprintf(file, "}\n");
     return (fclose(file) == 0);
 }
 
@@ -506,6 +722,7 @@ int main(int argc, char **argv)
     options.platform.log_level = LOG_LEVEL_INFO;
     options.can_spec = DEFAULT_CAN_SPEC;
     options.bitrate = DEFAULT_BITRATE;
+    options.sensor_seed = POSIX_SENSOR_DEFAULT_SEED;
 
     status = parse_options(argc, argv, &options);
 
@@ -536,17 +753,26 @@ int main(int argc, char **argv)
     LOG_INF("main", "fcn_node %s starting (FreeRTOS %s)", FCN_VERSION, tskKERNEL_VERSION_NUMBER);
 
     /* The simulated hardware comes up before the application, as a board is powered before
-     * its firmware runs. Without a bus there is no node: failing here is a start-up error. */
-    if (!posix_sim_open(options.sim_port, error, sizeof(error)) ||
-        !posix_can_start(options.can_spec, options.bitrate, error, sizeof(error))) {
+     * its firmware runs. Without a bus there is no node: failing here is a start-up error. The
+     * sensor model starts before the CAN hardware thread, which serves its simulation control
+     * commands and may only start once every model has registered them. */
+    bool hardware_up = posix_sim_open(options.sim_port, error, sizeof(error));
+
+    if (hardware_up) {
+        posix_sensor_start(options.sensor_seed);
+        hardware_up = posix_can_start(options.can_spec, options.bitrate, error, sizeof(error));
+    }
+
+    if (!hardware_up) {
         (void)fprintf(stderr, "fcn_node: %s\n", error);
         posix_sim_close();
         posix_platform_shutdown();
         return EXIT_FAILURE;
     }
 
-    LOG_INF("main", "CAN on %s at %lu bit/s, simulation control %s", options.can_spec,
-            (unsigned long)options.bitrate, (options.sim_port != 0U) ? "on" : "off");
+    LOG_INF("main", "CAN on %s at %lu bit/s, simulation control %s, sensor seed %lu",
+            options.can_spec, (unsigned long)options.bitrate,
+            (options.sim_port != 0U) ? "on" : "off", (unsigned long)options.sensor_seed);
     app_start(&options.app);
 
     const uint64_t start_ns = plat_time_ns();

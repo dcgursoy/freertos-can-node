@@ -16,7 +16,9 @@
 #    posix_can_start() (test_posix_can: the rings, atomics, eventfd and abort and restart
 #    commands between the driver and the hardware thread, and simulation control served by
 #    that thread). Its threads are started inside platform code, so a search for
-#    pthread_create() in the test's source does not find it.
+#    pthread_create() in the test's source does not find it;
+#  - every Unity test in tests/platform that calls pthread_create() itself (test_posix_sensor:
+#    the sensor model read by one thread while another serves its simulation control commands).
 # The other Unity tests have one thread. plat_selftest is not run: it runs the FreeRTOS POSIX
 # port, and under ThreadSanitizer programs on that port report races inside the port's own
 # scheduler code (port.c and tasks.c: vTaskSwitchContext against xTaskGetCurrentTaskHandle,
@@ -44,7 +46,7 @@ layout_fix="run 'sudo sysctl vm.mmap_rnd_bits=28' or allow setarch -R"
 # Build targets are named after the source file; CTest names a unit test like its target and a
 # platform test platform_<name without test_>.
 mapfile -t unit_tests < <(grep -l 'pthread_create(' "$FCN_ROOT"/tests/unit/*.c | xargs -r -n1 basename | sed 's/\.c$//' | sort)
-mapfile -t platform_tests < <(grep -l 'posix_can_start(' "$FCN_ROOT"/tests/platform/test_*.c | xargs -r -n1 basename | sed 's/\.c$//' | sort)
+mapfile -t platform_tests < <(grep -l -e 'posix_can_start(' -e 'pthread_create(' "$FCN_ROOT"/tests/platform/test_*.c | xargs -r -n1 basename | sed 's/\.c$//' | sort)
 if [[ ${#unit_tests[@]} -eq 0 || ${#platform_tests[@]} -eq 0 ]]; then
     echo "tsan: found unit tests '${unit_tests[*]}' and platform tests '${platform_tests[*]}';" \
         "each list should have at least one, so the selection is broken"

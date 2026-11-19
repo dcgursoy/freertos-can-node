@@ -28,7 +28,7 @@ import time
 import can
 import pytest
 
-from fcn_tools.bus import is_status, status_gaps
+from fcn_tools.bus import is_status, status_gaps, status_queue_counts
 from fcn_tools.canbits import INTERMISSION_BITS, message_bits
 from fcn_tools.node import EXIT_OK
 from fcn_tools.timing import check_timing
@@ -113,7 +113,7 @@ def assert_every_flood_frame_accounted_for(stats: dict, sent: int) -> None:
 def test_a_flood_above_the_bus_capacity_leaves_the_status_frame_its_turn(open_link):
     link = open_link(*NODE_ARGS)
     heard, sent, _, stats = run_flood(link)
-    queue = stats["can"]["queue"]
+    queue = status_queue_counts(stats)
 
     # The status values are in order and every one the tester did not hear was replaced by its
     # successor in the node, and counted there. A host that stalls the node for more than a
@@ -128,7 +128,7 @@ def test_a_flood_above_the_bus_capacity_leaves_the_status_frame_its_turn(open_li
 def test_under_a_flood_above_the_bus_capacity_the_status_frame_keeps_its_period(open_link):
     link = open_link(*NODE_ARGS)
     heard, sent, (first_wall, last_wall), stats = run_flood(link)
-    queue = stats["can"]["queue"]
+    queue = status_queue_counts(stats)
 
     assert status_gaps(heard) == queue["superseded"]
     assert_every_flood_frame_accounted_for(stats, sent)

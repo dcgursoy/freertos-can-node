@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from fcn_tools.bus import ID_STATUS, open_bus, wait_for_id
+from fcn_tools.bus import ID_STATUS, open_bus, status_queue_counts, wait_for_id
 from fcn_tools.node import EXIT_OK
 from fcn_tools.timing import check_timing
 
@@ -38,8 +38,9 @@ def test_version_names_the_node_and_the_kernel(node_binary):
 def test_help_lists_every_option(node_binary):
     out = subprocess.run([str(node_binary), "--help"], capture_output=True, text=True, timeout=10)
     assert out.returncode == 0
-    for option in ("--can", "--bitrate", "--sim-port", "--duration-s", "--stats-json",
-                   "--tick-mode", "--irq-mode", "--log-file", "--log-level", "--version"):
+    for option in ("--can", "--bitrate", "--sim-port", "--sensor-seed", "--duration-s",
+                   "--stats-json", "--tick-mode", "--irq-mode", "--log-file", "--log-level",
+                   "--version"):
         assert option in out.stdout
 
 
@@ -53,6 +54,9 @@ def test_help_lists_every_option(node_binary):
     (["--tick-mode", "nonsense"], "invalid --tick-mode"),
     (["--irq-mode", "nonsense"], "invalid --irq-mode"),
     (["--log-level", "loud"], "invalid --log-level"),
+    (["--sensor-seed", "4294967296"], "invalid --sensor-seed"),
+    (["--sensor-seed", "-1"], "invalid --sensor-seed"),
+    (["--sensor-seed", "0x10"], "invalid --sensor-seed"),
 ])
 def test_a_bad_command_line_is_a_usage_error(node_binary, args, message):
     out = subprocess.run([str(node_binary), *args], capture_output=True, text=True, timeout=10)
@@ -74,13 +78,13 @@ def test_runs_for_the_requested_time_and_reports_statistics(start_node):
     assert stats["log_lines_dropped"] == 0
 
     tasks = {task["name"]: task for task in stats["tasks"]}
-    assert set(tasks) == {"can_rx", "ticker", "can_tx", "health", "IDLE"}
-    # Priorities as documented in app/app.c, highest first.
+    assert set(tasks) == {"can_rx", "sensor", "process", "can_tx", "health", "IDLE"}
+    # Priorities as documented in app/app_tasks.h, highest first.
     by_priority = sorted(tasks, key=lambda name: tasks[name]["priority"], reverse=True)
-    assert by_priority == ["can_rx", "ticker", "can_tx", "health", "IDLE"]
+    assert by_priority == ["can_rx", "sensor", "process", "can_tx", "health", "IDLE"]
     assert len({task["priority"] for task in tasks.values()}) == len(tasks)
     assert sum(task["run_time_us"] for task in tasks.values()) <= stats["run_time_total_us"]
-    # A node that sends one frame every 10 ms is idle nearly all the time.
+    # A node that sends a few frames every 10 ms is idle nearly all the time.
     assert tasks["IDLE"]["run_time_us"] > 0.5 * stats["run_time_total_us"]
     # Every task registered its real stack, and none of them is anywhere near its limit.
     for task in tasks.values():
@@ -200,7 +204,7 @@ def test_the_alternative_platform_modes_still_run(start_node, option, value):
     else:
         assert irq["signals_sent"] > 0 and irq["serviced_by_signal"] > 0
     # The CAN path works in every mode: one status frame per 10 ticks of the node's time.
-    assert abs(stats["can"]["controller"]["tx_frames"] - tick["count"] / 10) <= 3
+    assert abs(status_queue_counts(stats)["sent"] - tick["count"] / 10) <= 3
     # Simulated interrupt handlers never run on top of each other (docs/bug-log.md, 002).
     assert irq["max_nesting"] == (1 if value != "poll" else 0)
 

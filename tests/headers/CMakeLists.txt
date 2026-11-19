@@ -10,9 +10,10 @@
 add_library(fcn_header_check OBJECT
     check_freertos_config_h.c
     check_plat_can_h.c
+    check_plat_sensor_h.c
     check_platform_h.c)
 # For the include directories only: an object library is never linked.
-target_link_libraries(fcn_header_check PRIVATE freertos_config freertos_kernel fcn_can)
+target_link_libraries(fcn_header_check PRIVATE freertos_config freertos_kernel fcn_can fcn_bms)
 fcn_target_defaults(fcn_header_check NO_COVERAGE)
 
 # An object library that nothing links is not built by default; this makes it part of "all".

@@ -169,14 +169,20 @@ answered with `? err malformed request`.
 | `can.status` | state, error counters, fault, the counters of the model and of the transport (`transport_tx_failed` and `transport_rx_failed` among them), and how late the host carried out the model's times (`pacing_lag_*`, `wakeup_lag_*`, `rx_lag_*`; see [What the host adds to the timing](#what-the-host-adds-to-the-timing)) |
 | `can.fault none\|short\|dominant\|noack` | applies or removes a bus fault |
 | `can.inject tx\|rx <count>` | destroys the next `count` transmission attempts or received frames |
+| `sensor.status` | the sensor model's seed, whether its front end is off line, its read counters and every channel's mode (see [sensor-model.md](sensor-model.md)) |
+| `sensor.set <channel> <value>` | holds a channel of the sensor front end (`current`, `cell1`..`cell8`, `temp1`..`temp4`) at a value, which it reports as a valid reading |
+| `sensor.open <channel>` | lets the front end declare the channel invalid, as with an open sense wire |
+| `sensor.offline on\|off` | takes the whole front end off line (it answers no read) or back |
+| `sensor.clear [<channel>]` | ends the fault of one channel, or with no channel every sensor fault, off line included |
 
 `fcn_tools.simctl.SimControl` is the client the tests use. The node carries out every request
 datagram it receives and does not remember tokens, so a request repeated after a timeout can
 be carried out twice. The client therefore repeats a request only when that cannot change the
-outcome. After a timeout it resends `ping`, `can.status` and `can.fault` (each with a new
-token). It resends any command when the kernel reports that nothing was listening yet, which
-happens while the node is still starting. `can.inject` adds to the errors still to come, so it
-is sent once and waited for.
+outcome. After a timeout it resends `ping`, `can.status`, `can.fault` and every `sensor.*`
+command (each with a new token): they read a state or set one to a value, so a second delivery
+changes nothing. It resends any command when the kernel reports that nothing was listening
+yet, which happens while the node is still starting. `can.inject` adds to the errors still to
+come, so it is sent once and waited for.
 
 ## The driver's side
 
@@ -196,7 +202,11 @@ one ([posix_irq.c](../platform/posix/posix_irq.c)).
   a mailbox waits in the transmit queue ([can_txq.h](../lib/can/can_txq.h)): one slot per
   cyclic message, where a newer value replaces one that has not gone out, and a bounded FIFO
   with a timeout for frames that must not be replaced or reordered. The queue's accounting
-  is exact at every moment: produced = sent + superseded + dropped + expired + pending.
+  is exact at every moment: produced = sent + superseded + dropped + expired + pending. It
+  also keeps the counters of every cyclic slot (`can_txq_slot_stats()`: produced = sent +
+  superseded + pending per slot), which the node's statistics report per message under
+  `telemetry.messages`; the bus tests account for the status frame's values with those of its
+  slot (`fcn_tools.bus.status_queue_counts`).
 - **Abort.** `plat_can_abort_tx()` takes back the frames that were loaded before the call, as
   a mailbox abort request does on a real controller, and none that are loaded after it,
   however soon. On the host, a request travels to its mailbox through a ring. Each request
