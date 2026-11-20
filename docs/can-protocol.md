@@ -308,8 +308,9 @@ instead, and the damaged one costs only its own verdict.
 This is the state machine of PRS 6.20 with transitToInvalidExtended = false (Fig. 6.131),
 through the library functions E2E_SMCheck (SWS_E2E_00340) and E2E_SMCheckInit (SWS_E2E_00353).
 It keeps the last `window_size` verdicts of a message and counts the OKs and the errors among
-them after every verdict (E2E_SMAddStatus, PRS_E2E_00466). REPEATED, WRONGSEQUENCE and
-NONEWDATA count as neither; they act only by keeping OKs out of the window.
+them after every verdict outside NODATA (E2E_SMAddStatus, PRS_E2E_00466, Fig. 6.133). In NODATA
+no transition depends on the counts, the figure skips them, and both stay 0. REPEATED,
+WRONGSEQUENCE and NONEWDATA count as neither; they act only by keeping OKs out of the window.
 
 | State (PRS_E2E_00914) | Meaning | Leaves for | When |
 |---|---|---|---|
@@ -536,7 +537,8 @@ ways. `tests/unit/test_can_db.c` holds it to frames worked out by hand and check
 field isolation, sign extension and masking for every signal. `tests/python/test_gen_can_db.py`
 compares it with cantools on random raw values and random frames for every message, through
 `tests/tools/can_db_cli.c`. And the same Python test generates, compiles and compares the code
-for a DBC with signals of every length from 1 to 32 bits, signed and unsigned, at every bit
+for a DBC with signals of every length from 1 to 32 bits, signed and unsigned, each starting at
+two or more bit positions within a byte, and signed and unsigned signals starting at every bit
 position within a byte.
 
 ## Changing the DBC

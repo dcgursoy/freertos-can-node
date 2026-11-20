@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * The frames the node sends (app/telemetry.c).
+ * The frames the node sends (app/telemetry.c), and the uptime BMS_NodeInfo carries.
  *
  * Each frame is checked twice: byte by byte against what is worked out by hand in the comment
  * next to it, and through the receiving end, the generated unpack() and an independent
@@ -324,6 +324,54 @@ static void test_the_node_info_carries_the_version_and_the_uptime_and_sna_for_th
     TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, frame.data, 8);
 }
 
+/* ----------------------------------------------------------------------------------- uptime */
+
+/* Periods of 100 ms in 2^32 ms, rounded up: after 2^32 ms a 32-bit count of 1 ms ticks, the
+ * widest the Cortex-M3 port allows, wraps to 0. */
+#define PERIODS_IN_2_POW_32_MS ((((uint64_t)UINT32_MAX + 1U) + 99U) / 100U)
+
+/*
+ * The uptime is the number of whole seconds in the periods counted, ten periods of 100 ms to
+ * the second: counted period by period from the start to 50 periods past the point where a
+ * 32-bit millisecond tick wraps, it is right after every one of them, and exactly every tenth
+ * period completes a second. An uptime derived from such a tick count would fall back to 0
+ * there.
+ */
+static void test_the_uptime_counts_whole_seconds_past_the_wrap_of_a_32_bit_millisecond_tick(void)
+{
+    telemetry_uptime_t uptime = {.seconds = 0U, .periods = 0U};
+    const uint64_t last = PERIODS_IN_2_POW_32_MS + 50U;
+    uint64_t first_wrong = 0U; /* the first period after which the count was wrong; 0: none */
+
+    for (uint64_t period = 1U; (period <= last) && (first_wrong == 0U); period++) {
+        const bool second = telemetry_uptime_period(&uptime, 10U);
+
+        if ((second != ((period % 10U) == 0U)) || ((uint64_t)uptime.seconds != (period / 10U))) {
+            first_wrong = period;
+        }
+    }
+
+    TEST_ASSERT_EQUAL_UINT64_MESSAGE(0U, first_wrong, "the first period counted wrong");
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)(last / 10U), uptime.seconds);
+    TEST_ASSERT_GREATER_THAN_UINT32((uint32_t)((((uint64_t)UINT32_MAX + 1U) / 1000U)),
+                                    uptime.seconds);
+}
+
+/* The count wraps with its 32-bit signal, after 2^32 s; a second of one period, or of 0, is
+ * every period. */
+static void test_the_uptime_wraps_after_2_pow_32_seconds_as_its_signal(void)
+{
+    telemetry_uptime_t uptime = {.seconds = UINT32_MAX, .periods = 9U};
+
+    TEST_ASSERT_TRUE(telemetry_uptime_period(&uptime, 10U));
+    TEST_ASSERT_EQUAL_UINT32(0U, uptime.seconds);
+    TEST_ASSERT_EQUAL_UINT32(0U, uptime.periods);
+
+    TEST_ASSERT_TRUE(telemetry_uptime_period(&uptime, 1U));
+    TEST_ASSERT_TRUE(telemetry_uptime_period(&uptime, 0U));
+    TEST_ASSERT_EQUAL_UINT32(2U, uptime.seconds);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -340,5 +388,7 @@ int main(void)
     RUN_TEST(test_the_task_stats_carry_one_task_in_the_units_of_the_dbc);
     RUN_TEST(test_the_task_stats_saturate_what_their_signals_cannot_carry);
     RUN_TEST(test_the_node_info_carries_the_version_and_the_uptime_and_sna_for_the_unknown);
+    RUN_TEST(test_the_uptime_counts_whole_seconds_past_the_wrap_of_a_32_bit_millisecond_tick);
+    RUN_TEST(test_the_uptime_wraps_after_2_pow_32_seconds_as_its_signal);
     return UNITY_END();
 }

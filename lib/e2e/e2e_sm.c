@@ -13,8 +13,9 @@
  * What holds for an initialised e2e_sm_check_state_t between any two calls:
  *
  *   - window_top_index < window_size of the configuration it is used with;
- *   - ok_count and error_count are the numbers of E2E_P_OK and E2E_P_ERROR among the first
- *     window_size entries of the window, as the last call counted them;
+ *   - in NODATA, ok_count and error_count are 0: Fig. 6.133 does not count the window there;
+ *   - in INIT, VALID and INVALID, ok_count and error_count are the numbers of E2E_P_OK and
+ *     E2E_P_ERROR among the first window_size entries of the window;
  *   - sm_state is NODATA, INIT, VALID or INVALID.
  *
  * e2e_sm_check() verifies the first and the last before it writes anything, because the
@@ -107,16 +108,16 @@ static void clear_status(e2e_sm_check_state_t *state)
 
 /*
  * E2E_SMAddStatus (PRS_E2E_00466, Fig. 6.133): write the verdict at the top index, move the
- * index on with wrap-around at window_size, and count E2E_P_OK and E2E_P_ERROR over the
- * window. The figure counts over the last CurrentWindowSize entries; with one window size
- * for all states that is the whole window.
+ * index on with wrap-around at window_size, and, except in NODATA, count E2E_P_OK and
+ * E2E_P_ERROR over the window. In NODATA the figure goes from writing the verdict straight to
+ * moving the index, with the note that the window needs no evaluation there: no transition out
+ * of NODATA looks at the counts, so they keep the 0 that E2E_SMCheckInit left. The figure
+ * counts over the last CurrentWindowSize entries; with one window size for all states that is
+ * the whole window.
  */
 static void add_status(e2e_sm_check_state_t *state, const e2e_sm_config_t *config,
                        e2e_p_check_status_t status)
 {
-    uint8_t ok_count = 0U;
-    uint8_t error_count = 0U;
-
     state->window[state->window_top_index] = status;
 
     if (state->window_top_index >= (config->window_size - 1U)) {
@@ -125,18 +126,23 @@ static void add_status(e2e_sm_check_state_t *state, const e2e_sm_config_t *confi
         state->window_top_index++;
     }
 
-    for (uint32_t i = 0U; i < config->window_size; i++) {
-        if (state->window[i] == E2E_P_OK) {
-            ok_count++;
-        } else if (state->window[i] == E2E_P_ERROR) {
-            error_count++;
-        } else {
-            /* REPEATED, WRONGSEQUENCE, NONEWDATA, NOTAVAILABLE: neither */
-        }
-    }
+    if (state->sm_state != E2E_SM_NODATA) {
+        uint8_t ok_count = 0U;
+        uint8_t error_count = 0U;
 
-    state->ok_count = ok_count;
-    state->error_count = error_count;
+        for (uint32_t i = 0U; i < config->window_size; i++) {
+            if (state->window[i] == E2E_P_OK) {
+                ok_count++;
+            } else if (state->window[i] == E2E_P_ERROR) {
+                error_count++;
+            } else {
+                /* REPEATED, WRONGSEQUENCE, NONEWDATA, NOTAVAILABLE: neither */
+            }
+        }
+
+        state->ok_count = ok_count;
+        state->error_count = error_count;
+    }
 }
 
 /* The condition every transition into VALID, and staying there, depends on. */

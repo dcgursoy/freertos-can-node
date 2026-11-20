@@ -287,20 +287,21 @@ def test_a_command_stream_that_stops_times_out_and_the_last_command_stays(open_l
 
 
 def test_a_command_with_a_wrong_crc_is_not_carried_out(open_link, can_spec):
-    link = open_link("--duration-s", "2")
+    link = open_link()
     tester = open_bus(can_spec)
     try:
         sender = e2e.Sender(e2e.Config(data_id=0x0120, data_length=64))   # PackStatus's Data ID
         for _ in range(10):
             data = sender.protect(bytes([0, 0, 0, 0, 0, 0, 0, 0]))       # telemetry off
             tester.send(can.Message(arbitration_id=ID_COMMAND, data=data, is_extended_id=False))
-            # One frame per 10 heartbeats, the command's cycle time in the node's own time.
+            # One frame per 10 heartbeats, the command's cycle time in the node's own time. The
+            # node is stopped after the 10 heartbeats that follow the last frame, however late
+            # the tester was: none of the counts below depends on when the frames came.
             for _ in range(10):
                 assert wait_for_id(link.bus, ID_STATUS, timeout=5.0) is not None
     finally:
         tester.shutdown()
-    assert link.node.wait(timeout=20) == EXIT_OK
-    stats = link.node.stats()
+    stats = stats_of(link)
 
     command = stats["command"]
     assert command["frames"] == 10 and command["accepted"] == 0

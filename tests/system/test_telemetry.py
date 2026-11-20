@@ -5,7 +5,9 @@ which uses fcn_tools.e2e, an implementation of AUTOSAR E2E Profile 11 written in
 the node's lib/e2e. Every number a test compares with comes from the DBC, from the node's own
 statistics or from the documented sensor model (docs/sensor-model.md); a test that waits waits
 for frames, heartbeats or readings of the model, never for a fixed time. Wall-clock periods are
-checked only in the test marked `timing`.
+checked only in test_every_cyclic_message_keeps_its_period_on_the_wall_clock. It is marked
+`timing`, and so are the TESTER_Command tests, whose counts hold only for a tester that the host
+ran in time (check_command_cadence()).
 
 WHICH READING A FRAME CARRIES. Nothing on the bus says which sample a value of a protected
 message was built from, but its E2E counter comes close: the node advances it once for every
@@ -35,7 +37,7 @@ import can
 import pytest
 
 from fcn_tools import e2e
-from fcn_tools.bus import (collect_while, drain, is_status, open_bus, status_fields,
+from fcn_tools.bus import (collect_while, drain, is_status, open_bus, status_fields, status_gaps,
                            status_missing_since_start)
 from fcn_tools.decode import DecodedFrame, Decoder, load_database
 from fcn_tools.node import EXIT_OK, NodeProcess
@@ -267,11 +269,12 @@ class Recorder:
 
         return test
 
-    def until(self, condition: Callable[[can.Message], bool], timeout: float = 10.0) -> None:
-        """Wait until `condition` holds for a frame received from now on."""
+    def until(self, condition: Callable[[can.Message], bool], timeout: float = 10.0) -> bool:
+        """Wait until `condition` holds for a frame received from now on; False if it did not
+        within `timeout`."""
         test = self.watch(condition)
         with self._changed:
-            assert self._changed.wait_for(test, timeout), "the frames waited for did not come"
+            return self._changed.wait_for(test, timeout)
 
     def stop(self) -> list[can.Message]:
         """Stop reading, and return every frame, those still on their way included."""
@@ -325,7 +328,8 @@ def command(counter: int, telemetry_on: bool, clear_faults_seq: int,
 class CommandStream:
     """Sends TESTER_Command frames from a bus of its own, each after two heartbeats of the node:
     every 20 ms of the node's time, so that each 100 ms supervision period of the node gets
-    frames even if the tester runs up to 80 ms late."""
+    frames even if the tester runs up to 80 ms late. Whether it did is read off the recorded
+    bus afterwards (check_command_cadence())."""
 
     def __init__(self, spec: str, recorder: Recorder) -> None:
         self._bus = open_bus(spec)
@@ -339,6 +343,67 @@ class CommandStream:
 
     def close(self) -> None:
         self._bus.shutdown()
+
+
+# Whether the tester kept its pace is a question of host timing: CommandStream runs in the test
+# process, paced by the Recorder's thread, and the host can hold up either. A supervision period
+# of the node without a frame is a NONEWDATA verdict, and those can take the state machine out
+# of VALID, after which the node rightly ignores good frames (app/command.h); a test that counts
+# acceptances or asserts VALID relies on the stream having had none. The recording tells: the
+# tester's frames are on the bus between the node's heartbeats. k heartbeats between two frames
+# are at most (k + 1) * 10 ms of the node's time, so with at most 8, 90 ms, no 100 ms period
+# passed without a frame, with 10 ms to spare.
+MAX_HEARTBEATS_BETWEEN_COMMANDS = 8
+# After the last frame, with the last three checks OK for the state machine (in every test
+# here), VALID is left in the third period in a row without a frame (app/command.h), which ends
+# more than 300 ms after the frame; the node has stopped before that if its last period came at
+# most 28 after the last heartbeat before the frame: within (28 + 1) * 10 = 290 ms of it.
+MAX_HEARTBEATS_AFTER_LAST_COMMAND = 28
+
+
+def heartbeats_around_commands(frames: list[can.Message], periods: int) -> list[int]:
+    """For a recording with TESTER_Command frames: the heartbeats between each frame and the one
+    before it, from the second frame on, and last, those after the last frame until the node
+    stopped; `periods`, the statistics' sensor.periods, is the number of the node's last period.
+    Counted with the heartbeats' PeriodCounter, so that a heartbeat the node replaced or the
+    tester's socket dropped counts as well."""
+    heartbeats = [frame for frame in frames if is_status(frame)]
+    status_gaps(heartbeats, max_step=None)      # the counters run forward with the ticks
+    before: list[int] = []      # PeriodCounter of the last heartbeat heard before each frame
+    latest = 0
+    for frame in frames:
+        if is_status(frame):
+            latest = status_fields(frame)[0]
+        elif frame.arbitration_id == ID[COMMAND] and not frame.is_extended_id:
+            before.append(latest)
+    assert before, "no TESTER_Command frame on the bus"
+    assert latest <= periods, (latest, periods)
+    return [b - a for a, b in zip(before, before[1:])] + [periods - before[-1]]
+
+
+def check_command_cadence(frames: list[can.Message], periods: int,
+                          pauses: Iterable[int] = ()) -> None:
+    """A timing tolerance: the tester kept its cadence, so that every supervision period of the
+    node from the first frame to the last had a frame, except after the frames whose numbers
+    (1 for the first) are in `pauses`, where the test stops the stream on purpose. Before the
+    first frame there is nothing to keep: the state machine is NODATA, and the first good frame
+    clears its window (lib/e2e/e2e_sm.c). `periods` as for heartbeats_around_commands()."""
+    *between, _ = heartbeats_around_commands(frames, periods)
+    late = [f"{count} before frame {number}" for number, count in enumerate(between, start=2)
+            if number - 1 not in pauses and count > MAX_HEARTBEATS_BETWEEN_COMMANDS]
+    check_timing(not late, "the command stream fell behind, heartbeats " + ", ".join(late)
+                 + f" (at most {MAX_HEARTBEATS_BETWEEN_COMMANDS}): the test process, or the "
+                 "heartbeats that pace it, were held up")
+
+
+def check_stopped_in_time(frames: list[can.Message], periods: int) -> None:
+    """A timing tolerance: the test stopped the node before its state machine could leave
+    VALID for want of frames after the last one. `periods` as for
+    heartbeats_around_commands()."""
+    after = heartbeats_around_commands(frames, periods)[-1]
+    check_timing(after <= MAX_HEARTBEATS_AFTER_LAST_COMMAND,
+                 f"the node was stopped {after} heartbeats after the last command frame "
+                 f"(at most {MAX_HEARTBEATS_AFTER_LAST_COMMAND}): the test process was held up")
 
 
 # ------------------------------------------------------------------------- a recorded run
@@ -596,8 +661,9 @@ def test_task_stats_and_node_info_decode_and_agree_with_the_statistics(run):
     assert len(values) >= len(STATS_TASKS)
 
     # Node information every second: the version the statistics report, no slot and no reset
-    # cause yet (phases 3 and 4), and the seconds of the tick count when it was sent: the
-    # n-th frame is sent in the health task's period that ends at n seconds.
+    # cause yet (phases 3 and 4), and the seconds the health task has counted in its own
+    # periods (app/telemetry.h, telemetry_uptime_t): the n-th frame ends the n-th second and
+    # says n, which is at most the seconds of the final tick count.
     major, minor, patch = (int(part) for part in stats["version"].split("."))
     infos = numbered_info(run)
     assert len(infos) >= run.seconds - 1
@@ -606,7 +672,7 @@ def test_task_stats_and_node_info_decode_and_agree_with_the_statistics(run):
         assert (signals["SwMajor"], signals["SwMinor"], signals["SwPatch"]) == \
             (major, minor, patch)
         assert signals["ActiveSlot"] == "SNA" and signals["ResetCause"] == "SNA"
-        assert value.number.lo + 1 <= signals["UptimeSeconds"] <= stats["tick"]["count"] // 1000
+        assert value.number.lo + 1 == signals["UptimeSeconds"] <= stats["tick"]["count"] // 1000
 
 
 # ------------------------------------------------------------------------- schedulability
@@ -831,6 +897,7 @@ def test_each_sensor_fault_shows_as_not_available_in_the_next_frame_and_clears_a
 # ----------------------------------------------------------------------- TESTER_Command
 
 
+@pytest.mark.timing
 def test_telemetry_off_silences_exactly_the_protected_messages_and_on_brings_them_back(
         open_link, can_spec):
     link = open_link()
@@ -864,6 +931,9 @@ def test_telemetry_off_silences_exactly_the_protected_messages_and_on_brings_the
     print(command_stats)
     print({name: run.message(name) for name in CYCLIC})
 
+    # The counts of frames acted on and the final state hold for a stream that kept its pace.
+    check_command_cadence(frames, stats["sensor"]["periods"])
+    check_stopped_in_time(frames, stats["sensor"]["periods"])
     assert command_stats["frames"] == tester.sent
     assert command_stats["status"]["OK"] == tester.sent and command_stats["check_errors"] == 0
     assert command_stats["accepted"] == tester.sent - 2 and command_stats["ignored"] == 2
@@ -940,6 +1010,7 @@ BAD_FRAMES = (
 )
 
 
+@pytest.mark.timing
 def test_frames_that_fail_the_check_are_counted_and_never_acted_on(open_link, can_spec):
     link = open_link()
     recorder = Recorder(link.bus, [*link.before_first_status, link.first_status])
@@ -954,11 +1025,14 @@ def test_frames_that_fail_the_check_are_counted_and_never_acted_on(open_link, ca
     finally:
         tester.close()
     assert link.node.stop() == EXIT_OK
-    recorder.stop()
+    frames = recorder.stop()
     stats = link.node.stats()
     command_stats = stats["command"]
     print(command_stats)
 
+    # The counts of frames acted on and the final state hold for a stream that kept its pace.
+    check_command_cadence(frames, stats["sensor"]["periods"])
+    check_stopped_in_time(frames, stats["sensor"]["periods"])
     statuses = [status for *_, status, _ in BAD_FRAMES]
     for status in ("OK", "OKSOMELOST", "REPEATED", "WRONGSEQUENCE", "ERROR"):
         assert command_stats["status"][status] == statuses.count(status), (status, command_stats)
@@ -981,6 +1055,7 @@ def test_frames_that_fail_the_check_are_counted_and_never_acted_on(open_link, ca
         assert stats["telemetry"]["messages"][name]["suppressed"] == 0, name
 
 
+@pytest.mark.timing
 def test_a_command_stream_that_stops_is_not_trusted_until_it_has_proved_itself_again(
         open_link, can_spec):
     link = open_link()
@@ -996,15 +1071,20 @@ def test_a_command_stream_that_stops_is_not_trusted_until_it_has_proved_itself_a
         # come back are not acted on, the third is, and it switches the telemetry off.
         for counter in (5, 6, 7):
             tester.send(command(counter, False, 2))
-        recorder.until(heartbeats_without(PROTECTED, 2 * EVERY["temps"]))
+        switched_off = recorder.until(heartbeats_without(PROTECTED, 2 * EVERY["temps"]))
     finally:
         tester.close()
     assert link.node.stop() == EXIT_OK
-    recorder.stop()
+    frames = recorder.stop()
     stats = link.node.stats()
     command_stats = stats["command"]
     print(command_stats)
 
+    # Whether the third frame back is acted on, and the counts, depend on a stream that kept
+    # its pace within each of its two parts; the final state on a node stopped in time.
+    check_command_cadence(frames, stats["sensor"]["periods"], pauses=(5,))
+    assert switched_off, "the third frame after the pause did not switch the telemetry off"
+    check_stopped_in_time(frames, stats["sensor"]["periods"])
     assert command_stats["frames"] == 8 and command_stats["status"]["OK"] == 8
     assert command_stats["status"]["NONEWDATA"] >= 3
     assert command_stats["accepted"] == 4 and command_stats["ignored"] == 4

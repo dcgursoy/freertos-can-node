@@ -3,17 +3,24 @@
 
 status_gaps() is what tells a test that a status value waited in a mailbox through a bus
 fault (tests/system/test_can_faults.py) or that values went missing without the node counting
-them (tests/system/test_can_link.py); the filters decide which frames count at all."""
+them (tests/system/test_can_link.py); the filters decide which frames count at all. A test
+can only tell the node's losses from its own if its bus loses nothing unseen: open_bus() gives
+both transports the same receive buffer, and receive_overflow() counts what did not fit."""
 from __future__ import annotations
 
+import os
+import socket
 import struct
 import uuid
+from pathlib import Path
 
 import can
 import pytest
 
+from fcn_tools import udpbus
 from fcn_tools.bus import (ID_PING, ID_PONG, ID_STATUS, STATUS_MAX_STEP, STATUS_PERIOD_TICKS,
-                           collect_count, drain, is_pong, is_status, status_fields, status_gaps,
+                           BusReader, collect_count, drain, is_pong, is_status, open_bus,
+                           receive_overflow, status_fields, status_gaps,
                            status_missing_since_start, status_publish_lateness, wait_for_id)
 
 
@@ -174,3 +181,74 @@ def test_drain_reads_everything_that_is_waiting(virtual_pair):
         sender.send(status(counter))
     assert [status_fields(f)[0] for f in drain(receiver, quiet=0.05)] == list(range(1, 21))
     assert drain(receiver, quiet=0.05) == []
+
+
+def test_a_bus_reader_returns_what_came_before_and_everything_it_read(virtual_pair):
+    sender, receiver = virtual_pair
+    with BusReader(receiver, [status(1)]) as reader:
+        for counter in range(2, 21):
+            sender.send(status(counter))
+    # Read in its thread or, for frames still on their way when it stopped, by drain().
+    assert [status_fields(f)[0] for f in reader.frames] == list(range(1, 21))
+    assert reader.stop() is reader.frames
+
+
+def test_a_bus_reader_left_by_an_exception_stops_reading(virtual_pair):
+    sender, receiver = virtual_pair
+    with pytest.raises(KeyError):
+        with BusReader(receiver) as reader:
+            raise KeyError("the test failed")
+    sender.send(status(1))
+    assert [status_fields(f)[0] for f in drain(receiver, quiet=0.05)] == [1]
+    assert reader.frames == []
+
+
+# ----------------------------------------------------------- the receive buffer of a tester
+
+
+def socket_of(bus: can.BusABC) -> socket.socket:
+    """A handle of its own on the socket of `bus` (a duplicate of its descriptor): an option
+    read or set through it is the socket's. The caller closes it."""
+    return socket.socket(fileno=os.dup(bus.fileno()))
+
+
+def test_a_bus_of_either_transport_gets_the_receive_buffer_of_the_udp_bus(can_spec):
+    try:
+        rmem_max = int(Path("/proc/sys/net/core/rmem_max").read_text())
+    except OSError:
+        pytest.skip("net.core.rmem_max cannot be read here")
+    bus = open_bus(can_spec)
+    try:
+        with socket_of(bus) as sock:
+            granted = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        # socket(7): the kernel doubles the value that is set, and caps the request at
+        # rmem_max.
+        assert granted == 2 * min(udpbus.RECEIVE_BUFFER_BYTES, rmem_max)
+    finally:
+        bus.shutdown()
+
+
+def test_receive_overflow_counts_every_frame_that_did_not_fit(can_spec):
+    sender, receiver = open_bus(can_spec), open_bus(can_spec)
+    try:
+        # Room for a handful of frames (the kernel's least buffer is a few kilobytes).
+        with socket_of(receiver) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        burst = 200
+        for number in range(burst):
+            sender.send(can.Message(arbitration_id=0x123, data=struct.pack("<I", number),
+                                    is_extended_id=False))
+        arrived = [struct.unpack("<I", bytes(m.data))[0] for m in drain(receiver, quiet=0.1)]
+        # What fitted is the beginning of the burst, in order; every frame after that was
+        # dropped by the kernel, and counted.
+        assert 0 < len(arrived) < burst
+        assert arrived == list(range(len(arrived)))
+        assert receive_overflow(receiver) == burst - len(arrived)
+    finally:
+        sender.shutdown()
+        receiver.shutdown()
+
+
+def test_receive_overflow_needs_a_bus_with_a_socket(virtual_pair):
+    with pytest.raises(TypeError, match="no socket"):
+        receive_overflow(virtual_pair[0])

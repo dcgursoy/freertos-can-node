@@ -25,8 +25,8 @@
  * bus, and hand every frame it built to the bus, or the receiver sees a counter jump.
  *
  * CONTEXT. No operating system, no locks. A telemetry_sender_t belongs to the one task that
- * builds the protected messages; the builders of the other messages keep no state and may be
- * called from any task.
+ * builds the protected messages, a telemetry_uptime_t to the one that sends BMS_NodeInfo; the
+ * builders of the other messages keep no state and may be called from any task.
  */
 #ifndef FCN_TELEMETRY_H
 #define FCN_TELEMETRY_H
@@ -52,6 +52,18 @@ typedef enum {
 typedef struct {
     e2e_p11_protect_state_t e2e[TELEMETRY_PROTECTED_MESSAGES];
 } telemetry_sender_t;
+
+/**
+ * The uptime BMS_NodeInfo carries: whole seconds, counted by the task that sends the message
+ * from its own periods. It is not taken from the kernel's tick count, whose width the port
+ * chooses: the Cortex-M3 port allows at most 32 bits, and a 32-bit count of 1 ms ticks wraps
+ * after 2^32 ms, 49.7 days. This count wraps after 2^32 s, 136 years, as the 32-bit
+ * UptimeSeconds does. All zero before the first period.
+ */
+typedef struct {
+    uint32_t seconds; /**< whole seconds counted */
+    uint32_t periods; /**< periods counted towards the next second */
+} telemetry_uptime_t;
 
 /** One task's figures for BMS_TaskStats, in the units the node measures them in. */
 typedef struct {
@@ -104,5 +116,10 @@ bool telemetry_task_stats(const telemetry_task_t *task, can_frame_t *frame);
  *  seconds. Returns false only if packing refused. */
 bool telemetry_node_info(uint8_t sw_major, uint8_t sw_minor, uint8_t sw_patch, uint32_t uptime_s,
                          can_frame_t *frame);
+
+/** One period of the counting task has ended; `periods_per_second` of them (at least 1) make a
+ *  second. Returns true if this period completed a second, which uptime->seconds then
+ *  includes. */
+bool telemetry_uptime_period(telemetry_uptime_t *uptime, uint32_t periods_per_second);
 
 #endif /* FCN_TELEMETRY_H */

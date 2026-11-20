@@ -36,14 +36,15 @@ size meant for the target; on the host each task runs on a pthread stack of its 
 platform measures ([README](../README.md#what-phase-0-contains)).
 
 **Rate-monotonic order, with one exception.** A task with a shorter period has the higher
-priority: `can_rx` (frames can come every 47 µs) above `sensor` and `process` (10 ms) above
-`health` (100 ms). `sensor` and `process` share a period; `sensor` is above, because `process`
-waits for its samples. The exception is `can_tx`, which is released by every frame it loads and
-so more often than the tasks above it. It runs below the tasks that produce the frames on
-purpose: a producer is never preempted by its own output, and the frames a period produces go
-out together. The design notes said the exception would be `can_rx`; modelled as a sporadic task
-at its shortest frame time, `can_rx` is in rate-monotonic order, and the task that is not is
-`can_tx`. The response-time analysis below holds for any fixed priorities and is the verdict.
+priority: `can_rx` (modelled per tick, T = 1 ms; frames can come every 47 µs) above `sensor` and
+`process` (10 ms) above `health` (100 ms). `sensor` and `process` share a period; `sensor` is
+above, because `process` waits for its samples. The exception is `can_tx`, which is released by
+every frame it loads and so more often than the tasks above it. It runs below the tasks that
+produce the frames on purpose: a producer is never preempted by its own output, and the frames a
+period produces go out together. The design notes said the exception would be `can_rx`;
+modelled by its demand per tick (T = 1000 µs, see below), `can_rx` has a period no longer than
+that of any task below it and is in rate-monotonic order; the task that is not is `can_tx`. The
+response-time analysis below holds for any fixed priorities and is the verdict.
 
 ## Communication between the tasks
 
@@ -112,10 +113,15 @@ Every kernel object of the application is allocated statically (`xTaskCreateStat
 
 The heartbeat comes from the sensor task because its two numbers describe that task: the
 number of its period and the tick it was released in. The sensor task is the highest-priority
-periodic task and is released by the tick alone, so the heartbeat keeps the timing of phase 1's
-status frame and says that the node's time base runs, whatever the processing chain does. A
-processing task that stops shows on the bus by itself: its protected messages stop, and their
-receivers' end-to-end checks time out.
+periodic task and is released by the tick alone, so the numbers keep the timing of phase 1's
+status frame. The frame reaches the bus only when `can_tx` loads it, and `can_tx` (3) runs below
+`process` (4): the heartbeat goes out after the processing job of its period, and a heartbeat on
+the bus says that the sensor task and `can_tx` both run. A processing task that blocks shows on
+the bus by itself: its protected messages stop while the heartbeat goes on, and their receivers'
+end-to-end checks time out. A processing job that does not end keeps `can_tx` from running, as
+any task at priority 3 or above that keeps the CPU does: the heartbeat then stops with every
+other frame of the node, which a receiver cannot tell from a time base that stopped. Detecting
+that is left to the watchdogs of phase 3.
 
 **The way back: TESTER_Command.** `can_rx` owns the command receiver
 ([app/command.c](../app/command.c)): it checks every TESTER_Command frame on arrival (AUTOSAR E2E
@@ -200,12 +206,25 @@ as app/task_table.c applies them:
   covered, and the kernel's tick, `tick_irq` (8), periodic with T = 1000 µs
   (`configTICK_RATE_HZ` is 1000).
 - **`can_rx` and `can_tx`** are released by events that can come far more often than once per
-  tick, so each is modelled by its demand per tick: `can_rx` takes at most 32 frames per
-  activation (`CAN_IO_RX_BATCH`) and with a full batch waits for the next tick, and `can_tx` has
-  at most 22 bus events plus the 7 cyclic messages per tick. In any window this is at least the
-  work the frames of that window cause, so the interference they put on the tasks below is an
-  upper bound. Modelled per event instead (T = 47 µs), `can_tx` would be unschedulable, because it
-  runs below `sensor` and `process` by design.
+  tick, so each is modelled by its demand per tick: one job per tick (T = 1000 µs) that does what
+  any 1000 µs can ask of the task. Every wake-up of either is one pass of its loop in
+  [app/can_io.c](../app/can_io.c), so the budget counts passes as well as frames. At 1 Mbit/s at
+  most 22 frames end on the bus in any 1000 µs, one per 47 µs.
+  - `can_rx`: at most one pass per received frame and one for the receive cycle, 23 passes of
+    3 µs; 22 frames of 4 µs; the receive cycle's 12 µs. 169 µs.
+  - `can_tx`: at most one pass per frame that ends on the bus (the transmit-done of one of the
+    node's frames, or the pong that a ping makes `can_rx` queue), one for `sensor` and `process`
+    together (it runs only once both have blocked), two for `health` (which is below it, so each
+    publish wakes it at once, and BMS_TaskStats and BMS_NodeInfo can fall into one period) and
+    one timeout of its wait: 26 passes of 13 µs. A load and a transmit-done for each of the
+    node's frames that ends, and a load for each of its 3 mailboxes: 47 events of 3 µs. 479 µs.
+
+  A busy period of a lower task begins with no work of theirs left over, so all they do in it
+  is caused within it, at most one budget per 1000 µs: the interference the analysis charges is
+  an upper bound. The model is that of a bus without faults, as for `can_irq`: error frames, the
+  controller's state changes and the transmit queue's aborts of frames in the mailboxes are
+  outside it. The derivation is in app/task_table.c. Modelled per event instead (T = 47 µs),
+  `can_tx` would be unschedulable, because it runs below `sensor` and `process` by design.
 - **A task released by another task** is periodic with the releasing task's period, and its
   release jitter is the releasing task's worst-case response time (Audsley et al. 1993, section
   4). `process` is released by the sensor task's sample: T = 10 ms and J = 2000 µs, the sensor
@@ -269,10 +288,10 @@ python -m fcn_tools.sched task_table.json
 ```
 
 ```
-Utilisation U = sum of C/T = 0.3136
+Utilisation U = sum of C/T = 0.7216
   necessary          U <= 1                                       holds
   Liu and Layland    U <= n(2^(1/n) - 1) = 0.7286 for n = 7       not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx; priorities not in rate-monotonic order
-  hyperbolic         prod(C/T + 1) = 1.3483 <= 2                  not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx; priorities not in rate-monotonic order
+  hyperbolic         prod(C/T + 1) = 1.8590 <= 2                  not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx; priorities not in rate-monotonic order
 
 Priority order (a higher number is more urgent)
   rate-monotonic      no: can_tx (T 1000, priority 3) is not above sensor (T 10000, priority 5) (and 1 more pair(s))
@@ -281,11 +300,11 @@ Priority order (a higher number is more urgent)
   task      prio  kind           T       D    C     J   B     R  slack  job  verdict
   can_irq      9  sporadic      47      47    2     0  20    22     25  1/1  meets
   tick_irq     8  periodic    1000    1000    3     0  20    25    975  1/1  meets
-  can_rx       6  sporadic    1000    1000  140     0  20   171    829  1/1  meets
-  sensor       5  periodic   10000    2000  100     0  20   275   1725  1/1  meets
-  process      4  periodic   10000   10000  150  2000  25  2438   7562  1/1  meets
-  can_tx       3  sporadic    1000    1000  100     0  20   537    463  1/1  meets
-  health       2  periodic  100000  100000  300     0   0   829  99171  1/1  meets
+  can_rx       6  sporadic    1000    1000  169     0  20   202    798  1/1  meets
+  sensor       5  periodic   10000    2000  100     0  20   306   1694  1/1  meets
+  process      4  periodic   10000   10000  150  2000  25  2467   7533  1/1  meets
+  can_tx       3  sporadic    1000    1000  479     0  20   963     37  1/1  meets
+  health       2  periodic  100000  100000  300     0   0  1936  98064  1/1  meets
 
 Verdict: schedulable: every task meets its deadline
 ```
@@ -296,11 +315,12 @@ applicable, as expected for this table: the sensor task's deadline is shorter th
 the processing task has release jitter, the critical sections and the pack mutex mean blocking,
 and `can_tx` breaks rate-monotonic order. The response-time analysis is the verdict: with the
 design budgets, every task meets its deadline. The smallest margin relative to its deadline is
-`can_tx`'s, 463 of 1000 µs; the processing task's response, 2438 µs from the tick, is mostly the
-2000 µs of release jitter that the sensor task's deadline allows it. The largest blocking term,
-20 µs, is the health task's scheduler suspension, which the analysis counts against the
-interrupts as well, a pessimistic choice for `vTaskSuspendAll()`, which does not mask
-interrupts.
+`can_tx`'s, 37 of 1000 µs. That margin is thin, and most of `can_tx`'s 479 µs is what its
+passes cost whatever they carry: 338 µs, 13 µs for each of 26. The processing task's response,
+2467 µs from the tick, is mostly the 2000 µs of release jitter that the sensor task's deadline
+allows it. The largest blocking term, 20 µs, is the health task's scheduler suspension, which
+the analysis counts against the interrupts as well, a pessimistic choice for
+`vTaskSuspendAll()`, which does not mask interrupts.
 
 ### The model, and where the POSIX port leaves it
 

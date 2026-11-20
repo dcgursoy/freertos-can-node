@@ -318,13 +318,16 @@ static void test_check_refuses_wrong_input_and_changes_nothing(void)
  * The transitions
  * ---------------------------------------------------------------------------------------- */
 
-/* NODATA stays NODATA on ERROR and NONEWDATA, however many. */
+/* NODATA stays NODATA on ERROR and NONEWDATA, however many, and does not count the window
+ * (Fig. 6.133): both counts stay 0, although ERRORs fill it. */
 static void test_nodata_ignores_errors_and_missing_data(void)
 {
     start();
 
     for (unsigned int i = 0U; i < 40U; i++) {
         ASSERT_STATE_MESSAGE(E2E_SM_NODATA, feed(((i % 3U) == 0U) ? ERR : NONEW), at("step", i));
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(0U, s_sm.ok_count, at("step", i));
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(0U, s_sm.error_count, at("step", i));
     }
 }
 
@@ -523,8 +526,9 @@ static void test_invalid_tests_for_valid_before_clearing_on_an_error(void)
 /*
  * The state machine as the header's table says, with the window kept another way: every
  * verdict since the last clearing in one long array, and the counts taken over its last
- * window_size entries (missing ones are NOTAVAILABLE). No ring and no top index, so a fault in
- * the ring arithmetic of the code under test shows as a difference.
+ * window_size entries (missing ones are NOTAVAILABLE), in every state but NODATA, where they
+ * stay 0 (Fig. 6.133). No ring and no top index, so a fault in the ring arithmetic of the code
+ * under test shows as a difference.
  */
 #define REFERENCE_HISTORY 4096U
 
@@ -551,14 +555,17 @@ static void reference_step(reference_t *ref, const e2e_sm_config_t *config,
     TEST_ASSERT_TRUE(ref->length < REFERENCE_HISTORY);
     ref->history[ref->length] = verdict;
     ref->length++;
-    ref->ok_count = 0U;
-    ref->error_count = 0U;
 
-    for (size_t back = 0U; (back < config->window_size) && (back < ref->length); back++) {
-        const e2e_p_check_status_t v = ref->history[ref->length - 1U - back];
+    if (ref->state != E2E_SM_NODATA) {
+        ref->ok_count = 0U;
+        ref->error_count = 0U;
 
-        ref->ok_count = (uint8_t)(ref->ok_count + ((v == OK) ? 1U : 0U));
-        ref->error_count = (uint8_t)(ref->error_count + ((v == ERR) ? 1U : 0U));
+        for (size_t back = 0U; (back < config->window_size) && (back < ref->length); back++) {
+            const e2e_p_check_status_t v = ref->history[ref->length - 1U - back];
+
+            ref->ok_count = (uint8_t)(ref->ok_count + ((v == OK) ? 1U : 0U));
+            ref->error_count = (uint8_t)(ref->error_count + ((v == ERR) ? 1U : 0U));
+        }
     }
 
     switch (ref->state) {

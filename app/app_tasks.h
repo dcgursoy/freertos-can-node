@@ -16,7 +16,8 @@
  *                                                                  ends the run
  *
  * Rate-monotonic order holds for the tasks with a period of their own (sensor above health)
- * and for the receive task, whose frames can come every 47 us. The transmit task is the
+ * and for the receive task, modelled by its demand per tick (task_table.c): a period of 1 ms,
+ * no longer than that of any task below it. The transmit task is the
  * exception, on purpose: it is released by every frame it has to load, more often than the
  * tasks above it, and it runs below the tasks that produce the frames so that a producer is
  * never preempted by its own output. The response-time analysis, which holds for any fixed

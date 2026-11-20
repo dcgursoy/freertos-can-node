@@ -264,3 +264,19 @@ bool telemetry_node_info(uint8_t sw_major, uint8_t sw_minor, uint8_t sw_patch, u
 
     return can_db_bms_node_info_pack(&msg, frame->data, sizeof(frame->data));
 }
+
+bool telemetry_uptime_period(telemetry_uptime_t *uptime, uint32_t periods_per_second)
+{
+    bool second = false;
+
+    uptime->periods++;
+
+    /* At least: a periods_per_second of 0 counts as 1. */
+    if (uptime->periods >= periods_per_second) {
+        uptime->periods = 0U;
+        uptime->seconds++; /* after 2^32 s back to 0, as UptimeSeconds */
+        second = true;
+    }
+
+    return second;
+}

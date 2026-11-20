@@ -20,9 +20,11 @@
  * Fig. 6.131): they act only by keeping OKs out of the window.
  *
  * WINDOW. The last window_size verdicts are kept in a ring that starts out filled with
- * E2E_P_NOTAVAILABLE. After every new verdict the OKs and the errors in the ring are counted
- * (E2E_SMAddStatus, PRS_E2E_00466, Fig. 6.133); the transitions compare these two counts with
- * the limits of the current state.
+ * E2E_P_NOTAVAILABLE. After every new verdict outside NODATA the OKs and the errors in the ring
+ * are counted (E2E_SMAddStatus, PRS_E2E_00466, Fig. 6.133); the transitions compare these two
+ * counts with the limits of the current state. In NODATA the verdict goes into the ring but
+ * nothing is counted, as Fig. 6.133 has it: no transition out of NODATA depends on the counts,
+ * and both stay 0.
  *
  * STATES AND TRANSITIONS (PRS_E2E_00345 with transitToInvalidExtended = false, Fig. 6.131):
  *
@@ -126,8 +128,9 @@ typedef struct {
 /**
  * E2E_SMCheckStateType (PRS_E2E_00913) without NoDataInitCount. Statically allocated by the
  * caller, one per received message; written only by the two functions below. ok_count and
- * error_count may be read for diagnosis: they are the counts of the window after the last
- * call, as the transitions saw them.
+ * error_count may be read for diagnosis: in NODATA both are 0 (Fig. 6.133 counts nothing
+ * there); in the other states they are the counts of the window after the last call, as the
+ * transitions saw them.
  */
 typedef struct {
     e2e_p_check_status_t window[E2E_SM_WINDOW_MAX]; /**< ProfileStatusWindow; the first

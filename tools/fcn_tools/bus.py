@@ -7,15 +7,25 @@ The node and every tool name a bus the same way:
     socketcan:vcan0     a Linux SocketCAN interface
 
 so a test or a script written against this module runs unchanged on both.
+
+A frame that a tester has not read yet waits in its socket's receive buffer, and one that
+arrives while the buffer is full is dropped by the kernel. open_bus() gives a socket of either
+transport the same buffer (fcn_tools.udpbus.RECEIVE_BUFFER_BYTES), and receive_overflow() tells
+how many frames did not fit. BusReader reads a bus in a thread of its own, so that frames only
+pile up while the whole test process is held up.
 """
 from __future__ import annotations
 
+import socket
 import struct
+import threading
 import time
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterable, Iterator
 
 import can
+
+from .udpbus import RECEIVE_BUFFER_BYTES, UdpBus, socket_drops
 
 DEFAULT_UDP_PORT = 29500
 
@@ -33,8 +43,84 @@ def open_bus(spec: str, **kwargs) -> can.BusABC:
     if kind == "socketcan":
         if not argument:
             raise ValueError("socketcan needs an interface, for example socketcan:vcan0")
-        return can.Bus(interface="socketcan", channel=argument, **kwargs)
+        bus = can.Bus(interface="socketcan", channel=argument, **kwargs)
+        try:
+            # The receive buffer UdpBus asks for. The kernel caps the request at
+            # net.core.rmem_max and doubles it; with the stock 212,992 bytes a socket then
+            # holds 476 unread frames instead of the 238 of its default buffer, as many as a
+            # UdpBus (both measured on Linux 6.6).
+            bus.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECEIVE_BUFFER_BYTES)
+        except BaseException:
+            bus.shutdown()
+            raise
+        return bus
     raise ValueError(f"unknown bus '{spec}': use udp[:<base port>] or socketcan:<interface>")
+
+
+def receive_overflow(bus: can.BusABC) -> int:
+    """Frames the kernel dropped because the receive buffer of `bus`, a bus of open_bus(), was
+    full: frames the reader lost on its own side, because nothing read the bus for longer than
+    the buffer lasts. Exact at the time of the call, on both transports: UdpBus.rx_overflow,
+    and on SocketCAN the drop counter of the socket, which counts every frame that did not
+    fit (measured: frames received plus frames dropped were the frames sent, Linux 6.6)."""
+    if isinstance(bus, UdpBus):
+        return bus.rx_overflow
+    sock = getattr(bus, "socket", None)
+    if not isinstance(sock, socket.socket):
+        raise TypeError(f"{type(bus).__name__} is no bus of open_bus(): no socket to ask")
+    return socket_drops(sock)
+
+
+class BusReader:
+    """Reads every frame a bus receives, in a thread of its own, from its start until stop().
+
+    A test that only reads at the end leaves everything the node sends meanwhile to the
+    socket's buffer, which holds 476 frames with the stock net.core.rmem_max (open_bus()), and
+    loses frames whenever it does something else for longer than that lasts. With a reader
+    thread only a stall of the whole test process that long can lose frames;
+    receive_overflow() says whether one did.
+
+    Use it as a context manager: the reader stops at the end of the block, and if the block
+    ended normally it takes the frames still on their way as well (stop()). `frames` is
+    complete, and safe to read, once it has stopped.
+    """
+
+    def __init__(self, bus: can.BusABC, first: Iterable[can.Message] = ()) -> None:
+        self._bus = bus
+        #: `first` (frames the caller had already read), then every frame read here.
+        self.frames: list[can.Message] = list(first)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="BusReader", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            message = self._bus.recv(timeout=0.05)
+            if message is not None:
+                self.frames.append(message)
+
+    def _end_thread(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+        if self._thread.is_alive():
+            raise RuntimeError("the reader thread did not stop")
+
+    def stop(self) -> list[can.Message]:
+        """Stop reading and return every frame, with those still on their way (drain()): call
+        it once the sender has stopped."""
+        if not self._stop.is_set():
+            self._end_thread()
+            self.frames += drain(self._bus)
+        return self.frames
+
+    def __enter__(self) -> "BusReader":
+        return self
+
+    def __exit__(self, exc_type, *_) -> None:
+        if exc_type is None:
+            self.stop()
+        else:
+            self._end_thread()   # no drain: the sender may still be running
 
 
 def socketcan_available(interface: str = "vcan0") -> bool:
@@ -100,8 +186,8 @@ def drain(bus: can.BusABC, keep: Callable[[can.Message], bool] | None = None,
           quiet: float = 0.2, timeout: float = 10.0) -> list[can.Message]:
     """Every frame the bus still holds, read until none has arrived for `quiet` seconds. Meant
     for after the node has ended: what it sent is waiting in the socket by then, and a reader
-    that the host delays still gets all of it. `timeout` only bounds a sender that never
-    stops."""
+    that the host delays still gets all of it, except what arrived unread while the socket was
+    full (receive_overflow() counts that). `timeout` only bounds a sender that never stops."""
     deadline = time.monotonic() + timeout
     frames: list[can.Message] = []
     while time.monotonic() < deadline:

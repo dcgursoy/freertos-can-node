@@ -16,9 +16,9 @@ import time
 import can
 import pytest
 
-from fcn_tools.bus import (ID_PING, collect, collect_count, drain, is_pong, is_status,
-                           status_fields, status_gaps, status_missing_since_start,
-                           status_queue_counts, wait_for)
+from fcn_tools.bus import (ID_PING, BusReader, collect, collect_count, is_pong, is_status,
+                           receive_overflow, status_fields, status_gaps,
+                           status_missing_since_start, status_queue_counts, wait_for)
 from fcn_tools.node import EXIT_OK
 from fcn_tools.timing import check_timing
 
@@ -212,21 +212,21 @@ def test_a_bus_held_dominant_stops_all_traffic_without_bus_off(open_link):
 # ------------------------------------------------------------------------- single bit errors
 
 
+@pytest.mark.timing
 def test_destroyed_transmissions_are_repeated_and_nothing_is_lost(open_link):
     link = open_link()
-    with link.node.sim() as sim:
-        before = sim.can_status()
-        sim.can_inject("tx", 5)
-        status = wait_status(sim, lambda s: s["tx_failed"] == before["tx_failed"] + 5)
-        # Five errors add 40; every frame that got through since takes 1 off.
-        assert 0 < status["tec"] <= 40 and status["state"] == "active"
-        # Ten more frames after that, so that the run goes on well past the errors.
-        wait_status(sim, lambda s: s["tx"] >= status["tx"] + 10)
-
-    assert link.node.stop() == EXIT_OK
-    # Everything the node sent, from its first frame to its last: the tester's socket kept
-    # what it did not read during the test.
-    heard = link.before_first_status + [link.first_status] + drain(link.bus)
+    # Everything the node sends, from its first frame to its last, read while the test runs.
+    with BusReader(link.bus, [*link.before_first_status, link.first_status]) as reader:
+        with link.node.sim() as sim:
+            before = sim.can_status()
+            sim.can_inject("tx", 5)
+            status = wait_status(sim, lambda s: s["tx_failed"] == before["tx_failed"] + 5)
+            # Five errors add 40; every frame that got through since takes 1 off.
+            assert 0 < status["tec"] <= 40 and status["state"] == "active"
+            # Ten more frames after that, so that the run goes on well past the errors.
+            wait_status(sim, lambda s: s["tx"] >= status["tx"] + 10)
+        assert link.node.stop() == EXIT_OK
+    heard = reader.frames
     node_stats = link.node.stats()
     stats = node_stats["can"]
     controller, queue = stats["controller"], stats["queue"]
@@ -241,8 +241,15 @@ def test_destroyed_transmissions_are_repeated_and_nothing_is_lost(open_link):
     assert queue["dropped"] == 0 and queue["expired"] == 0
     # And nothing was lost on the way: every frame the controller completed reached the
     # tester, in order, and every status value that never left was replaced by its successor
-    # in the node and counted as such, up to the last one the node produced.
+    # in the node and counted as such, up to the last one the node produced. The tester hears
+    # all of it only if its own socket never overflowed, which takes a host that does not run
+    # the test process for as long as the socket's 476 frames last, about 1.5 s of the node's
+    # 315 frames per second: a timing miss of the tester, which says nothing about the node.
     assert stats["transport_counters"]["tx_frames"] == controller["tx_frames"]
+    lost = receive_overflow(link.bus)
+    check_timing(lost == 0, f"the tester lost {lost} of the {controller['tx_frames']} frames "
+                            "the node sent: its socket was full because the host did not run "
+                            "the test process in time, which says nothing about the node")
     assert len(heard) == controller["tx_frames"]
     status_frames = [m for m in heard if is_status(m)]
     assert status_missing_since_start(status_frames, max_step=None) == status_queue["superseded"]

@@ -101,6 +101,7 @@ __all__ = [
     "UdpBus",
     "decode",
     "encode",
+    "socket_drops",
 ]
 
 #: Base port of the bus that the node and the tools use when none is given
@@ -433,16 +434,7 @@ class UdpBus(can.BusABC):
         return self._overflow
 
     def _kernel_drops(self) -> int:
-        try:
-            counters = self._socket.getsockopt(
-                socket.SOL_SOCKET, _SO_MEMINFO, 4 * _SK_MEMINFO_VARS
-            )
-        except OSError as error:
-            raise can.CanOperationError(
-                f"the kernel does not report the socket's drop counter: {error.strerror}",
-                error.errno,
-            ) from error
-        return int(struct.unpack_from("@I", counters, 4 * _SK_MEMINFO_DROPS)[0])
+        return socket_drops(self._socket)
 
     # ---------------------------------------------------------------- python-can plumbing
 
@@ -562,6 +554,23 @@ def _bind_first_free_slot(sock: socket.socket, base_port: int) -> int:
         f"all {SLOTS} slots of the UDP bus at base port {base_port} are taken "
         f"({_LOOPBACK}:{base_port}..{base_port + SLOTS - 1})"
     )
+
+
+def socket_drops(sock: socket.socket) -> int:
+    """The kernel's drop counter of a socket (SO_MEMINFO): what it discarded because the
+    socket's receive buffer was full. Linux counts that for a SocketCAN raw socket as it does
+    for this bus's UDP one (measured on 6.6; fcn_tools.bus.receive_overflow() uses both).
+
+    :raises can.CanOperationError: if the kernel does not report it
+    """
+    try:
+        counters = sock.getsockopt(socket.SOL_SOCKET, _SO_MEMINFO, 4 * _SK_MEMINFO_VARS)
+    except OSError as error:
+        raise can.CanOperationError(
+            f"the kernel does not report the socket's drop counter: {error.strerror}",
+            error.errno,
+        ) from error
+    return int(struct.unpack_from("@I", counters, 4 * _SK_MEMINFO_DROPS)[0])
 
 
 def _kernel_timestamp(ancillary: list[tuple[int, int, bytes]]) -> float | None:

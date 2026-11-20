@@ -21,23 +21,30 @@
  *             inter-arrival time. Every bit rate the node can be started with is covered.
  *   tick_irq  The kernel's tick: periodic, 1 ms, below the CAN interrupt (rate-monotonic among
  *             the interrupts).
- *   can_rx    Released by the CAN interrupt and by the receive cycle (100 ms). It takes at most
- *             CAN_IO_RX_BATCH frames per activation and, with a full batch, waits for the next
- *             tick (can_io.c); a full bus at 1 Mbit/s delivers at most 21.3 frames per tick.
- *             So it is modelled by its demand per tick: one job per tick of CAN_IO_RX_BATCH
- *             frames plus a receive cycle. In any window this is at least the work the frames
- *             of that window cause (4 us per frame against 140 us per 1000 us), so the
- *             interference it puts on the tasks below is an upper bound.
+ *   can_rx    Released by the CAN interrupt and by the receive cycle (100 ms), far more often
+ *             than once per tick, so modelled by its demand per tick: one job per tick that
+ *             does what any 1000 us can ask of the task, counted below at RX_WCET_US.
  *   sensor    Periodic. Its deadline is 2 ms, well inside its period: the release jitter of
  *             the processing task is then bounded by it.
  *   process   Released by the sensor task's sample, so periodic with the sensor's period and a
  *             release jitter of the sensor's worst-case response time, which the sensor's
  *             deadline bounds (2 ms). Its deadline counts from the sensor's arrival: the next
  *             sample, 10 ms later.
- *   can_tx    Released by every publish and by every transmit-done event, so like the receive
- *             task modelled by its demand per tick: at most 22 frames of the bus per tick at
- *             1 Mbit/s plus the 7 cyclic messages, which can all be published in one tick.
+ *   can_tx    Released by every notification (a transmit-done interrupt, a publish, a pong put
+ *             into the queue), so like the receive task modelled by its demand per tick,
+ *             counted below at TX_WCET_US.
  *   health    Periodic.
+ *
+ * Why a budget per tick bounds what the two CAN tasks take from the tasks below them: every
+ * wake-up of either is one pass of its loop (can_io.c), and RX_WCET_US and TX_WCET_US count the
+ * most passes, frames and events that any 1000 us at PLAT_CAN_MAX_BITRATE can bring, each at
+ * its cost. A busy period of a lower task begins with no work of theirs left over, so all they
+ * do in it is caused within it: at most one budget per 1000 us, which is what the analysis
+ * charges. The model is that of a bus without faults, the bus of can_irq's model of one
+ * interrupt per frame: error frames, the controller's state changes and the aborts of frames
+ * in the mailboxes are outside it. (The transmit queue asks for aborts only after bus
+ * off, or when a frame has waited in its mailbox for a whole period of its message or for the
+ * event timeout: can_txq.h, STALE FRAMES IN A MAILBOX.)
  *
  * Blocking: every task that calls can_io (sensor, process, can_tx, health, and can_rx for the
  * pong) enters short critical sections around the transmit queue, at most 5 us; the health
@@ -50,13 +57,16 @@
 #include "can/can_bits.h"
 #include "plat_can.h"
 
-/* The shortest frame on the bus and the tick, in microseconds. */
+/* The shortest frame on the bus and the tick, in microseconds, and the most frames that can
+ * end on the bus in any 1000 us: one every 47 us at most, so 1000 / 47 = 21.3 rounded up. */
 #define SHORTEST_FRAME_BITS (44U + CAN_BITS_INTERMISSION)
 #define SHORTEST_FRAME_US   ((SHORTEST_FRAME_BITS * 1000000U) / PLAT_CAN_MAX_BITRATE)
 #define TICK_US             (1000000U / configTICK_RATE_HZ)
+#define BUS_FRAMES_PER_TICK ((TICK_US + SHORTEST_FRAME_US - 1U) / SHORTEST_FRAME_US)
 
 _Static_assert(SHORTEST_FRAME_US == 47U, "the shortest frame at 1 Mbit/s takes 47 us");
 _Static_assert(TICK_US == 1000U, "the tick is 1 ms");
+_Static_assert(BUS_FRAMES_PER_TICK == 22U, "at most 22 frames end on the bus in any 1000 us");
 /* The per-tick model of the receive task relies on one batch covering the frames a full bus
  * delivers in a tick at PLAT_CAN_MAX_BITRATE. can_io.c checks that at compile time; it is not
  * checked a second time here, so that the bug log's entry 007, which takes that check out to
@@ -70,10 +80,26 @@ _Static_assert(TICK_US == 1000U, "the tick is 1 ms");
 #define CAN_IRQ_WCET_US  2U /* read the cause register, notify one or two tasks */
 #define TICK_IRQ_WCET_US 3U /* xTaskIncrementTick() with a handful of delayed tasks */
 
-/* can_rx: 4 us per frame (out of the FIFO, dispatch, a TESTER_Command check or a pong into the
- * queue), 12 us for a receive cycle (a check with no data and a state machine step). */
-#define RX_FRAME_US 4U
-#define RX_WCET_US  ((CAN_IO_RX_BATCH * RX_FRAME_US) + 12U)
+/*
+ * can_rx, per pass of the loop in rx_task: 3 us for the wake-up, the read that finds the FIFO
+ * empty and the look at the receive cycle's time; 4 us per frame (out of the FIFO, dispatch, a
+ * TESTER_Command check or a pong into the queue); 12 us for a receive cycle (a check with no
+ * data and a state machine step).
+ *
+ * Passes in any 1000 us: every received frame ends with an interrupt whose notification wakes
+ * the task, and a notification that comes during a pass gives one more pass, not one each, so
+ * at most one pass per frame that ends on the bus, BUS_FRAMES_PER_TICK; and one for the end of
+ * a receive cycle or of the idle wait. A batch is cut, which costs a pass more, only when
+ * CAN_IO_RX_BATCH frames wait at once, at least as many as end on the bus in a tick (can_io.c
+ * checks that); the task, above every other, takes them as they come, so on this bus that
+ * does not happen. Frames: the BUS_FRAMES_PER_TICK.
+ */
+#define RX_PASS_US         3U
+#define RX_FRAME_US        4U
+#define RX_CYCLE_US        12U
+#define RX_PASSES_PER_TICK (BUS_FRAMES_PER_TICK + 1U)
+#define RX_WCET_US                                                                                 \
+    ((RX_PASSES_PER_TICK * RX_PASS_US) + (BUS_FRAMES_PER_TICK * RX_FRAME_US) + RX_CYCLE_US)
 
 /* sensor: three front-end reads 80 us, the heartbeat 10 us, the sample into the queue 10 us. */
 #define SENSOR_WCET_US     100U
@@ -85,10 +111,33 @@ _Static_assert(TICK_US == 1000U, "the tick is 1 ms");
 #define PACK_MUTEX_US   40U /* the processing task's longest hold of the pack mutex */
 #define CRITICAL_US     5U  /* the longest critical section around the transmit queue */
 
-/* can_tx: 3 us per event (a mailbox loaded or a transmit-done handled) for 22 + 7 events, and
- * 13 us for the wake-up and the poll of the queue. */
-#define TX_EVENTS_PER_TICK 29U
-#define TX_WCET_US         ((TX_EVENTS_PER_TICK * 3U) + 13U)
+/*
+ * can_tx, per pass of the loop in tx_task: 13 us for the wake-up, the look for controller
+ * events, the poll of the queue, the look for a frame to load that finds none, and the wait's
+ * next deadline; 3 us per event, a frame loaded into a mailbox or a transmit-done handled.
+ *
+ * Passes in any 1000 us: one per notification, or per timeout of the wait (a notification that
+ * comes during a pass gives one more pass, not one each):
+ *   - at most one per frame that ends on the bus, BUS_FRAMES_PER_TICK: one of the node's own
+ *     frames ends with its transmit-done interrupt; a ping makes can_rx put a pong into the
+ *     queue, which notifies can_tx; any other frame wakes it not at all;
+ *   - one for the sensor and the processing task: both are above can_tx, which runs only once
+ *     both have blocked, so the heartbeat and the protected frames of one period wake it once;
+ *   - two for the health task, which is below can_tx: can_tx runs a pass at each of its
+ *     publishes, and BMS_TaskStats and BMS_NodeInfo can fall into the same period;
+ *   - one timeout: tx_wait_ticks() never waits less than a tick.
+ * Events in any 1000 us: a transmit-done for each of the node's frames that ends on the bus, at
+ * most BUS_FRAMES_PER_TICK, and a load for each of them and for each of the
+ * CAN_IO_TX_MAILBOXES mailboxes that may be loaded with a frame that ends later.
+ */
+#define TX_PASS_US         13U
+#define TX_EVENT_US        3U
+#define TX_PASSES_PER_TICK (BUS_FRAMES_PER_TICK + 1U + 2U + 1U)
+#define TX_EVENTS_PER_TICK ((2U * BUS_FRAMES_PER_TICK) + CAN_IO_TX_MAILBOXES)
+#define TX_WCET_US         ((TX_PASSES_PER_TICK * TX_PASS_US) + (TX_EVENTS_PER_TICK * TX_EVENT_US))
+
+_Static_assert(TX_PASSES_PER_TICK == 26U, "can_tx: 22 + 1 + 2 + 1 passes in any 1000 us");
+_Static_assert(TX_EVENTS_PER_TICK == 47U, "can_tx: 2 x 22 + 3 events in any 1000 us");
 
 /* health: the task list 20 us (with the scheduler suspended), the stack figure 100 us, two
  * frames 30 us, a log line 100 us, the rest 50 us. */
@@ -101,8 +150,8 @@ _Static_assert(TICK_US == 1000U, "the tick is 1 ms");
 
 _Static_assert(SENSOR_DEADLINE_US <= (APP_SENSOR_PERIOD_MS * US_PER_MS),
                "sensor: deadline within its period");
-_Static_assert(RX_WCET_US <= TICK_US, "can_rx: one batch fits a tick");
-_Static_assert(TX_WCET_US <= TICK_US, "can_tx: the events of a tick fit a tick");
+_Static_assert(RX_WCET_US <= TICK_US, "can_rx: the passes and frames of a tick fit a tick");
+_Static_assert(TX_WCET_US <= TICK_US, "can_tx: the passes and events of a tick fit a tick");
 
 static const app_task_budget_t s_table[] = {{.name = "can_irq",
                                              .priority = CAN_IRQ_PRIORITY,

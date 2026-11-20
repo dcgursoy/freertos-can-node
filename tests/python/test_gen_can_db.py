@@ -13,9 +13,11 @@ cantools reads dbc/fcn.dbc on its own and is the oracle here. What is checked:
                    them, unpacks random frames into the values cantools decodes, and masks values
                    wider than their signals, for every message; all lines go to ONE run of it;
   the generator    on a DBC made for the purpose with signals of every length from 1 to 32 bits,
-                   signed and unsigned, at every bit position within a byte: the generated code
-                   is compiled here with the project's warning set under AddressSanitizer and
-                   UndefinedBehaviorSanitizer and compared with cantools the same way. fcn.dbc
+                   signed and unsigned, each starting at two or more bit positions within a
+                   byte, and signed and unsigned signals starting at every bit position within
+                   a byte: the generated code is compiled here with the project's warning set
+                   under AddressSanitizer and UndefinedBehaviorSanitizer and compared with
+                   cantools the same way. fcn.dbc
                    has a single signed signal, of 16 bits; sign extension from any other length
                    is only exercised here;
   the rules        each rule of the generator, fed a DBC that breaks it, reports exactly that;
@@ -869,7 +871,7 @@ def every_length_codec(tmp_path_factory):
     return binary, db, compare(binary, db, rounds=100)
 
 
-def test_the_test_dbc_has_every_length_signed_and_unsigned_at_every_phase(every_length_codec):
+def test_the_test_dbc_has_every_length_signed_and_unsigned_at_several_phases(every_length_codec):
     _, db, _ = every_length_codec
     phases: dict[tuple[int, bool], set[int]] = {}
     for message in db.messages:

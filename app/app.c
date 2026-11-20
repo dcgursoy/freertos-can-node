@@ -31,10 +31,15 @@
  *   - BMS_Heartbeat: the sensor task, first thing in each of its periods. It is the status
  *     frame of phase 1, and its two numbers describe exactly that task: the number of its
  *     period and the tick it was released in. The sensor task is the highest-priority periodic
- *     task and is released by the tick alone, so the heartbeat keeps the timing of phase 1's
- *     ticker, and it says that the node's time base runs whatever the processing chain does.
- *     A processing task that stops shows on the bus by itself: its protected messages stop,
- *     and their receivers' E2E checks time out.
+ *     task and is released by the tick alone, so the numbers keep the timing of phase 1's
+ *     ticker. The frame reaches the bus only when can_tx loads it, and can_tx runs below the
+ *     processing task: the frame goes out after the processing job of its period, and a
+ *     heartbeat on the bus says that the sensor task and can_tx both run. A processing task
+ *     that blocks shows on the bus by itself: its protected messages stop while the heartbeat
+ *     goes on, and their receivers' E2E checks time out. A processing job that does not end
+ *     keeps can_tx from running, as any task at priority 3 or above that keeps the CPU does:
+ *     the heartbeat then stops with every other frame of the node, which a receiver cannot
+ *     tell from a time base that stopped. Detecting that is left to the watchdogs of phase 3.
  *   - BMS_PackStatus, BMS_CellVoltages1/2, BMS_Temperatures: the processing task, for every
  *     sample that carries the measurements of the message (10, 20, 100 ms), protected end to
  *     end (telemetry.c), and only while the telemetry switch is on.
@@ -101,6 +106,10 @@ _Static_assert((APP_HEALTH_PERIOD_MS * APP_TASK_STATS_EVERY) == CAN_DB_BMS_TASK_
 _Static_assert((APP_HEALTH_PERIOD_MS * APP_NODE_INFO_EVERY) == CAN_DB_BMS_NODE_INFO_CYCLE_MS,
                "NodeInfo: every tenth health period");
 _Static_assert((1000U % APP_HEALTH_PERIOD_MS) == 0U, "whole health periods per second");
+/* The health task counts the uptime in whole seconds of its own periods (telemetry_uptime_t),
+ * not from the tick count, and sends it once a second: BMS_NodeInfo's period has to be one. */
+_Static_assert((APP_HEALTH_PERIOD_MS * APP_NODE_INFO_EVERY) == 1000U,
+               "NodeInfo: once a second, with the seconds the health task counts");
 
 /* The tasks BMS_TaskStats goes round, in this order (TaskIndex). */
 #define TASK_STATS_TASKS 6U
@@ -497,12 +506,13 @@ static void send_task_stats(uint32_t index)
     publish(SLOT_TASK_STATS, built, &frame, plat_time_ns());
 }
 
-static void send_node_info(void)
+/* `uptime_s`: the seconds the health task has counted (telemetry_uptime_t), which do not
+ * depend on the width of the kernel's tick count. */
+static void send_node_info(uint32_t uptime_s)
 {
-    const uint64_t seconds = (uint64_t)xTaskGetTickCount() / (uint64_t)configTICK_RATE_HZ;
     can_frame_t frame;
     const bool built = telemetry_node_info((uint8_t)FCN_VERSION_MAJOR, (uint8_t)FCN_VERSION_MINOR,
-                                           (uint8_t)FCN_VERSION_PATCH, (uint32_t)seconds, &frame);
+                                           (uint8_t)FCN_VERSION_PATCH, uptime_s, &frame);
 
     publish(SLOT_NODE_INFO, built, &frame, plat_time_ns());
 }
@@ -607,6 +617,7 @@ static void health_task(void *arg)
     TickType_t last_wake;
     uint32_t cycles = 0U;
     uint32_t next_task = 0U;
+    telemetry_uptime_t uptime = {.seconds = 0U, .periods = 0U};
 
     (void)arg;
     plat_task_enter("health");
@@ -626,9 +637,10 @@ static void health_task(void *arg)
             next_task = (next_task + 1U) % TASK_STATS_TASKS;
         }
 
-        if ((cycles % APP_NODE_INFO_EVERY) == 0U) {
-            send_node_info();
-            log_alive(cycles / (1000U / APP_HEALTH_PERIOD_MS));
+        /* Every APP_NODE_INFO_EVERY-th period ends a second (asserted at the top). */
+        if (telemetry_uptime_period(&uptime, APP_NODE_INFO_EVERY)) {
+            send_node_info(uptime.seconds);
+            log_alive(uptime.seconds);
         }
 
         const bool time_is_up = (s_config.run_seconds != 0U) &&
