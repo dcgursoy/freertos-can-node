@@ -305,7 +305,7 @@ static void test_a_fresh_model_reports_the_default_seed_and_no_fault(void)
     TEST_ASSERT_EQUAL_STRING(
         "f ok seed=1 offline=off current_reads=0 cell_reads=0 temp_reads=0 unanswered=0 "
         "current=model cell1=model cell2=model cell3=model cell4=model cell5=model cell6=model "
-        "cell7=model cell8=model temp1=model temp2=model temp3=model temp4=model",
+        "cell7=model cell8=model temp1=model temp2=model temp3=model temp4=model hang=off hung=0",
         exchange("f sensor.status"));
 
     start(4294967295U);
@@ -652,7 +652,7 @@ static void test_clear_ends_every_fault_at_once(void)
     EXPECT_TIMED_OK("c3 sensor.set current 5", "c3 ok current=5");
     EXPECT_TIMED_OK("c4 sensor.offline on", "c4 ok offline=on");
     run(s_run, 0U, 20U);
-    EXPECT_TIMED_OK("c5 sensor.clear", "c5 ok cleared=all offline=off");
+    EXPECT_TIMED_OK("c5 sensor.clear", "c5 ok cleared=all offline=off hang=off");
     run(s_run, 20U, 100U);
 
     for (uint32_t p = 20U; p < 120U; p++) {
@@ -663,7 +663,7 @@ static void test_clear_ends_every_fault_at_once(void)
     TEST_ASSERT_EQUAL_STRING(
         "c6 ok seed=42 offline=off current_reads=120 cell_reads=60 temp_reads=12 unanswered=32 "
         "current=model cell1=model cell2=model cell3=model cell4=model cell5=model cell6=model "
-        "cell7=model cell8=model temp1=model temp2=model temp3=model temp4=model",
+        "cell7=model cell8=model temp1=model temp2=model temp3=model temp4=model hang=off hung=0",
         exchange("c6 sensor.status"));
 }
 
@@ -689,7 +689,7 @@ static void test_the_status_names_every_counter_and_every_channel(void)
     TEST_ASSERT_EQUAL_STRING(
         "s6 ok seed=42 offline=on current_reads=2 cell_reads=2 temp_reads=0 unanswered=1 "
         "current=-7 cell1=model cell2=4300 cell3=model cell4=model cell5=model cell6=model "
-        "cell7=model cell8=model temp1=-123 temp2=model temp3=model temp4=open",
+        "cell7=model cell8=model temp1=-123 temp2=model temp3=model temp4=open hang=off hung=0",
         exchange("s6 sensor.status"));
 
     /* Arguments after "status" are ignored, as by can.status. */
@@ -709,7 +709,7 @@ static void test_every_command_answers_with_the_state_it_set(void)
     EXPECT_TIMED_OK("a9 sensor.clear cell5", "a9 ok cell5=model");
     EXPECT_TIMED_OK("b1 sensor.offline on", "b1 ok offline=on");
     EXPECT_TIMED_OK("b2 sensor.offline off", "b2 ok offline=off");
-    EXPECT_TIMED_OK("b3 sensor.clear", "b3 ok cleared=all offline=off");
+    EXPECT_TIMED_OK("b3 sensor.clear", "b3 ok cleared=all offline=off hang=off");
 }
 
 static void test_a_wrong_command_is_refused_with_what_was_wrong(void)
@@ -793,8 +793,202 @@ static void test_a_wrong_command_is_refused_with_what_was_wrong(void)
     TEST_ASSERT_EQUAL_STRING(
         "h7 ok seed=42 offline=off current_reads=0 cell_reads=0 temp_reads=0 unanswered=0 "
         "current=model cell1=1 cell2=model cell3=model cell4=model cell5=model cell6=model "
-        "cell7=model cell8=model temp1=model temp2=model temp3=model temp4=model",
+        "cell7=model cell8=model temp1=model temp2=model temp3=model temp4=model hang=off hung=0",
         exchange("h7 sensor.status"));
+}
+
+/* --------------------------------------------------------------------------------- the hang */
+
+/* A reader of its own: one current reading, as the sensor task would take it, while this
+ * thread plays the bench. */
+typedef struct {
+    atomic_bool done;
+    bool answered;
+    bool invalid;
+    int32_t current_ma;
+} hang_reader_t;
+
+static hang_reader_t s_reader;
+static atomic_uint s_waits; /* calls of the wait function of "sensor.hang on" */
+
+static void counting_wait(void)
+{
+    const struct timespec pause = {0, 1000000L};
+
+    (void)atomic_fetch_add(&s_waits, 1U);
+    (void)nanosleep(&pause, NULL);
+}
+
+static void *read_once(void *arg)
+{
+    hang_reader_t *reader = arg;
+
+    reader->answered = plat_sensor_read_current(&reader->current_ma, &reader->invalid);
+    atomic_store(&reader->done, true);
+    return NULL;
+}
+
+/* The value of `key`=<number> in the status reply, or -1. */
+static long status_number(const char *key)
+{
+    const char *reply = exchange("q sensor.status");
+    char pattern[32];
+    const char *at_key;
+
+    (void)snprintf(pattern, sizeof(pattern), " %s=", key);
+    at_key = strstr(reply, pattern);
+    return (at_key != NULL) ? strtol(at_key + strlen(pattern), NULL, 10) : -1L;
+}
+
+/* Wait (up to 5 s) until the status says that a read is waiting for the hang to end. */
+static void wait_until_hung(long count)
+{
+    const struct timespec pause = {0, 1000000L};
+
+    for (uint32_t i = 0U; (i < 5000U) && (status_number("hung") < count); i++) {
+        (void)nanosleep(&pause, NULL);
+    }
+
+    TEST_ASSERT_EQUAL_INT32_MESSAGE(count, status_number("hung"), "the reader is waiting");
+}
+
+/* Join the reader once the hang has been ended. It returns within 5 s if the end of the hang
+ * reached it; a defect that keeps it waiting fails here instead of hanging the test (the
+ * reader is then left behind, blocked, until the process ends). */
+static void join_reader(pthread_t thread)
+{
+    const struct timespec pause = {0, 1000000L};
+
+    for (uint32_t i = 0U; (i < 5000U) && !atomic_load(&s_reader.done); i++) {
+        (void)nanosleep(&pause, NULL);
+    }
+
+    if (!atomic_load(&s_reader.done)) {
+        TEST_FAIL_MESSAGE("the read did not return after the hang ended");
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, pthread_join(thread, NULL));
+}
+
+/* "on" and "spin": a read that starts while the front end hangs does not return, takes no
+ * reading and is counted in `hung`; "on" waits through the wait function, "spin" never calls
+ * it. Once the hang ends, the read returns the very reading a run without the hang would have
+ * given first: the model has no clock, so nothing was skipped. */
+static void hang_holds_the_read(const char *mode, bool calls_wait)
+{
+    const struct timespec settle = {0, 30000000L};
+    pthread_t thread;
+    char request[48];
+    char expected[48];
+
+    record_baseline();
+    posix_sensor_set_wait(counting_wait);
+    atomic_store(&s_waits, 0U);
+    (void)memset(&s_reader, 0, sizeof(s_reader));
+    atomic_store(&s_reader.done, false);
+
+    (void)snprintf(request, sizeof(request), "k1 sensor.hang %s", mode);
+    (void)snprintf(expected, sizeof(expected), "k1 ok hang=%s", mode);
+    EXPECT_TIMED_OK(request, expected);
+    TEST_ASSERT_EQUAL_INT(0, pthread_create(&thread, NULL, read_once, &s_reader));
+    wait_until_hung(1L);
+
+    /* Held: nothing returned and nothing read 30 ms later, the hang shown in the status. */
+    (void)nanosleep(&settle, NULL);
+    TEST_ASSERT_FALSE(atomic_load(&s_reader.done));
+    TEST_ASSERT_EQUAL_INT32(0, status_number("current_reads"));
+    (void)snprintf(expected, sizeof(expected), " hang=%s hung=1", mode);
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(exchange("k2 sensor.status"), expected), expected);
+
+    if (calls_wait) {
+        TEST_ASSERT_GREATER_THAN_UINT32(0U, atomic_load(&s_waits));
+    } else {
+        TEST_ASSERT_EQUAL_UINT32(0U, atomic_load(&s_waits));
+    }
+
+    EXPECT_TIMED_OK("k3 sensor.hang off", "k3 ok hang=off");
+    join_reader(thread);
+    TEST_ASSERT_TRUE(atomic_load(&s_reader.done));
+    TEST_ASSERT_TRUE(s_reader.answered);
+    TEST_ASSERT_FALSE(s_reader.invalid);
+    TEST_ASSERT_EQUAL_INT32(s_baseline[0].current_ma, s_reader.current_ma);
+    TEST_ASSERT_EQUAL_INT32(1, status_number("current_reads"));
+    TEST_ASSERT_EQUAL_INT32(1, status_number("hung"));
+
+    /* A read after the hang returns at once, and is not counted as hung. */
+    period_t next;
+
+    acquire(1U, &next);
+    TEST_ASSERT_TRUE(same_period(&s_baseline[1], &next));
+    TEST_ASSERT_EQUAL_INT32(1, status_number("hung"));
+    posix_sensor_set_wait(NULL);
+}
+
+static void test_a_hanging_front_end_blocks_the_read_until_it_is_released(void)
+{
+    hang_holds_the_read("on", true);
+}
+
+static void test_a_spinning_front_end_holds_the_read_without_the_wait_function(void)
+{
+    hang_holds_the_read("spin", false);
+}
+
+/* Without a wait function, "on" sleeps the thread, as in this test without a kernel. */
+static void test_without_a_wait_function_a_hang_still_holds_the_read(void)
+{
+    pthread_t thread;
+
+    posix_sensor_set_wait(NULL);
+    (void)memset(&s_reader, 0, sizeof(s_reader));
+    atomic_store(&s_reader.done, false);
+    EXPECT_TIMED_OK("w1 sensor.hang on", "w1 ok hang=on");
+    TEST_ASSERT_EQUAL_INT(0, pthread_create(&thread, NULL, read_once, &s_reader));
+    wait_until_hung(1L);
+    TEST_ASSERT_FALSE(atomic_load(&s_reader.done));
+    /* sensor.clear ends the hang with every other fault. */
+    EXPECT_TIMED_OK("w2 sensor.clear", "w2 ok cleared=all offline=off hang=off");
+    join_reader(thread);
+    TEST_ASSERT_TRUE(s_reader.answered);
+}
+
+/* A hang does not change what the front end answers once it ends: off line before the hang
+ * ends is off line after it. */
+static void test_the_hang_and_the_offline_state_are_independent(void)
+{
+    pthread_t thread;
+
+    (void)memset(&s_reader, 0, sizeof(s_reader));
+    atomic_store(&s_reader.done, false);
+    EXPECT_TIMED_OK("v1 sensor.hang spin", "v1 ok hang=spin");
+    TEST_ASSERT_EQUAL_INT(0, pthread_create(&thread, NULL, read_once, &s_reader));
+    wait_until_hung(1L);
+    EXPECT_TIMED_OK("v2 sensor.offline on", "v2 ok offline=on");
+    EXPECT_TIMED_OK("v3 sensor.hang off", "v3 ok hang=off");
+    join_reader(thread);
+    TEST_ASSERT_FALSE(s_reader.answered);
+    TEST_ASSERT_EQUAL_INT32(1, status_number("unanswered"));
+}
+
+static void test_a_wrong_hang_command_is_refused(void)
+{
+    char request[96];
+
+    TEST_ASSERT_EQUAL_STRING("j1 err usage: sensor.hang on|spin|off", exchange("j1 sensor.hang"));
+    TEST_ASSERT_EQUAL_STRING("j2 err usage: sensor.hang on|spin|off",
+                             exchange("j2 sensor.hang yes"));
+    TEST_ASSERT_EQUAL_STRING("j3 err usage: sensor.hang on|spin|off",
+                             exchange("j3 sensor.hang on off"));
+    TEST_ASSERT_EQUAL_STRING("j4 err usage: sensor.hang on|spin|off",
+                             exchange("j4 sensor.hang ON"));
+    (void)snprintf(request, sizeof(request), "j5 sensor.hang %s", "onnnnnnnnnnnnnnnnnnnnnnnn");
+    TEST_ASSERT_EQUAL_STRING("j5 err usage: sensor.hang on|spin|off", exchange(request));
+    /* Nothing changed; then a hang without a reader is shown, and no read counted as hung. */
+    EXPECT_PREFIX("j6 sensor.status", "j6 ok seed=42 offline=off ");
+    TEST_ASSERT_NOT_NULL(strstr(exchange("j7 sensor.status"), " hang=off hung=0"));
+    EXPECT_TIMED_OK("j8 sensor.hang spin", "j8 ok hang=spin");
+    TEST_ASSERT_NOT_NULL(strstr(exchange("j9 sensor.status"), " hang=spin hung=0"));
+    EXPECT_TIMED_OK("k9 sensor.hang off", "k9 ok hang=off");
 }
 
 /* ------------------------------------------------------------------- from another thread */
@@ -957,6 +1151,11 @@ int main(void)
     RUN_TEST(test_the_status_names_every_counter_and_every_channel);
     RUN_TEST(test_every_command_answers_with_the_state_it_set);
     RUN_TEST(test_a_wrong_command_is_refused_with_what_was_wrong);
+    RUN_TEST(test_a_hanging_front_end_blocks_the_read_until_it_is_released);
+    RUN_TEST(test_a_spinning_front_end_holds_the_read_without_the_wait_function);
+    RUN_TEST(test_without_a_wait_function_a_hang_still_holds_the_read);
+    RUN_TEST(test_the_hang_and_the_offline_state_are_independent);
+    RUN_TEST(test_a_wrong_hang_command_is_refused);
     RUN_TEST(test_commands_from_another_thread_reach_the_reader);
 
     (void)close(s_client);

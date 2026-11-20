@@ -20,7 +20,10 @@
  * can deliver included: checking that is the caller's job (bms_*_plausible()).
  *
  * All three functions may be called from one task only, the sensor task, and never from an
- * interrupt. They do not block: on the host each returns at once.
+ * interrupt. They do not block: on the host each returns at once, except while the test bench
+ * makes the front end hang (simulation control "sensor.hang", docs/sensor-model.md), a fault
+ * of the hardware under which a read does not return until the fault is removed. That is the
+ * fault the watchdogs are there for.
  */
 #ifndef FCN_PLAT_SENSOR_H
 #define FCN_PLAT_SENSOR_H

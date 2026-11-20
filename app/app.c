@@ -1,31 +1,47 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * The application of phase 2: one battery module measured, judged and published on CAN, and
- * commanded from the bus. The tasks, their priorities and their periods are listed in
- * app_tasks.h; this file is what they do and how they talk to each other.
+ * The application: one battery module measured, judged and published on CAN, commanded from the
+ * bus, its faults kept as diagnostic trouble codes, its tasks supervised. The tasks, their
+ * priorities and their periods are listed in app_tasks.h; this file is what they do and how
+ * they talk to each other.
  *
  *   front end --> sensor --(sample queue)--> process --> protected telemetry --> can_io --> bus
- *                   |                           |                              ^
- *                   +--> heartbeat ------------ | ---------------------------->|
- *                                               v                              |
- *                                    pack state (mutex) <-- health --> task stats, node info
- *
+ *                   |                           |   \                          ^
+ *                   +--> heartbeat ------------ | --(verdict queue)--> health -+--> BMS_Fault,
+ *                                               v                      |  ^       task stats,
+ *                                    pack state (mutex) <--------------+  |       node info
+ *                                                                         |
  *   bus --> can_rx --> TESTER_Command check (command.c) --> telemetry switch --> process
+ *                                                      \--> clear requests --> health
+ *
+ *   sensor, process, can_rx, can_tx --(alive indications)--> watchdog manager (health)
+ *                                                       health --(kick)--> hardware watchdog
  *
  * IPC
- *   - sensor -> process: a queue of APP_SAMPLE_QUEUE_LENGTH samples (bms_sample_t, copied).
+ *   - sensor -> process: a queue of APP_SAMPLE_QUEUE_LENGTH samples (app_sample_t, copied).
  *     The sensor task never waits for room: a sample the queue cannot take is counted and
  *     dropped, and the processing task sees the gap in the sequence numbers (lib/bms counts it
  *     as lost). The processing task waits for a sample with a timeout of
  *     APP_SAMPLE_TIMEOUT_MS: a timeout means the sensor task has stopped delivering
- *     (supervision), and is counted and logged.
+ *     (supervision), and is counted, logged and judged as a fault.
  *   - the pack state (lib/bms) is behind a mutex with priority inheritance: written by the
  *     processing task, read by the health task for its log line and the final statistics.
  *     Both hold it only to run lib/bms on one sample or to copy the state; frames are built
  *     from the copy, outside the lock.
- *   - the telemetry switch is written by the receive task (TESTER_Command) and read by the
- *     processing task, in short critical sections.
- *   - every frame goes out through can_io (a slot per cyclic message, app_message_slot()).
+ *   - process -> health: a queue of APP_FAULT_VERDICT_QUEUE_LENGTH verdicts on the samples
+ *     (fault_verdict_t, fault.h). The processing task never waits for room; a lost verdict is
+ *     counted. The health task works them into the DTCs in their order once per period.
+ *   - the DTCs (fault_monitor_t) have one owner, the health task: it alone works the verdicts
+ *     in, judges the CAN controller and the watchdog manager, carries out clears and sends
+ *     BMS_Fault. After every period it publishes the summary (fault_summary_t) in a critical
+ *     section; the processing task reads from it whether a fault is active, for BMS_PackStatus.
+ *   - the telemetry switch and the count of clear requests are written by the receive task
+ *     (TESTER_Command) and read by the processing and the health task, in short critical
+ *     sections.
+ *   - the alive indications of the supervised tasks go to the watchdog manager (lib/wdgm)
+ *     lock-free: wdgm_checkpoint() is one atomic addition. Everything else of the manager
+ *     belongs to the health task.
+ *   - every frame goes out through can_io (a slot per cyclic message, s_messages).
  *
  * WHO SENDS WHAT
  *   - BMS_Heartbeat: the sensor task, first thing in each of its periods. It is the status
@@ -36,15 +52,29 @@
  *     processing task: the frame goes out after the processing job of its period, and a
  *     heartbeat on the bus says that the sensor task and can_tx both run. A processing task
  *     that blocks shows on the bus by itself: its protected messages stop while the heartbeat
- *     goes on, and their receivers' E2E checks time out. A processing job that does not end
- *     keeps can_tx from running, as any task at priority 3 or above that keeps the CPU does:
- *     the heartbeat then stops with every other frame of the node, which a receiver cannot
- *     tell from a time base that stopped. Detecting that is left to the watchdogs of phase 3.
+ *     goes on, and their receivers' E2E checks time out. A task that hangs or keeps the CPU is
+ *     found by the watchdogs (SUPERVISION below).
  *   - BMS_PackStatus, BMS_CellVoltages1/2, BMS_Temperatures: the processing task, for every
  *     sample that carries the measurements of the message (10, 20, 100 ms), protected end to
  *     end (telemetry.c), and only while the telemetry switch is on.
+ *   - BMS_Fault: the health task, in every period, after the period's last change of the DTCs,
+ *     protected end to end, whatever the telemetry switch says. Nothing else changes the DTCs,
+ *     so every change goes out in the frame of the period that made it.
  *   - BMS_TaskStats, BMS_NodeInfo: the health task.
  *   - BMS_Pong: the receive task, as in phase 1.
+ *
+ * SUPERVISION. The sensor, processing, receive and transmit tasks each report an alive
+ * indication once per pass of their loop (s_supervised). The health task runs one supervision
+ * cycle of the watchdog manager per period and kicks the hardware watchdog after it while the
+ * manager allows a kick (global status OK, FAILED or EXPIRED). An entity beyond its tolerance
+ * makes the global status STOPPED at once (expired_tolerance 0): the health task records it (a
+ * log line, the DTC SUPERVISION_EXPIRED, which goes out in BMS_Fault in the same period) and
+ * kicks no more, and the hardware watchdog resets the node at most APP_WDG_TIMEOUT_MS after the
+ * last kick. The health task itself is not an entity: it is the one that kicks, so the
+ * hardware watchdog covers it. Neither is the idle task: it does nothing that could hang, and
+ * a task above it that keeps the CPU starves it as it starves the health task, whose kicks
+ * stop then. The threads of the host platform that stand for hardware (the CAN controller,
+ * the tick, the watchdog) are not tasks.
  */
 #include "app.h"
 
@@ -59,10 +89,15 @@
 #include "can_db.h"
 #include "can_io.h"
 #include "command.h"
+#include "fault.h"
 #include "log/log.h"
+#include "plat_can.h"
+#include "plat_retained.h"
 #include "plat_sensor.h"
+#include "plat_wdg.h"
 #include "platform.h"
 #include "telemetry.h"
+#include "wdgm/wdgm.h"
 
 #ifndef FCN_VERSION_MAJOR
 #define FCN_VERSION_MAJOR 0
@@ -87,7 +122,8 @@ _Static_assert((FCN_VERSION_PATCH >= 0) && (FCN_VERSION_PATCH <= 255), "SwPatch:
 #define SLOT_TEMPERATURES   4U
 #define SLOT_TASK_STATS     5U
 #define SLOT_NODE_INFO      6U
-#define SLOTS               7U
+#define SLOT_FAULT          7U
+#define SLOTS               8U
 
 _Static_assert(SLOTS == NODE_STATS_MESSAGES, "one statistics entry per cyclic message");
 _Static_assert(SLOTS <= CAN_TXQ_CYCLIC_SLOTS, "the transmit queue has a slot for each");
@@ -101,6 +137,7 @@ _Static_assert((APP_SENSOR_PERIOD_MS * APP_CELLS_EVERY) == CAN_DB_BMS_CELL_VOLTA
                "CellVoltages2: every sample with cells");
 _Static_assert((APP_SENSOR_PERIOD_MS * APP_TEMPS_EVERY) == CAN_DB_BMS_TEMPERATURES_CYCLE_MS,
                "Temperatures: every sample with temperatures");
+_Static_assert(APP_HEALTH_PERIOD_MS == CAN_DB_BMS_FAULT_CYCLE_MS, "BMS_Fault: every health period");
 _Static_assert((APP_HEALTH_PERIOD_MS * APP_TASK_STATS_EVERY) == CAN_DB_BMS_TASK_STATS_CYCLE_MS,
                "TaskStats: every second health period");
 _Static_assert((APP_HEALTH_PERIOD_MS * APP_NODE_INFO_EVERY) == CAN_DB_BMS_NODE_INFO_CYCLE_MS,
@@ -110,6 +147,24 @@ _Static_assert((1000U % APP_HEALTH_PERIOD_MS) == 0U, "whole health periods per s
  * not from the tick count, and sends it once a second: BMS_NodeInfo's period has to be one. */
 _Static_assert((APP_HEALTH_PERIOD_MS * APP_NODE_INFO_EVERY) == 1000U,
                "NodeInfo: once a second, with the seconds the health task counts");
+/* BMS_TaskStats goes in the odd periods and BMS_NodeInfo in periods divisible by
+ * APP_NODE_INFO_EVERY, which are even: a period sends BMS_Fault and at most one of the two. */
+_Static_assert(APP_TASK_STATS_EVERY == 2U, "TaskStats: the odd periods");
+_Static_assert((APP_NODE_INFO_EVERY % APP_TASK_STATS_EVERY) == 0U, "NodeInfo: even periods only");
+
+/* The hardware watchdog: a timeout the IWDG can have, several health periods long. */
+_Static_assert((APP_WDG_TIMEOUT_MS >= PLAT_WDG_TIMEOUT_MIN_MS) &&
+                   (APP_WDG_TIMEOUT_MS <= PLAT_WDG_TIMEOUT_MAX_MS),
+               "the hardware watchdog accepts the timeout");
+_Static_assert(APP_WDG_TIMEOUT_MS >= (3U * APP_HEALTH_PERIOD_MS),
+               "the kicks of a late health task do not reset the node");
+
+/* The verdict queue holds more than a health period of verdicts: one per sample, or one per
+ * timeout of the processing task's wait, which is longer than a sample period. */
+_Static_assert(APP_FAULT_VERDICT_QUEUE_LENGTH >=
+                   (2U * (APP_HEALTH_PERIOD_MS / APP_SENSOR_PERIOD_MS)),
+               "the verdicts of two health periods fit the queue");
+_Static_assert(APP_SAMPLE_TIMEOUT_MS > APP_SENSOR_PERIOD_MS, "a timeout is longer than a period");
 
 /* The tasks BMS_TaskStats goes round, in this order (TaskIndex). */
 #define TASK_STATS_TASKS 6U
@@ -153,7 +208,85 @@ static const message_info_t s_messages[SLOTS] = {
     [SLOT_TASK_STATS] = {"BMS_TaskStats", CAN_DB_BMS_TASK_STATS_ID, CAN_DB_BMS_TASK_STATS_CYCLE_MS,
                          0U, false, false},
     [SLOT_NODE_INFO] = {"BMS_NodeInfo", CAN_DB_BMS_NODE_INFO_ID, CAN_DB_BMS_NODE_INFO_CYCLE_MS, 0U,
-                        false, false}};
+                        false, false},
+    [SLOT_FAULT] = {"BMS_Fault", CAN_DB_BMS_FAULT_ID, CAN_DB_BMS_FAULT_CYCLE_MS,
+                    CAN_DB_BMS_FAULT_E2E_DATA_ID, true, false}};
+
+/*
+ * The supervised entities of the watchdog manager, one per task that must not stop, numbered as
+ * their entries below. Every entity is examined once per supervision cycle (reference_cycle 1,
+ * one health period, 100 ms) and its count is correct within the bounds
+ * expected_alive - min_margin .. expected_alive + max_margin.
+ *
+ * The lower bound of every entity is 1: the supervision is there to find a task that has
+ * stopped (it hangs, deadlocks, or waits for something that never comes), and one alive
+ * indication per 100 ms is what a running task of this set always gives. Timing within a
+ * period is the business of the overrun counters (BMS_TaskStats). The upper bounds:
+ *   - sensor, process: one indication per pass, a pass per 10 ms (the process task's also on
+ *     each timeout of its wait, every 30 ms, while the samples do not come): 10 expected, at
+ *     most 20, twice the rate of its period, so that a task whose wait no longer waits (a loop
+ *     that runs through xTaskDelayUntil or the queue at once) is found as well;
+ *   - can_rx, can_tx: a pass per wake-up, at least every 50 ms (can_io.h), at most one per
+ *     frame on the bus (2200 per 100 ms at 1 Mbit/s, task_table.c): 2 expected and the largest
+ *     upper bound a uint16_t margin gives, 65535; a lower bound only, in effect.
+ * failed_tolerance 2: two failed cycles, net of good ones in between, are tolerated, so that one
+ * pass of an event-driven task that slips past the end of a cycle is not taken for a hang. A
+ * task that stops makes the first cycle that begins after its last indication incorrect, and
+ * the third such cycle makes it EXPIRED (T + 1 = 3): 300 to 400 ms after the last indication
+ * (lib/wdgm/wdgm.h: within T + 2 reference cycles). The kick of the cycle before was the last,
+ * 200 to 300 ms after it, and the hardware watchdog resets the node APP_WDG_TIMEOUT_MS after
+ * that kick: 700 to 800 ms after the last indication, plus the health task's response times.
+ */
+typedef enum {
+    SUPERVISED_CAN_RX = 0,
+    SUPERVISED_SENSOR,
+    SUPERVISED_PROCESS,
+    SUPERVISED_CAN_TX,
+    SUPERVISED_ENTITIES
+} supervised_t;
+
+static const wdgm_entity_config_t s_supervised[SUPERVISED_ENTITIES] = {
+    [SUPERVISED_CAN_RX] = {.name = "can_rx",
+                           .expected_alive = 2U,
+                           .min_margin = 1U,
+                           .max_margin = 65533U,
+                           .reference_cycle = 1U,
+                           .failed_tolerance = 2U},
+    [SUPERVISED_SENSOR] = {.name = "sensor",
+                           .expected_alive = 10U,
+                           .min_margin = 9U,
+                           .max_margin = 10U,
+                           .reference_cycle = 1U,
+                           .failed_tolerance = 2U},
+    [SUPERVISED_PROCESS] = {.name = "process",
+                            .expected_alive = 10U,
+                            .min_margin = 9U,
+                            .max_margin = 10U,
+                            .reference_cycle = 1U,
+                            .failed_tolerance = 2U},
+    [SUPERVISED_CAN_TX] = {.name = "can_tx",
+                           .expected_alive = 2U,
+                           .min_margin = 1U,
+                           .max_margin = 65533U,
+                           .reference_cycle = 1U,
+                           .failed_tolerance = 2U}};
+
+/* expired_tolerance 0: no supervision cycle with kicks after an entity expired. The time the
+ * node has to record the failure before the reset is the hardware watchdog's timeout. */
+static const wdgm_config_t s_supervision_config = {.entities = s_supervised,
+                                                   .entity_count = (uint8_t)SUPERVISED_ENTITIES,
+                                                   .expired_tolerance = 0U};
+
+_Static_assert((uint32_t)SUPERVISED_ENTITIES <= WDGM_MAX_ENTITIES, "the manager has room");
+_Static_assert((uint32_t)SUPERVISED_ENTITIES <= (uint32_t)FAULT_NONE, "entities fit a uint8_t");
+
+/* A sample as the sensor task hands it over: lib/bms's sample, and which of its groups the
+ * front end did not answer (they are in it with every channel flagged invalid), which only the
+ * fault monitor needs to know. */
+typedef struct {
+    bms_sample_t bms;
+    uint8_t unanswered; /* BMS_SAMPLE_* */
+} app_sample_t;
 
 /* What the application did with each message. Each message has one sender, the only task
  * that writes its entry; the health task reads all of them at the end. */
@@ -172,11 +305,14 @@ static StackType_t s_process_stack[APP_TASK_STACK_WORDS];
 static StaticTask_t s_health_tcb;
 static StackType_t s_health_stack[APP_TASK_STACK_WORDS];
 
-/* The queue's storage as an array of its items: the right size and alignment by construction.
+/* The queues' storage as arrays of their items: the right size and alignment by construction.
  * The kernel takes it as bytes (a conversion MISRA rule 11.3 permits, to a character type). */
 static StaticQueue_t s_sample_queue_state;
-static bms_sample_t s_sample_queue_storage[APP_SAMPLE_QUEUE_LENGTH];
+static app_sample_t s_sample_queue_storage[APP_SAMPLE_QUEUE_LENGTH];
 static QueueHandle_t s_sample_queue;
+static StaticQueue_t s_verdict_queue_state;
+static fault_verdict_t s_verdict_queue_storage[APP_FAULT_VERDICT_QUEUE_LENGTH];
+static QueueHandle_t s_verdict_queue;
 
 static StaticSemaphore_t s_pack_mutex_state;
 static SemaphoreHandle_t s_pack_mutex;
@@ -192,15 +328,28 @@ static node_process_stats_t s_process;
 static bms_pack_t s_pack;
 static telemetry_sender_t s_sender;
 
-/* Written by the health task. */
+/* Written by the health task: its overruns, the DTCs and the counter of BMS_Fault, the state
+ * of the watchdog manager (but for the alive counters, see SUPERVISION), and what the
+ * supervision saw. */
 static uint32_t s_health_overruns;
+static fault_monitor_t s_faults;
+static e2e_p11_protect_state_t s_fault_counter;
+static wdgm_state_t s_wdgm;
+static node_supervision_stats_t s_supervision;
+static uint32_t s_seen_examinations[SUPERVISED_ENTITIES];
+static bool s_expiry_recorded;
+
+/* The summary of the DTCs as the health task published it after its last period; read and
+ * written in critical sections. */
+static fault_summary_t s_fault_summary;
 
 /* Owned by the receive task: every call on it is made there (on_command, on_command_cycle). */
 static command_rx_t s_command;
 
-/* The telemetry switch as the receive task last left it; read and written in critical
- * sections. */
+/* The telemetry switch and the count of clear requests as the receive task last left them;
+ * read and written in critical sections. */
 static bool s_telemetry_on;
+static uint32_t s_clear_requests;
 
 static message_counts_t s_counts[SLOTS];
 
@@ -227,15 +376,36 @@ static bool telemetry_switch(void)
     return on;
 }
 
+/* Whether a DTC has testFailed, as of the health task's last period. */
+static bool fault_active(void)
+{
+    bool active;
+
+    taskENTER_CRITICAL();
+    active = (s_fault_summary.active != 0U);
+    taskEXIT_CRITICAL();
+
+    return active;
+}
+
+/* An alive indication of a supervised task. */
+static void alive(supervised_t entity)
+{
+    (void)wdgm_checkpoint(&s_wdgm, (uint8_t)entity);
+}
+
 /* ---------------------------------------------------------------------------- the sensor */
 
 /* Sample number `index` (0, 1, 2, ...): the current in every one, the cells in every
  * APP_CELLS_EVERY-th, the temperatures in every APP_TEMPS_EVERY-th, the first one with all
  * three. A group the front end did not answer goes in with every channel flagged invalid, so
- * that lib/bms makes it invalid rather than keeping its last values (lib/bms/bms.h). */
-static void acquire(bms_sample_t *sample, uint32_t index)
+ * that lib/bms makes it invalid rather than keeping its last values (lib/bms/bms.h), and is
+ * noted in `unanswered` for the fault monitor. */
+static void acquire(app_sample_t *out, uint32_t index)
 {
-    (void)memset(sample, 0, sizeof(*sample));
+    bms_sample_t *sample = &out->bms;
+
+    (void)memset(out, 0, sizeof(*out));
     sample->stamp_ns = plat_time_ns();
     sample->sequence = index;
     sample->groups = (uint8_t)BMS_SAMPLE_CURRENT;
@@ -243,6 +413,7 @@ static void acquire(bms_sample_t *sample, uint32_t index)
 
     if (!plat_sensor_read_current(&sample->current_ma, &sample->current_invalid)) {
         sample->current_invalid = true;
+        out->unanswered = (uint8_t)(out->unanswered | BMS_SAMPLE_CURRENT);
         s_sensor.current_unanswered++;
     }
 
@@ -252,6 +423,7 @@ static void acquire(bms_sample_t *sample, uint32_t index)
 
         if (!plat_sensor_read_cells(sample->cell_mv, &sample->cell_invalid)) {
             sample->cell_invalid = (uint8_t)BMS_ALL_CELLS;
+            out->unanswered = (uint8_t)(out->unanswered | BMS_SAMPLE_CELLS);
             s_sensor.cell_unanswered++;
         }
     }
@@ -262,6 +434,7 @@ static void acquire(bms_sample_t *sample, uint32_t index)
 
         if (!plat_sensor_read_temps(sample->temp_dc, &sample->temp_invalid)) {
             sample->temp_invalid = (uint8_t)BMS_ALL_TEMPS;
+            out->unanswered = (uint8_t)(out->unanswered | BMS_SAMPLE_TEMPS);
             s_sensor.temp_unanswered++;
         }
     }
@@ -278,7 +451,7 @@ static void sensor_task(void *arg)
 
     for (;;) {
         can_frame_t frame = {0};
-        bms_sample_t sample;
+        app_sample_t sample;
 
         /* pdFALSE: the release time had passed already, the last period overran. */
         if (xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(APP_SENSOR_PERIOD_MS)) == pdFALSE) {
@@ -304,6 +477,9 @@ static void sensor_task(void *arg)
         }
 
         s_sensor.periods = periods;
+
+        /* After the reads: a front end that hangs keeps the task from getting here. */
+        alive(SUPERVISED_SENSOR);
     }
 }
 
@@ -311,7 +487,7 @@ static void sensor_task(void *arg)
 
 /* Build and publish one protected message, or count it as suppressed while the telemetry is
  * off. */
-static void publish_protected(uint8_t slot, bool telemetry_on, const bms_pack_t *pack,
+static void publish_protected(uint8_t slot, bool telemetry_on, bool faults, const bms_pack_t *pack,
                               uint64_t stamp_ns)
 {
     can_frame_t frame = {0};
@@ -323,7 +499,7 @@ static void publish_protected(uint8_t slot, bool telemetry_on, const bms_pack_t 
 
         switch (slot) {
         case SLOT_PACK_STATUS:
-            built = telemetry_pack_status(&s_sender, pack, &frame);
+            built = telemetry_pack_status(&s_sender, pack, faults, &frame);
             break;
         case SLOT_CELL_VOLTAGES1:
             built = telemetry_cell_voltages1(&s_sender, pack, &frame);
@@ -340,30 +516,47 @@ static void publish_protected(uint8_t slot, bool telemetry_on, const bms_pack_t 
     }
 }
 
-static void process_sample(const bms_sample_t *sample)
+/* Hand a verdict to the health task, the owner of the DTCs; never wait for room. */
+static void post_verdict(const fault_verdict_t *verdict)
+{
+    if (xQueueSend(s_verdict_queue, verdict, 0U) == pdTRUE) {
+        s_process.verdicts_posted++;
+    } else {
+        s_process.verdicts_lost++;
+    }
+}
+
+static void process_sample(const app_sample_t *sample)
 {
     bms_pack_t pack;
+    fault_verdict_t verdict;
     bool telemetry_on;
+    bool faults;
 
     (void)xSemaphoreTake(s_pack_mutex, portMAX_DELAY);
-    bms_process(&s_pack, &s_bms_config, sample);
+    bms_process(&s_pack, &s_bms_config, &sample->bms);
     pack = s_pack;
     (void)xSemaphoreGive(s_pack_mutex);
 
+    /* The verdict on the faults, from the copy that this sample made. */
+    fault_judge_sample(&sample->bms, sample->unanswered, &pack, &verdict);
+    post_verdict(&verdict);
+
     s_process.samples++;
     telemetry_on = telemetry_switch();
+    faults = fault_active();
 
     /* Each message goes out with the samples that carry its measurements, stamped with the
      * time of the sample, so that the transmit-done report gives the sample-to-bus latency. */
-    publish_protected(SLOT_PACK_STATUS, telemetry_on, &pack, sample->stamp_ns);
+    publish_protected(SLOT_PACK_STATUS, telemetry_on, faults, &pack, sample->bms.stamp_ns);
 
-    if ((sample->groups & BMS_SAMPLE_CELLS) != 0U) {
-        publish_protected(SLOT_CELL_VOLTAGES1, telemetry_on, &pack, sample->stamp_ns);
-        publish_protected(SLOT_CELL_VOLTAGES2, telemetry_on, &pack, sample->stamp_ns);
+    if ((sample->bms.groups & BMS_SAMPLE_CELLS) != 0U) {
+        publish_protected(SLOT_CELL_VOLTAGES1, telemetry_on, faults, &pack, sample->bms.stamp_ns);
+        publish_protected(SLOT_CELL_VOLTAGES2, telemetry_on, faults, &pack, sample->bms.stamp_ns);
     }
 
-    if ((sample->groups & BMS_SAMPLE_TEMPS) != 0U) {
-        publish_protected(SLOT_TEMPERATURES, telemetry_on, &pack, sample->stamp_ns);
+    if ((sample->bms.groups & BMS_SAMPLE_TEMPS) != 0U) {
+        publish_protected(SLOT_TEMPERATURES, telemetry_on, faults, &pack, sample->bms.stamp_ns);
     }
 }
 
@@ -375,7 +568,7 @@ static void process_task(void *arg)
     plat_task_enter("process");
 
     for (;;) {
-        bms_sample_t sample;
+        app_sample_t sample;
 
         if (xQueueReceive(s_sample_queue, &sample, pdMS_TO_TICKS(APP_SAMPLE_TIMEOUT_MS)) ==
             pdTRUE) {
@@ -398,7 +591,11 @@ static void process_task(void *arg)
 
             process_sample(&sample);
         } else {
+            fault_verdict_t verdict;
+
             s_process.timeouts++;
+            fault_judge_timeout(&verdict);
+            post_verdict(&verdict);
 
             if (!timed_out) {
                 LOG_WRN(TAG, "no sample from the sensor task for %u ms",
@@ -406,19 +603,23 @@ static void process_task(void *arg)
                 timed_out = true;
             }
         }
+
+        alive(SUPERVISED_PROCESS);
     }
 }
 
 /* -------------------------------------------------------------------- the command receiver */
 
-/* Receive task context. The switch is copied out for the processing task after every call
- * that can change it. */
-static void share_telemetry_switch(void)
+/* Receive task context. The switch and the count of clear requests are copied out for the
+ * other tasks after every call that can change them. */
+static void share_command_outputs(void)
 {
     const bool on = command_telemetry_on(&s_command);
+    const uint32_t clears = command_clear_requests(&s_command);
 
     taskENTER_CRITICAL();
     s_telemetry_on = on;
+    s_clear_requests = clears;
     taskEXIT_CRITICAL();
 }
 
@@ -426,13 +627,13 @@ static void on_command(const can_frame_t *frame, uint64_t eof_ns)
 {
     (void)eof_ns;
     command_on_frame(&s_command, frame);
-    share_telemetry_switch();
+    share_command_outputs();
 }
 
 static void on_command_cycle(void)
 {
     command_on_cycle(&s_command);
-    share_telemetry_switch();
+    share_command_outputs();
 }
 
 /* Receive task context: answer a ping with the same payload. */
@@ -443,6 +644,148 @@ static void on_ping(const can_frame_t *frame, uint64_t eof_ns)
     (void)eof_ns;
     pong.id = CAN_DB_BMS_PONG_ID;
     (void)can_io_send_event(&pong);
+}
+
+/* The alive indications of the two CAN tasks, from inside their loops (can_io.h). */
+static void can_rx_alive(void)
+{
+    alive(SUPERVISED_CAN_RX);
+}
+
+static void can_tx_alive(void)
+{
+    alive(SUPERVISED_CAN_TX);
+}
+
+/* --------------------------------------------------------------------------- supervision */
+
+/* The fewest and the most alive indications of each entity in one examined cycle. */
+static void note_alive_counts(void)
+{
+    for (uint32_t i = 0U; i < (uint32_t)SUPERVISED_ENTITIES; i++) {
+        const wdgm_entity_state_t *entity = &s_wdgm.entity[i];
+        node_supervised_stats_t *seen = &s_supervision.entities[i];
+
+        if (entity->examinations != s_seen_examinations[i]) {
+            if ((s_seen_examinations[i] == 0U) || (entity->last_count < seen->min_count)) {
+                seen->min_count = entity->last_count;
+            }
+
+            if (entity->last_count > seen->max_count) {
+                seen->max_count = entity->last_count;
+            }
+
+            s_seen_examinations[i] = entity->examinations;
+        }
+    }
+}
+
+/* Health task context, first thing in every period: one supervision cycle, and the kick of the
+ * hardware watchdog if the watchdog manager allows it. */
+static void supervise(void)
+{
+    const wdgm_global_status_t status = wdgm_main_function(&s_wdgm, &s_supervision_config);
+
+    note_alive_counts();
+
+    if (wdgm_may_kick(&s_wdgm)) {
+        plat_wdg_kick();
+        s_supervision.kicks++;
+    } else {
+        s_supervision.kicks_withheld++;
+    }
+
+    if (((status == WDGM_GLOBAL_STATUS_EXPIRED) || (status == WDGM_GLOBAL_STATUS_STOPPED)) &&
+        !s_expiry_recorded) {
+        const uint8_t first = wdgm_first_expired(&s_wdgm);
+        const bool known = first < (uint8_t)SUPERVISED_ENTITIES;
+
+        LOG_ERR(TAG,
+                "supervision: %s expired (%lu alive in its last cycle); no more kicks: reset "
+                "within %u ms",
+                known ? s_supervised[first].name : "the state",
+                known ? (unsigned long)s_wdgm.entity[first].last_count : 0UL,
+                (unsigned int)APP_WDG_TIMEOUT_MS);
+        s_expiry_recorded = true;
+    }
+}
+
+/* ------------------------------------------------------------------------------ faults */
+
+/* A line for every fault that became active or stopped being active in this period. */
+static void log_fault_changes(uint16_t before, uint16_t after)
+{
+    for (uint32_t event = 0U; event < (uint32_t)FAULT_EVENTS; event++) {
+        const uint16_t mask = (uint16_t)(1UL << event);
+        const bool was = (before & mask) != 0U;
+        const bool is = (after & mask) != 0U;
+
+        if (is && !was) {
+            LOG_WRN(TAG, "fault %s active (DTC 0x%06lX)", fault_name(event),
+                    (unsigned long)fault_dtc_number(event));
+        } else if (was && !is) {
+            LOG_INF(TAG, "fault %s no longer active", fault_name(event));
+        } else {
+            /* no change */
+        }
+    }
+}
+
+/* Health task context, after the supervision cycle: work the processing task's verdicts into
+ * the DTCs in their order, judge the CAN controller and the watchdog manager, carry out a clear
+ * request, publish the summary, and send BMS_Fault with it. */
+static void run_faults(void)
+{
+    fault_verdict_t verdict;
+    can_io_stats_t io;
+    can_txq_stats_t queue;
+    plat_can_status_t controller;
+    fault_summary_t summary;
+    uint16_t before;
+    uint32_t clear_requests;
+    can_frame_t frame;
+    bool more = true;
+
+    taskENTER_CRITICAL();
+    before = s_fault_summary.active;
+    clear_requests = s_clear_requests;
+    taskEXIT_CRITICAL();
+
+    /* At most a queue full in one period, so that the job has a bound (task_table.c): what the
+     * processing task posts meanwhile waits for the next period, in its order. */
+    for (uint32_t i = 0U; more && (i < APP_FAULT_VERDICT_QUEUE_LENGTH); i++) {
+        more = (xQueueReceive(s_verdict_queue, &verdict, 0U) == pdTRUE);
+
+        if (more) {
+            fault_apply(&s_faults, &verdict);
+        }
+    }
+
+    can_io_get_stats(&io, &queue);
+    plat_can_get_status(&controller);
+
+    const fault_health_inputs_t inputs = {.bus_off_count = queue.bus_off_count,
+                                          .error_passive_entries = io.error_passive_entries,
+                                          .can_state = (can_fc_state_t)controller.state,
+                                          .supervision = wdgm_global_status(&s_wdgm)};
+
+    fault_health_cycle(&s_faults, &inputs);
+
+    if (fault_clear_if_requested(&s_faults, clear_requests)) {
+        LOG_INF(TAG, "DTCs cleared: CmdClearFaultsSeq changed (clear %lu)",
+                (unsigned long)s_faults.clears);
+    }
+
+    fault_summary(&s_faults, &summary);
+    log_fault_changes(before, summary.active);
+
+    taskENTER_CRITICAL();
+    s_fault_summary = summary;
+    taskEXIT_CRITICAL();
+
+    const bool built = telemetry_fault(&s_fault_counter, &summary, &frame);
+
+    publish(SLOT_FAULT, built, &frame, plat_time_ns());
 }
 
 /* ------------------------------------------------------------------------------ health */
@@ -511,8 +854,9 @@ static void send_task_stats(uint32_t index)
 static void send_node_info(uint32_t uptime_s)
 {
     can_frame_t frame;
-    const bool built = telemetry_node_info((uint8_t)FCN_VERSION_MAJOR, (uint8_t)FCN_VERSION_MINOR,
-                                           (uint8_t)FCN_VERSION_PATCH, uptime_s, &frame);
+    const bool built =
+        telemetry_node_info((uint8_t)FCN_VERSION_MAJOR, (uint8_t)FCN_VERSION_MINOR,
+                            (uint8_t)FCN_VERSION_PATCH, plat_reset_cause(), uptime_s, &frame);
 
     publish(SLOT_NODE_INFO, built, &frame, plat_time_ns());
 }
@@ -539,6 +883,7 @@ static void log_alive(uint32_t seconds)
     int32_t current_ma;
     uint32_t periods;
     bool telemetry_on;
+    fault_summary_t faults;
 
     (void)xSemaphoreTake(s_pack_mutex, portMAX_DELAY);
     state = s_pack.state;
@@ -549,11 +894,43 @@ static void log_alive(uint32_t seconds)
     taskENTER_CRITICAL();
     periods = s_sensor.periods;
     telemetry_on = s_telemetry_on;
+    faults = s_fault_summary;
     taskEXIT_CRITICAL();
 
-    LOG_INF(TAG, "alive: %lu s, sensor periods %lu, pack %s %lu mV %ld mA, telemetry %s",
+    LOG_INF(TAG,
+            "alive: %lu s, sensor periods %lu, pack %s %lu mV %ld mA, telemetry %s, faults "
+            "active 0x%04X confirmed 0x%04X",
             (unsigned long)seconds, (unsigned long)periods, state_name(state),
-            (unsigned long)pack_mv, (long)current_ma, telemetry_on ? "on" : "off");
+            (unsigned long)pack_mv, (long)current_ma, telemetry_on ? "on" : "off",
+            (unsigned int)faults.active, (unsigned int)faults.confirmed);
+}
+
+/* The watchdog manager as the statistics show it. Health task context. */
+static void capture_supervision(node_supervision_stats_t *out)
+{
+    *out = s_supervision;
+    out->status = wdgm_global_status(&s_wdgm);
+    out->cycles = s_wdgm.cycles;
+    out->first_expired = wdgm_first_expired(&s_wdgm);
+    out->expired_cycles = s_wdgm.expired_cycles;
+    out->expired_tolerance = s_supervision_config.expired_tolerance;
+    out->timeout_ms = APP_WDG_TIMEOUT_MS;
+    out->entity_count = (uint32_t)SUPERVISED_ENTITIES;
+
+    for (uint32_t i = 0U; i < (uint32_t)SUPERVISED_ENTITIES; i++) {
+        node_supervised_stats_t *entity = &out->entities[i];
+
+        entity->name = s_supervised[i].name;
+        entity->status = wdgm_local_status(&s_wdgm, (uint8_t)i);
+        entity->examinations = s_wdgm.entity[i].examinations;
+        entity->incorrect = s_wdgm.entity[i].incorrect;
+        entity->last_count = s_wdgm.entity[i].last_count;
+        entity->expected_alive = s_supervised[i].expected_alive;
+        entity->min_margin = s_supervised[i].min_margin;
+        entity->max_margin = s_supervised[i].max_margin;
+        entity->reference_cycle = s_supervised[i].reference_cycle;
+        entity->failed_tolerance = s_supervised[i].failed_tolerance;
+    }
 }
 
 /* The application's counters into the final statistics. Runs in the health task after it has
@@ -568,11 +945,16 @@ static void capture_app(node_stats_t *out)
     out->pack = s_pack;
     (void)xSemaphoreGive(s_pack_mutex);
 
+    /* The health task's own state: no lock. */
+    out->faults = s_faults;
+    capture_supervision(&out->supervision);
+
     taskENTER_CRITICAL();
     out->sensor = s_sensor;
     out->process = s_process;
     out->command = s_command;
     out->telemetry_on = s_telemetry_on;
+    out->fault_summary = s_fault_summary;
 
     for (uint8_t slot = 0U; slot < SLOTS; slot++) {
         node_message_stats_t *message = &out->messages[slot];
@@ -632,7 +1014,11 @@ static void health_task(void *arg)
 
         cycles++;
 
-        if ((cycles % APP_TASK_STATS_EVERY) == 0U) {
+        /* First the supervision and the kick, at the same point of every period. */
+        supervise();
+        run_faults();
+
+        if ((cycles % APP_TASK_STATS_EVERY) == 1U) {
             send_task_stats(next_task);
             next_task = (next_task + 1U) % TASK_STATS_TASKS;
         }
@@ -656,22 +1042,47 @@ static void health_task(void *arg)
 
 void app_start(const app_config_t *config)
 {
+    const plat_reset_reason_t cause = plat_reset_cause();
+    bool ok;
+
     s_config = *config;
 
     bms_init(&s_pack);
     telemetry_init(&s_sender);
     command_init(&s_command);
     s_telemetry_on = command_telemetry_on(&s_command);
+    s_clear_requests = command_clear_requests(&s_command);
 
-    s_sample_queue = xQueueCreateStatic(APP_SAMPLE_QUEUE_LENGTH, sizeof(bms_sample_t),
+    /* The DTCs, with the reset faults judged from this start's cause, and their summary, so
+     * that the first BMS_PackStatus already says whether one is active. */
+    ok = fault_init(&s_faults, cause);
+    fault_summary(&s_faults, &s_fault_summary);
+    ok = ok && (e2e_p11_protect_init(&s_fault_counter) == E2E_E_OK);
+
+    if (cause != PLAT_RESET_POWER_ON) {
+        LOG_WRN(TAG, "the last reset was not a power-on: reset cause %u", (unsigned int)cause);
+    }
+
+    /* The watchdog manager before any task can report to it, then the hardware watchdog: from
+     * here on, a hang before the health task's first kick resets the node too. */
+    ok = ok && wdgm_init(&s_wdgm, &s_supervision_config);
+    s_supervision.watchdog_started = plat_wdg_start(APP_WDG_TIMEOUT_MS);
+    ok = ok && s_supervision.watchdog_started;
+
+    s_sample_queue = xQueueCreateStatic(APP_SAMPLE_QUEUE_LENGTH, sizeof(app_sample_t),
                                         (uint8_t *)s_sample_queue_storage, &s_sample_queue_state);
+    s_verdict_queue =
+        xQueueCreateStatic(APP_FAULT_VERDICT_QUEUE_LENGTH, sizeof(fault_verdict_t),
+                           (uint8_t *)s_verdict_queue_storage, &s_verdict_queue_state);
     s_pack_mutex = xSemaphoreCreateMutexStatic(&s_pack_mutex_state);
-    configASSERT((s_sample_queue != NULL) && (s_pack_mutex != NULL));
+    configASSERT(ok && (s_sample_queue != NULL) && (s_verdict_queue != NULL) &&
+                 (s_pack_mutex != NULL));
 
     can_io_start();
     (void)can_io_on_frame(CAN_DB_TESTER_PING_ID, false, on_ping);
     (void)can_io_on_frame(CAN_DB_TESTER_COMMAND_ID, false, on_command);
     can_io_on_rx_cycle(COMMAND_CYCLE_MS, on_command_cycle);
+    can_io_on_alive(can_rx_alive, can_tx_alive);
 
     (void)xTaskCreateStatic(sensor_task, "sensor", APP_TASK_STACK_WORDS, NULL, APP_SENSOR_PRIORITY,
                             s_sensor_stack, &s_sensor_tcb);

@@ -19,7 +19,11 @@
  * every frame while the state machine is NODATA, INIT or INVALID are counted and ignored.
  * Acting on a command means:
  *   - CmdTelemetryOn becomes the node's telemetry switch (command_telemetry_on());
- *   - CmdClearFaultsSeq is stored (phase 3 clears latched faults when it changes).
+ *   - CmdClearFaultsSeq is stored, and if it differs from that of the command acted on before
+ *     it, a request to clear the DTCs is counted (clear_requests; the owner of the DTCs carries
+ *     it out, fault.h). The first command acted on sets the reference and requests nothing: a
+ *     tester that starts, or that comes back after a timeout with the value it had, clears
+ *     nothing by doing so.
  * Before the first command that is acted on, the telemetry switch is on. Afterwards it keeps
  * the value of the last command acted on, also while the command stream is lost: a node whose
  * tester went away does not change its behaviour by itself.
@@ -80,13 +84,15 @@ typedef struct {
     e2e_p11_check_state_t check; /**< Profile 11 state of the message */
     e2e_sm_check_state_t sm;     /**< state machine; sm.sm_state is the verdict */
     command_status_counts_t status;
-    uint32_t frames;          /**< frames passed to command_on_frame() */
-    uint32_t cycles;          /**< calls of command_on_cycle() */
-    uint32_t checks;          /**< checks made: every frame, and every cycle without one */
-    uint32_t check_errors;    /**< checks that did not return E2E_E_OK (a frame of wrong length) */
-    uint32_t sm_errors;       /**< state machine steps that did not return E2E_E_OK (never) */
-    uint32_t accepted;        /**< frames whose command was carried out */
-    uint32_t ignored;         /**< frames whose command was not, see WHAT IS CARRIED OUT */
+    uint32_t frames;       /**< frames passed to command_on_frame() */
+    uint32_t cycles;       /**< calls of command_on_cycle() */
+    uint32_t checks;       /**< checks made: every frame, and every cycle without one */
+    uint32_t check_errors; /**< checks that did not return E2E_E_OK (a frame of wrong length) */
+    uint32_t sm_errors;    /**< state machine steps that did not return E2E_E_OK (never) */
+    uint32_t accepted;     /**< frames whose command was carried out */
+    uint32_t ignored;      /**< frames whose command was not, see WHAT IS CARRIED OUT */
+    /** commands acted on whose CmdClearFaultsSeq differed from the one before (wraps) */
+    uint32_t clear_requests;
     uint8_t clear_faults_seq; /**< CmdClearFaultsSeq of the last command acted on */
     bool have_command;        /**< a command has been acted on since command_init() */
     bool telemetry_on;        /**< the telemetry switch */
@@ -109,5 +115,9 @@ void command_on_cycle(command_rx_t *rx);
 /** The telemetry switch: true before the first command acted on, then that command's
  *  CmdTelemetryOn. */
 bool command_telemetry_on(const command_rx_t *rx);
+
+/** The requests to clear the DTCs since command_init(): see WHAT IS CARRIED OUT. Only grows,
+ *  modulo 2^32. */
+uint32_t command_clear_requests(const command_rx_t *rx);
 
 #endif /* FCN_COMMAND_H */

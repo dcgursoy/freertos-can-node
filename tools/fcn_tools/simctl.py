@@ -22,12 +22,15 @@ import time
 
 # Commands that may reach the node more than once without changing the outcome: they only
 # read (ping, can.status, sensor.status) or set a state to a value (can.fault and the other
-# sensor commands: a channel held, opened or cleared twice, or the front end taken off line
-# twice, ends as it would after once). Any other command, can.inject above all (it adds to the
-# errors still to come), is sent once and waited for.
+# sensor commands: a channel held, opened or cleared twice, or the front end taken off line or
+# made to hang twice, ends as it would after once). Any other command, can.inject above all (it
+# adds to the errors still to come), is sent once and waited for.
 REPEATABLE = frozenset({"ping", "can.status", "can.fault",
                         "sensor.status", "sensor.set", "sensor.open", "sensor.offline",
-                        "sensor.clear"})
+                        "sensor.hang", "sensor.clear"})
+
+# The modes of sensor.hang (platform/posix/posix_sensor.c, docs/sensor-model.md).
+HANG_MODES = ("on", "spin", "off")
 
 # The channels of the sensor front-end model (platform/posix/posix_sensor.c).
 SENSOR_CHANNELS = ("current",
@@ -170,6 +173,20 @@ class SimControl:
         """Take the whole front end off line (it answers no read), or bring it back."""
         return self.request(f"sensor.offline {'on' if offline else 'off'}")
 
+    def sensor_hang(self, mode: str | bool = "on") -> dict[str, str]:
+        """Make every read of the front end hang until the hang ends, or end it.
+
+        "on" (or True): a read blocks the sensor task, as a driver that waits for an interrupt
+        that never comes; the tasks below it run on. "spin": a read keeps the CPU, as a driver
+        polling a flag that never changes; every task below the sensor task starves. "off" (or
+        False): reads return again. Anything else raises ValueError and sends nothing."""
+        if mode is True or mode is False:
+            mode = "on" if mode else "off"
+        if mode not in HANG_MODES:
+            raise ValueError(f"a hang mode is one of {', '.join(HANG_MODES)}, not {mode!r}")
+        return self.request(f"sensor.hang {mode}")
+
     def sensor_clear(self, channel: str | None = None) -> dict[str, str]:
-        """End the fault of `channel`, or with no channel every fault, off line included."""
+        """End the fault of `channel`, or with no channel every fault, off line and hang
+        included."""
         return self.request("sensor.clear" if channel is None else f"sensor.clear {channel}")

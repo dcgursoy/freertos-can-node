@@ -30,7 +30,7 @@ row below has findings behind it today.
 
 | Rule | Category | Scope | Why |
 |---|---|---|---|
-| 1.4 | required | project | The project is written in C11 on purpose: `<stdatomic.h>` for the lock-free ring between an interrupt and a task, and `_Noreturn` on the reset functions. Rule 1.4 was introduced by Amendment 2, before MISRA had guidance for C11; MISRA C:2023 permits both features under rules of their own. |
+| 1.4 | required | project | The project is written in C11 on purpose: `<stdatomic.h>` for the lock-free ring between an interrupt and a task and for the watchdog manager's alive counters, which several tasks and interrupt handlers increment while the supervising task takes them (`lib/wdgm`), and `_Noreturn` on the reset functions. Rule 1.4 was introduced by Amendment 2, before MISRA had guidance for C11; MISRA C:2023 permits both features under rules of their own. |
 | 8.9 | advisory | project | The statically allocated kernel objects and buffers of a module are declared together at file scope, so that the module's memory budget can be read in one place, rather than as `static` locals of the one function that passes them to the kernel. |
 | 11.5 | advisory | `lib/ring/spsc_ring.c` | The ring stores elements of a caller-chosen type and, like `memcpy`, takes storage and elements as `void` pointers. They are converted only to `uint8_t *` for copying bytes. |
 | 17.1, 21.6 | required | `lib/log/log.c` | A printf-style log call needs `<stdarg.h>` and `vsnprintf`. The logging front end is the only file allowed to use them; it formats into a fixed buffer on the caller's stack and never allocates. |

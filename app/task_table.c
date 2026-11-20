@@ -49,12 +49,24 @@
  * Blocking: every task that calls can_io (sensor, process, can_tx, health, and can_rx for the
  * pong) enters short critical sections around the transmit queue, at most 5 us; the health
  * task suspends the scheduler while uxTaskGetSystemState() reads the task list; the
- * processing and the health task share the pack mutex (priority inheritance).
+ * processing and the health task share the pack mutex (priority inheritance). The words that
+ * pass between tasks in critical sections (the telemetry switch, the clear requests, the
+ * summary of the DTCs) take less than the transmit queue's sections.
+ *
+ * Phase 3 added to two budgets: the processing task judges every sample for the fault
+ * monitor and posts the verdict (10 us), and the health task runs the supervision cycle,
+ * kicks the hardware watchdog, works the verdicts into the DTCs, judges the CAN controller and
+ * sends BMS_Fault. The health task's frames are spread over its periods (app_tasks.h) so that
+ * one period publishes at most two, as in phase 2: can_tx's count of passes for it stays at two.
+ * The DTC work went to the health task, below can_tx, because the processing task is above
+ * it: every microsecond added to the processing task's budget adds one to can_tx's response
+ * time, whose margin is the smallest of the set.
  */
 #include "app_tasks.h"
 
 #include "FreeRTOS.h"
 #include "can/can_bits.h"
+#include "fault.h"
 #include "plat_can.h"
 
 /* The shortest frame on the bus and the tick, in microseconds, and the most frames that can
@@ -106,8 +118,9 @@ _Static_assert(BUS_FRAMES_PER_TICK == 22U, "at most 22 frames end on the bus in 
 #define SENSOR_DEADLINE_US 2000U
 
 /* process: the sample out of the queue 10 us, lib/bms under the mutex 40 us, up to four frames
- * built, protected and published 25 us each. */
-#define PROCESS_WCET_US 150U
+ * built, protected and published 25 us each, the verdict on the faults (fault_judge_sample(),
+ * a comparison per reading) 5 us and the verdict into the health task's queue 5 us. */
+#define PROCESS_WCET_US 160U
 #define PACK_MUTEX_US   40U /* the processing task's longest hold of the pack mutex */
 #define CRITICAL_US     5U  /* the longest critical section around the transmit queue */
 
@@ -124,7 +137,8 @@ _Static_assert(BUS_FRAMES_PER_TICK == 22U, "at most 22 frames end on the bus in 
  *   - one for the sensor and the processing task: both are above can_tx, which runs only once
  *     both have blocked, so the heartbeat and the protected frames of one period wake it once;
  *   - two for the health task, which is below can_tx: can_tx runs a pass at each of its
- *     publishes, and BMS_TaskStats and BMS_NodeInfo can fall into the same period;
+ *     publishes, and a period publishes BMS_Fault and at most one of BMS_TaskStats and
+ *     BMS_NodeInfo (app_tasks.h);
  *   - one timeout: tx_wait_ticks() never waits less than a tick.
  * Events in any 1000 us: a transmit-done for each of the node's frames that ends on the bus, at
  * most BUS_FRAMES_PER_TICK, and a load for each of them and for each of the
@@ -139,9 +153,25 @@ _Static_assert(BUS_FRAMES_PER_TICK == 22U, "at most 22 frames end on the bus in 
 _Static_assert(TX_PASSES_PER_TICK == 26U, "can_tx: 22 + 1 + 2 + 1 passes in any 1000 us");
 _Static_assert(TX_EVENTS_PER_TICK == 47U, "can_tx: 2 x 22 + 3 events in any 1000 us");
 
-/* health: the task list 20 us (with the scheduler suspended), the stack figure 100 us, two
- * frames 30 us, a log line 100 us, the rest 50 us. */
-#define HEALTH_WCET_US       300U
+/* health, phase 2: the task list 20 us (with the scheduler suspended), the stack figure 100 us,
+ * two frames 30 us, a log line 100 us, the rest 50 us: 300 us. Phase 3 adds:
+ *   - the supervision cycle of four entities 15 us, the kick 2 us;
+ *   - the verdicts: at most APP_FAULT_VERDICT_QUEUE_LENGTH per period (app.c takes no more in
+ *     one job), each taken out of the queue (3 us) and worked into up to nine DTCs (1 us
+ *     each): 12 us per verdict;
+ *   - the CAN controller's counters and state 10 us, its monitors and a clear 10 us, the
+ *     summary of 16 DTCs 20 us, BMS_Fault built, protected and published 25 us;
+ *   - log lines at 100 us each: one for each fault that changed, at most one per fault, one
+ *     for a clear and one for the expiry of a supervised task (once per run).
+ * The log lines are the largest term, and a period in which every fault changes does not
+ * happen; the health task is the lowest-priority task, so its budget delays no other task. */
+#define HEALTH_LOG_LINES ((uint32_t)FAULT_EVENTS + 2U)
+#define HEALTH_FAULT_WORK_US                                                                       \
+    (15U + 2U + (APP_FAULT_VERDICT_QUEUE_LENGTH * 12U) + 10U + 10U + 20U + 25U +                   \
+     (HEALTH_LOG_LINES * 100U))
+#define HEALTH_WCET_US (300U + HEALTH_FAULT_WORK_US)
+
+_Static_assert(HEALTH_WCET_US == 2566U, "health: 300 us + the fault work of phase 3");
 #define HEALTH_SUSPENDED_US  20U
 #define HEALTH_PACK_MUTEX_US 10U /* a copy of the pack state */
 

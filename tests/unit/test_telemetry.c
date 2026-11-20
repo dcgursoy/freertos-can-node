@@ -9,6 +9,7 @@
  * up here.
  */
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -104,7 +105,7 @@ static void test_the_pack_status_carries_the_pack_state_and_passes_the_e2e_check
     can_frame_t frame;
     can_db_bms_pack_status_t msg;
 
-    TEST_ASSERT_TRUE(telemetry_pack_status(&s_sender, &s_pack, &frame));
+    TEST_ASSERT_TRUE(telemetry_pack_status(&s_sender, &s_pack, false, &frame));
     expect_header(&frame, 0x020U);
     TEST_ASSERT_EQUAL_HEX8(0x00U, frame.data[1]);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(payload, &frame.data[2], 6);
@@ -130,7 +131,7 @@ static void test_an_invalid_current_or_pack_voltage_goes_out_as_0_with_its_flag_
     s_pack.current_valid = false;
     s_pack.pack_valid = false; /* pack_mv is then the sum of the valid cells only */
 
-    TEST_ASSERT_TRUE(telemetry_pack_status(&s_sender, &s_pack, &frame));
+    TEST_ASSERT_TRUE(telemetry_pack_status(&s_sender, &s_pack, false, &frame));
     TEST_ASSERT_TRUE(can_db_bms_pack_status_unpack(&msg, frame.data, 8U));
     TEST_ASSERT_EQUAL_INT16(0, msg.pack_current);
     TEST_ASSERT_EQUAL_UINT16(0U, msg.pack_voltage);
@@ -146,7 +147,7 @@ static void test_a_negative_current_is_sent_as_a_twos_complement_number(void)
 
     s_pack.current_ma = -80005; /* -8000.5 -> -8001 = 0xE0BF */
 
-    TEST_ASSERT_TRUE(telemetry_pack_status(&s_sender, &s_pack, &frame));
+    TEST_ASSERT_TRUE(telemetry_pack_status(&s_sender, &s_pack, false, &frame));
     TEST_ASSERT_EQUAL_HEX8(0xBFU, frame.data[2]);
     TEST_ASSERT_EQUAL_HEX8(0xE0U, frame.data[3]);
     TEST_ASSERT_TRUE(can_db_bms_pack_status_unpack(&msg, frame.data, 8U));
@@ -227,7 +228,7 @@ static void test_each_protected_message_counts_on_its_own_from_0_to_14_and_round
 
     /* Interleaved as the node sends them: the counters must not share a state. */
     for (uint32_t i = 0U; i < 20U; i++) {
-        TEST_ASSERT_TRUE(telemetry_pack_status(&s_sender, &s_pack, &status[i]));
+        TEST_ASSERT_TRUE(telemetry_pack_status(&s_sender, &s_pack, false, &status[i]));
         TEST_ASSERT_TRUE(telemetry_cell_voltages1(&s_sender, &s_pack, &cells[i]));
         TEST_ASSERT_TRUE(telemetry_temperatures(&s_sender, &s_pack, &temps[i]));
         TEST_ASSERT_EQUAL_UINT8(i % 15U, status[i].data[1] & 0x0FU);
@@ -248,7 +249,7 @@ static void test_a_protected_frame_fails_the_check_of_another_message(void)
     const e2e_p11_config_t cells1 = {.data_id = 0x0140U, .data_len = 8U, .max_delta_counter = 1U};
     e2e_p11_check_state_t receiver;
 
-    TEST_ASSERT_TRUE(telemetry_pack_status(&s_sender, &s_pack, &frame));
+    TEST_ASSERT_TRUE(telemetry_pack_status(&s_sender, &s_pack, false, &frame));
     TEST_ASSERT_EQUAL(E2E_E_OK, e2e_p11_check_init(&receiver));
     TEST_ASSERT_EQUAL(E2E_E_OK, e2e_p11_check(&cells1, &receiver, frame.data, 8U));
     TEST_ASSERT_EQUAL_HEX8(E2E_P11STATUS_ERROR, receiver.status);
@@ -311,17 +312,129 @@ static void test_the_task_stats_saturate_what_their_signals_cannot_carry(void)
 }
 
 /*
- *   version 0.1.0 in bytes 0..2; byte 3: ActiveSlot SNA (3) in bits 0..1, ResetCause SNA (63)
- *   in bits 2..7: 0xFF; uptime 3600 s = 0x0E10, bytes 4..7: 10 0E 00 00
+ *   version 0.1.0 in bytes 0..2; byte 3: ActiveSlot SNA (3) in bits 0..1, ResetCause in bits
+ *   2..7: POWER_ON (0) gives 0x03, WATCHDOG (11 = 0b001011) 0x2F, a value that is no cause SNA
+ *   (63) 0xFF; uptime 3600 s = 0x0E10, bytes 4..7: 10 0E 00 00
  */
-static void test_the_node_info_carries_the_version_and_the_uptime_and_sna_for_the_unknown(void)
+static void test_the_node_info_carries_the_version_the_reset_cause_and_the_uptime(void)
 {
-    static const uint8_t expected[8] = {0x00U, 0x01U, 0x00U, 0xFFU, 0x10U, 0x0EU, 0x00U, 0x00U};
+    static const uint8_t power_on[8] = {0x00U, 0x01U, 0x00U, 0x03U, 0x10U, 0x0EU, 0x00U, 0x00U};
+    can_frame_t frame;
+    can_db_bms_node_info_t msg;
+
+    TEST_ASSERT_TRUE(telemetry_node_info(0U, 1U, 0U, PLAT_RESET_POWER_ON, 3600U, &frame));
+    expect_header(&frame, 0x610U);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(power_on, frame.data, 8);
+
+    TEST_ASSERT_TRUE(telemetry_node_info(0U, 1U, 0U, PLAT_RESET_WATCHDOG, 3600U, &frame));
+    TEST_ASSERT_EQUAL_HEX8(0x2FU, frame.data[3]);
+
+    /* NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange): no cause, on purpose */
+    TEST_ASSERT_TRUE(telemetry_node_info(0U, 1U, 0U, (plat_reset_reason_t)99, 3600U, &frame));
+    TEST_ASSERT_EQUAL_HEX8(0xFFU, frame.data[3]);
+
+    /* Every cause the platform knows goes out as its own value. */
+    static const plat_reset_reason_t causes[] = {
+        PLAT_RESET_POWER_ON,       PLAT_RESET_REQUESTED,    PLAT_RESET_WATCHDOG,
+        PLAT_RESET_POWER_LOSS,     PLAT_RESET_IMAGE_FAULT,  PLAT_RESET_ASSERT,
+        PLAT_RESET_STACK_OVERFLOW, PLAT_RESET_MALLOC_FAILED};
+
+    for (size_t i = 0U; i < (sizeof(causes) / sizeof(causes[0])); i++) {
+        TEST_ASSERT_TRUE(telemetry_node_info(1U, 2U, 3U, causes[i], 0U, &frame));
+        TEST_ASSERT_TRUE(can_db_bms_node_info_unpack(&msg, frame.data, 8U));
+        TEST_ASSERT_EQUAL_UINT8((uint8_t)causes[i], msg.reset_cause);
+        TEST_ASSERT_EQUAL_UINT8(3U, msg.active_slot);
+    }
+}
+
+/* ------------------------------------------------------------------------------- BMS_Fault */
+
+/*
+ *   faults 0 and 8 active: 0x0101, bytes 2..3: 01 01; confirmed also 15: 0x8101, bytes 4..5:
+ *   01 81; byte 6: FaultMostRecent 8 in bits 0..4, FaultWarning 1 in bit 5: 0x28; byte 7:
+ *   FaultClearCount 3; byte 1: counter 0, the high nibble unused
+ */
+static void test_the_fault_frame_carries_the_summary_and_passes_the_e2e_check(void)
+{
+    static const uint8_t payload[6] = {0x01U, 0x01U, 0x01U, 0x81U, 0x28U, 0x03U};
+    const fault_summary_t summary = {.active = 0x0101U,
+                                     .confirmed = 0x8101U,
+                                     .most_recent = (uint8_t)FAULT_SAMPLE_TIMEOUT,
+                                     .clears = 3U,
+                                     .warning = true};
+    e2e_p11_protect_state_t counter;
+    can_frame_t frames[16];
+    can_db_bms_fault_t msg;
+
+    TEST_ASSERT_EQUAL(E2E_E_OK, e2e_p11_protect_init(&counter));
+    TEST_ASSERT_TRUE(telemetry_fault(&counter, &summary, &frames[0]));
+    expect_header(&frames[0], 0x010U);
+    TEST_ASSERT_EQUAL_HEX8(0x00U, frames[0].data[1]);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(payload, &frames[0].data[2], 6);
+
+    TEST_ASSERT_TRUE(can_db_bms_fault_unpack(&msg, frames[0].data, 8U));
+    TEST_ASSERT_EQUAL_HEX16(0x0101U, msg.fault_active);
+    TEST_ASSERT_EQUAL_HEX16(0x8101U, msg.fault_confirmed);
+    TEST_ASSERT_EQUAL_UINT8(8U, msg.fault_most_recent);
+    TEST_ASSERT_EQUAL_UINT8(1U, msg.fault_warning);
+    TEST_ASSERT_EQUAL_UINT8(3U, msg.fault_clear_count);
+
+    /* The counter is the caller's: 0, 1, ..., 14, 0 across the wrap, every frame new data for
+     * a receiver of Data ID 0x0110. */
+    for (uint32_t i = 1U; i < 16U; i++) {
+        TEST_ASSERT_TRUE(telemetry_fault(&counter, &summary, &frames[i]));
+        TEST_ASSERT_EQUAL_UINT8(i % 15U, frames[i].data[1] & 0x0FU);
+    }
+    expect_e2e(frames, 16U, 0x0110U, E2E_P11STATUS_OK, E2E_P11STATUS_OK);
+}
+
+static void test_a_fault_frame_without_a_recent_fault_says_none_and_a_bad_one_is_refused(void)
+{
+    fault_summary_t summary = {.active = 0U,
+                               .confirmed = 0U,
+                               .most_recent = (uint8_t)FAULT_NONE,
+                               .clears = 0U,
+                               .warning = false};
+    e2e_p11_protect_state_t counter;
     can_frame_t frame;
 
-    TEST_ASSERT_TRUE(telemetry_node_info(0U, 1U, 0U, 3600U, &frame));
-    expect_header(&frame, 0x610U);
-    TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, frame.data, 8);
+    TEST_ASSERT_EQUAL(E2E_E_OK, e2e_p11_protect_init(&counter));
+    TEST_ASSERT_TRUE(telemetry_fault(&counter, &summary, &frame));
+    TEST_ASSERT_EQUAL_HEX8(0x1FU, frame.data[6]); /* NONE = 31, no warning */
+    TEST_ASSERT_EQUAL_HEX8(0x00U, frame.data[7]);
+
+    /* A number that is neither a fault nor NONE builds nothing and leaves the counter alone. */
+    summary.most_recent = (uint8_t)FAULT_EVENTS;
+    TEST_ASSERT_FALSE(telemetry_fault(&counter, &summary, &frame));
+    summary.most_recent = (uint8_t)FAULT_NONE;
+    TEST_ASSERT_TRUE(telemetry_fault(&counter, &summary, &frame));
+    TEST_ASSERT_EQUAL_UINT8(1U, frame.data[1] & 0x0FU);
+}
+
+/*
+ *   PackFaultActive 1 in bit 2 of byte 6, and PackState FAULT (2) in bits 0..1 whatever the
+ *   pack's own state: with both valid flags, 0b00011110 = 0x1E
+ */
+static void test_an_active_fault_makes_the_pack_state_fault_and_sets_its_flag(void)
+{
+    static const bms_state_t states[] = {BMS_STATE_STARTUP, BMS_STATE_NORMAL, BMS_STATE_FAULT};
+    can_frame_t frame;
+    can_db_bms_pack_status_t msg;
+
+    for (size_t i = 0U; i < (sizeof(states) / sizeof(states[0])); i++) {
+        s_pack.state = states[i];
+        TEST_ASSERT_TRUE(telemetry_pack_status(&s_sender, &s_pack, true, &frame));
+        TEST_ASSERT_EQUAL_HEX8(0x1EU, frame.data[6]);
+        TEST_ASSERT_TRUE(can_db_bms_pack_status_unpack(&msg, frame.data, 8U));
+        TEST_ASSERT_EQUAL_UINT8(2U, msg.pack_state);
+        TEST_ASSERT_EQUAL_UINT8(1U, msg.pack_fault_active);
+
+        /* Without an active fault the pack's own state, and the flag 0. */
+        TEST_ASSERT_TRUE(telemetry_pack_status(&s_sender, &s_pack, false, &frame));
+        TEST_ASSERT_TRUE(can_db_bms_pack_status_unpack(&msg, frame.data, 8U));
+        TEST_ASSERT_EQUAL_UINT8((uint8_t)states[i], msg.pack_state);
+        TEST_ASSERT_EQUAL_UINT8(0U, msg.pack_fault_active);
+    }
 }
 
 /* ----------------------------------------------------------------------------------- uptime */
@@ -387,7 +500,10 @@ int main(void)
     RUN_TEST(test_init_starts_every_counter_at_0);
     RUN_TEST(test_the_task_stats_carry_one_task_in_the_units_of_the_dbc);
     RUN_TEST(test_the_task_stats_saturate_what_their_signals_cannot_carry);
-    RUN_TEST(test_the_node_info_carries_the_version_and_the_uptime_and_sna_for_the_unknown);
+    RUN_TEST(test_the_node_info_carries_the_version_the_reset_cause_and_the_uptime);
+    RUN_TEST(test_the_fault_frame_carries_the_summary_and_passes_the_e2e_check);
+    RUN_TEST(test_a_fault_frame_without_a_recent_fault_says_none_and_a_bad_one_is_refused);
+    RUN_TEST(test_an_active_fault_makes_the_pack_state_fault_and_sets_its_flag);
     RUN_TEST(test_the_uptime_counts_whole_seconds_past_the_wrap_of_a_32_bit_millisecond_tick);
     RUN_TEST(test_the_uptime_wraps_after_2_pow_32_seconds_as_its_signal);
     return UNITY_END();

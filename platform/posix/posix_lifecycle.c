@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "posix_retained.h"
 #include "task.h"
 
 #if defined(FCN_COVERAGE)
@@ -50,6 +51,7 @@ void posix_platform_run(void)
 
 void posix_platform_shutdown(void)
 {
+    posix_wdg_shutdown();
     posix_log_stop();
 }
 
@@ -62,19 +64,37 @@ void plat_end_scheduler(void)
 {
     posix_irq_set_enabled(false);
     posix_stack_freeze(); /* while every task's thread, the idle task's included, still exists */
+    posix_wdg_stop();     /* the board is switched off; the shutdown guard takes over */
     posix_shutdown_guard_arm(POSIX_SHUTDOWN_TIMEOUT_MS);
     vTaskEndScheduler();
 }
 
 void plat_reset(plat_reset_reason_t reason)
 {
+    static atomic_flag s_resetting = ATOMIC_FLAG_INIT;
+    const plat_reset_reason_t recorded =
+        posix_reset_reason_valid(reason) ? reason : PLAT_RESET_ASSERT;
+
     /* A reset is abrupt on purpose: like the reset line of a microcontroller it stops the
      * image wherever it is. Only what a test bench would still have afterwards is saved: the
-     * log lines already produced and, in coverage builds, the counters. */
-    vPortEnterCritical();
+     * retained cell, the log lines already produced and, in coverage builds, the counters.
+     * The hardware watchdog's thread is not a task and enters no critical section. */
+    if (!posix_on_external_thread()) {
+        vPortEnterCritical();
+    }
+
+    /* Two contexts resetting at once (the watchdog's thread and a task's assertion): the first
+     * one's reason is recorded and exited with; the other waits here for the exit. */
+    if (atomic_flag_test_and_set(&s_resetting)) {
+        for (;;) {
+            (void)pause();
+        }
+    }
+
+    posix_retained_note_reset(recorded);
     posix_log_drain();
 #if defined(FCN_COVERAGE)
     __gcov_dump();
 #endif
-    _exit((int)reason);
+    _exit((int)recorded);
 }

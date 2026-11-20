@@ -88,6 +88,7 @@ static void test_before_any_command_telemetry_is_on_and_nothing_is_known(void)
     TEST_ASSERT_EQUAL_UINT32(0U, s_rx.frames);
     TEST_ASSERT_EQUAL_UINT32(0U, s_rx.checks);
     TEST_ASSERT_EQUAL_UINT32(0U, s_rx.status.ok + s_rx.status.no_new_data + s_rx.status.error);
+    TEST_ASSERT_EQUAL_UINT32(0U, command_clear_requests(&s_rx));
 }
 
 static void test_without_a_tester_every_period_is_a_check_with_no_new_data(void)
@@ -345,6 +346,79 @@ static void test_the_counters_add_up(void)
     TEST_ASSERT_EQUAL_UINT32(6U, s_rx.checks);
 }
 
+/* ---------------------------------------------------------------------- clear requests */
+
+/*
+ * A request to clear the DTCs is a CmdClearFaultsSeq that differs from that of the command
+ * carried out before it: the first command carried out (7) is the reference, a repeated value
+ * is none, every change is one, back to an earlier value included.
+ */
+static void test_a_changed_clear_faults_seq_between_two_commands_carried_out_is_one_request(void)
+{
+    valid_with_telemetry_off();
+    TEST_ASSERT_EQUAL_UINT32(0U, command_clear_requests(&s_rx));
+
+    periods_with_commands(2U, false, 7U);
+    TEST_ASSERT_EQUAL_UINT32(0U, command_clear_requests(&s_rx));
+    periods_with_commands(1U, false, 8U);
+    TEST_ASSERT_EQUAL_UINT32(1U, command_clear_requests(&s_rx));
+    periods_with_commands(3U, true, 8U);
+    TEST_ASSERT_EQUAL_UINT32(1U, command_clear_requests(&s_rx));
+    periods_with_commands(1U, true, 9U);
+    periods_with_commands(1U, true, 7U);
+    TEST_ASSERT_EQUAL_UINT32(3U, command_clear_requests(&s_rx));
+    TEST_ASSERT_EQUAL_UINT32(3U, s_rx.clear_requests);
+    TEST_ASSERT_EQUAL_UINT8(7U, s_rx.clear_faults_seq);
+}
+
+/* Before the stream is valid nothing is carried out, so nothing is requested either, and the
+ * first command carried out, whatever its value, is the reference. */
+static void test_the_first_command_carried_out_requests_no_clear(void)
+{
+    periods_with_commands(1U, true, 5U);
+    periods_with_commands(1U, true, 6U);
+    TEST_ASSERT_FALSE(s_rx.have_command);
+    periods_with_commands(1U, true, 9U);
+    TEST_ASSERT_TRUE(s_rx.have_command);
+    TEST_ASSERT_EQUAL_UINT8(9U, s_rx.clear_faults_seq);
+    TEST_ASSERT_EQUAL_UINT32(0U, command_clear_requests(&s_rx));
+}
+
+/*
+ * A frame that is not carried out requests nothing, whatever it carries: a damaged one, a
+ * repeated one, and those of a stream that is INVALID after a timeout. The command carried out
+ * after them is compared with the last one carried out (7), not with the frames in between.
+ */
+static void test_frames_not_carried_out_request_no_clear(void)
+{
+    can_frame_t frame;
+
+    valid_with_telemetry_off();
+    frame = command(true, 99U);
+    frame.data[0] ^= 0x01U; /* damaged */
+    period_with(&frame);
+    TEST_ASSERT_EQUAL_UINT32(0U, command_clear_requests(&s_rx));
+
+    for (uint32_t i = 0U; i < 3U; i++) {
+        command_on_cycle(&s_rx);
+    }
+    TEST_ASSERT_EQUAL(E2E_SM_INVALID, s_rx.sm.sm_state);
+
+    periods_with_commands(2U, true, 42U); /* INVALID: not carried out */
+    TEST_ASSERT_EQUAL_UINT32(0U, command_clear_requests(&s_rx));
+    TEST_ASSERT_EQUAL_UINT8(7U, s_rx.clear_faults_seq);
+
+    periods_with_commands(1U, true, 7U); /* VALID again, the value of the last one carried out */
+    TEST_ASSERT_EQUAL(E2E_SM_VALID, s_rx.sm.sm_state);
+    TEST_ASSERT_EQUAL_UINT32(0U, command_clear_requests(&s_rx));
+
+    frame = command(true, 8U);
+    period_with(&frame);
+    period_with(&frame); /* the same frame again: REPEATED, not a second request */
+    TEST_ASSERT_EQUAL_UINT32(1U, s_rx.status.repeated);
+    TEST_ASSERT_EQUAL_UINT32(1U, command_clear_requests(&s_rx));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -362,5 +436,8 @@ int main(void)
     RUN_TEST(test_a_frame_of_the_wrong_length_is_refused_and_counted_as_an_error);
     RUN_TEST(test_commands_before_the_stream_is_valid_change_nothing);
     RUN_TEST(test_the_counters_add_up);
+    RUN_TEST(test_a_changed_clear_faults_seq_between_two_commands_carried_out_is_one_request);
+    RUN_TEST(test_the_first_command_carried_out_requests_no_clear);
+    RUN_TEST(test_frames_not_carried_out_request_no_clear);
     return UNITY_END();
 }

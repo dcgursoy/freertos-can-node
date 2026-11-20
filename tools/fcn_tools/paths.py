@@ -26,6 +26,12 @@ def tool_binary(name: str, preset: str = "release") -> Path:
     return build_root() / preset / "bin" / name
 
 
+def platform_test_binary(name: str, preset: str = "release") -> Path:
+    """A self-test program of tests/platform other than plat_selftest, for example
+    "wdg_selftest". Like tool_binary(), only ever run from a build tree, so no override."""
+    return build_root() / preset / "tests" / "platform" / name
+
+
 def selftest_binary(preset: str = "release") -> Path:
     override = os.environ.get("FCN_SELFTEST")
     if override:

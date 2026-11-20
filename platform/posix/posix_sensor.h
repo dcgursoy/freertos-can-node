@@ -7,7 +7,9 @@
  *
  * The model knows nothing about FreeRTOS. Its read functions are called by the sensor task, its
  * commands are served by whichever thread calls posix_sim_service() (in the node, the CAN
- * hardware thread); the two share only atomics.
+ * hardware thread); the two share only atomics. The one place where a read needs the kernel,
+ * the blocking wait of "sensor.hang on", is a function the node hands in
+ * (posix_sensor_set_wait()).
  */
 #ifndef FCN_POSIX_SENSOR_H
 #define FCN_POSIX_SENSOR_H
@@ -27,5 +29,18 @@
  * the tests do.
  */
 void posix_sensor_start(uint32_t seed);
+
+/** How a read waits while the front end hangs with "sensor.hang on": the read calls it again
+ *  and again until the hang ends. */
+typedef void (*posix_sensor_wait_fn)(void);
+
+/**
+ * Set the wait of "sensor.hang on". The node sets a function that blocks the calling task for
+ * one tick (vTaskDelay(1)), so that the reading task is blocked, as a task whose driver waits
+ * for an interrupt that never comes, and the tasks below it run on. NULL, the default, sleeps
+ * the thread for 1 ms instead, which is all a test without a kernel needs. "sensor.hang spin"
+ * never calls it. Kept by posix_sensor_start(). Call before the reading thread starts.
+ */
+void posix_sensor_set_wait(posix_sensor_wait_fn wait);
 
 #endif /* FCN_POSIX_SENSOR_H */

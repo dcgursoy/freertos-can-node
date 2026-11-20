@@ -34,13 +34,25 @@
  * current. Off line, the front end answers no read at all. The model runs on through every
  * fault: once a fault is cleared, the readings are those of a run without it.
  *
+ * THE HANG. "sensor.hang on" or "spin" makes every read wait at its start until "sensor.hang
+ * off" (or "sensor.clear"): the hardware fault behind the watchdog tests, a front end that
+ * never completes a transfer. "on" is a driver that waits for its transfer-complete interrupt:
+ * the read calls the wait function the node set (posix_sensor_set_wait(), one tick of
+ * vTaskDelay), so the task is blocked and every task below it runs on. "spin" is a driver that
+ * polls a busy flag: the read never gives up the CPU as far as the scheduler can tell, so every
+ * task below the caller starves. (On the host the thread sleeps 1 ms between its looks at the
+ * flag, so that it does not burn a host core; the scheduler does not see the sleep.) A read
+ * that waited is counted in `hung` when it starts to wait and is taken, numbered and answered
+ * as any other once the hang ends: the model has no clock, so the readings go on with the next
+ * number.
+ *
  * THREADS. The read functions run in the sensor task, the commands in the thread that serves
  * simulation control (the CAN hardware thread). They share only atomics: one 64-bit word per
  * channel holds its mode and its held value together, so a reading sees either the setting
- * before a command or the one after it, never a mix of the two; the off-line flag and the
- * counters are atomics of their own. Nothing here blocks or takes a lock, so a FreeRTOS task
- * may call the read functions (posix_platform.h). The seed is written by posix_sensor_start()
- * before either thread runs, and only read afterwards.
+ * before a command or the one after it, never a mix of the two; the off-line flag, the hang and
+ * the counters are atomics of their own. Nothing here takes a lock, and nothing blocks except
+ * a read during a hang, so a FreeRTOS task may call the read functions (posix_platform.h). The
+ * seed and the wait function are written before either thread runs, and only read afterwards.
  */
 #include "posix_sensor.h"
 
@@ -72,6 +84,14 @@
 #define MODE_MODEL 0U /* the model's value */
 #define MODE_HELD  1U /* the held value, valid */
 #define MODE_OPEN  2U /* flagged invalid */
+
+/* The hang of the front end. */
+#define HANG_OFF   0U /* reads return */
+#define HANG_BLOCK 1U /* "on": a read blocks its task through the wait function */
+#define HANG_SPIN  2U /* "spin": a read keeps the CPU */
+
+/* How long a read sleeps between two looks at the hang without a wait function, or in spin. */
+#define HANG_NAP_NS 1000000L
 
 /* Noise amplitudes: a reading lies within +-this of the model's value. */
 #define CURRENT_NOISE_MA 150U
@@ -126,6 +146,14 @@ static _Atomic uint64_t s_channels[CH_COUNT]; /* mode << 32 | held value as uint
 static _Atomic bool s_offline;
 static _Atomic uint64_t s_reads[GROUPS]; /* readings taken, answered or not */
 static _Atomic uint64_t s_unanswered;    /* of those, the ones taken while off line */
+static _Atomic uint32_t s_hang;          /* HANG_OFF, HANG_BLOCK or HANG_SPIN */
+static _Atomic uint64_t s_hung;          /* reads that had to wait for a hang to end */
+static posix_sensor_wait_fn s_wait;      /* set before the threads run; NULL: sleep */
+
+static const char *const HANG_NAMES[] = {"off", "on", "spin"};
+
+_Static_assert((sizeof(HANG_NAMES) / sizeof(HANG_NAMES[0])) == (HANG_SPIN + 1U),
+               "one name per hang mode");
 
 /* --------------------------------------------------------------------------------- the model */
 
@@ -221,9 +249,39 @@ static int32_t reported(uint32_t channel, int32_t model, bool *invalid)
     return value;
 }
 
-/* Number this reading of `group` in *n and say whether the front end answers it. */
+static void nap(void)
+{
+    const struct timespec pause = {0, HANG_NAP_NS};
+
+    (void)nanosleep(&pause, NULL);
+}
+
+/* While the front end hangs, a read does not get past this point (see THE HANG). */
+static void wait_while_hanging(void)
+{
+    uint32_t mode = atomic_load(&s_hang);
+
+    if (mode != HANG_OFF) {
+        (void)atomic_fetch_add(&s_hung, 1U);
+
+        while (mode != HANG_OFF) {
+            if ((mode == HANG_BLOCK) && (s_wait != NULL)) {
+                s_wait();
+            } else {
+                nap();
+            }
+
+            mode = atomic_load(&s_hang);
+        }
+    }
+}
+
+/* Number this reading of `group` in *n and say whether the front end answers it, once the
+ * front end is not hanging. */
 static bool take_reading(uint32_t group, uint64_t *n)
 {
+    wait_while_hanging();
+
     const bool answered = !atomic_load(&s_offline);
 
     *n = atomic_fetch_add(&s_reads[group], 1U);
@@ -416,7 +474,7 @@ static bool unknown_channel(const char *name, char *reply, size_t reply_len)
 }
 
 /* The status: seed, off-line state, counters, then every channel as <name>=model, =open or
- * =<held value>. */
+ * =<held value>, and last the hang and the reads that waited for one. */
 static bool status_reply(char *reply, size_t reply_len)
 {
     size_t used = 0U;
@@ -446,6 +504,16 @@ static bool status_reply(char *reply, size_t reply_len)
         fits = (length >= 0) && ((size_t)length < (reply_len - used));
     }
 
+    if (fits) {
+        const uint32_t hang = atomic_load(&s_hang);
+
+        used += (size_t)length;
+        length = snprintf(&reply[used], reply_len - used, " hang=%s hung=%llu",
+                          HANG_NAMES[(hang <= HANG_SPIN) ? hang : HANG_OFF],
+                          (unsigned long long)atomic_load(&s_hung));
+        fits = (length >= 0) && ((size_t)length < (reply_len - used));
+    }
+
     /* A reply cut short would lose the channels at its end without anyone noticing. */
     if (!fits) {
         (void)snprintf(reply, reply_len, "the status does not fit into a reply");
@@ -455,7 +523,7 @@ static bool status_reply(char *reply, size_t reply_len)
 }
 
 /* Commands under "sensor.": status | set <channel> <value> | open <channel> | offline on|off |
- * clear [<channel>]. Runs in the thread that serves simulation control. */
+ * hang on|spin|off | clear [<channel>]. Runs in the thread that serves simulation control. */
 static bool sim_sensor_handler(const char *verb, const char *args, char *reply, size_t reply_len)
 {
     words_t words;
@@ -526,6 +594,25 @@ static bool sim_sensor_handler(const char *verb, const char *args, char *reply, 
         return true;
     }
 
+    if (strcmp(verb, "hang") == 0) {
+        uint32_t mode = HANG_SPIN + 1U;
+
+        for (uint32_t m = 0U; (m <= HANG_SPIN) && (words.count == 1U) && !words.too_long; m++) {
+            if (strcmp(words.word[0], HANG_NAMES[m]) == 0) {
+                mode = m;
+            }
+        }
+
+        if (mode > HANG_SPIN) {
+            (void)snprintf(reply, reply_len, "usage: sensor.hang on|spin|off");
+            return false;
+        }
+
+        atomic_store(&s_hang, mode);
+        (void)snprintf(reply, reply_len, "hang=%s t_ns=%llu", HANG_NAMES[mode], now_ns());
+        return true;
+    }
+
     if (strcmp(verb, "clear") == 0) {
         if (words.too_long || (words.count > 1U)) {
             (void)snprintf(reply, reply_len, "usage: sensor.clear [<channel>]");
@@ -538,7 +625,9 @@ static bool sim_sensor_handler(const char *verb, const char *args, char *reply, 
             }
 
             atomic_store(&s_offline, false);
-            (void)snprintf(reply, reply_len, "cleared=all offline=off t_ns=%llu", now_ns());
+            atomic_store(&s_hang, HANG_OFF);
+            (void)snprintf(reply, reply_len, "cleared=all offline=off hang=off t_ns=%llu",
+                           now_ns());
             return true;
         }
 
@@ -571,5 +660,12 @@ void posix_sensor_start(uint32_t seed)
 
     atomic_store(&s_unanswered, 0U);
     atomic_store(&s_offline, false);
+    atomic_store(&s_hang, HANG_OFF);
+    atomic_store(&s_hung, 0U);
     posix_sim_register("sensor.", sim_sensor_handler);
+}
+
+void posix_sensor_set_wait(posix_sensor_wait_fn wait)
+{
+    s_wait = wait;
 }

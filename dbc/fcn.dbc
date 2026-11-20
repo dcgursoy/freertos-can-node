@@ -36,6 +36,15 @@ BS_:
 BU_: BMS TESTER
 
 
+BO_ 16 BMS_Fault: 8 BMS
+ SG_ E2E_Crc : 0|8@1+ (1,0) [0|255] "" TESTER
+ SG_ E2E_Counter : 8|4@1+ (1,0) [0|14] "" TESTER
+ SG_ FaultActive : 16|16@1+ (1,0) [0|65535] "" TESTER
+ SG_ FaultConfirmed : 32|16@1+ (1,0) [0|65535] "" TESTER
+ SG_ FaultMostRecent : 48|5@1+ (1,0) [0|15] "" TESTER
+ SG_ FaultWarning : 53|1@1+ (1,0) [0|1] "" TESTER
+ SG_ FaultClearCount : 56|8@1+ (1,0) [0|255] "" TESTER
+
 BO_ 32 BMS_PackStatus: 8 BMS
  SG_ E2E_Crc : 0|8@1+ (1,0) [0|255] "" TESTER
  SG_ E2E_Counter : 8|4@1+ (1,0) [0|14] "" TESTER
@@ -107,13 +116,21 @@ BO_ 2024 UDS_Response: 8 BMS
 CM_ "freertos-can-node: every frame the node sends or accepts, base format (11-bit identifiers), little-endian signals. A lower identifier wins arbitration, so identifiers are handed out by urgency. Messages with an FcnE2eDataId of 0 or more are protected by AUTOSAR E2E Profile 11, variant 11A (docs/can-protocol.md).";
 CM_ BU_ BMS "The node: a FreeRTOS telemetry node for one battery module.";
 CM_ BU_ TESTER "Whatever talks to the node: the test bench, a diagnostic tool.";
+CM_ BO_ 16 "The node's diagnostic trouble codes, every 100 ms, sent by the task that owns them after the last change it made in the period, so that every change goes out in the frame of the period that made it. Protected end to end. Fault n (the value table of FaultMostRecent, app/fault.h) is bit n of FaultActive and FaultConfirmed.";
+CM_ SG_ 16 E2E_Crc "E2E Profile 11 CRC over the Data ID and bytes 1 to 7.";
+CM_ SG_ 16 E2E_Counter "E2E Profile 11 counter: 0 to 14, then 0 again; 15 is never sent.";
+CM_ SG_ 16 FaultActive "Bit n: the DTC of fault n has testFailed (ISO 14229-1 status bit 0), the fault is present now. PackFaultActive is 1 while any bit is.";
+CM_ SG_ 16 FaultConfirmed "Bit n: the DTC of fault n has confirmedDTC (status bit 3): the fault occurred since the node started or since the last clear (CmdClearFaultsSeq).";
+CM_ SG_ 16 FaultMostRecent "The fault whose DTC went to testFailed most recently since the start or the last clear; NONE if none did.";
+CM_ SG_ 16 FaultWarning "1 while a DTC requests the warning indicator (status bit 7): a limit of the pack was exceeded, or its measurement failed, since the start or the last clear.";
+CM_ SG_ 16 FaultClearCount "Clears of the DTCs carried out since the node started, modulo 256.";
 CM_ BO_ 32 "Pack summary, every 10 ms. Protected end to end.";
 CM_ SG_ 32 E2E_Crc "E2E Profile 11 CRC over the Data ID and bytes 1 to 7.";
 CM_ SG_ 32 E2E_Counter "E2E Profile 11 counter: 0 to 14, then 0 again; 15 is never sent.";
 CM_ SG_ 32 PackCurrent "Filtered pack current, positive while the pack is discharging; meaningful only while PackCurrentValid is 1.";
 CM_ SG_ 32 PackVoltage "Sum of the filtered cell voltages; meaningful only while PackVoltageValid is 1.";
-CM_ SG_ 32 PackState "STARTUP until every channel has delivered a reading, FAULT while a channel is invalid, NORMAL otherwise.";
-CM_ SG_ 32 PackFaultActive "1 while a fault is active (phase 3).";
+CM_ SG_ 32 PackState "STARTUP until every channel has delivered a reading, FAULT while a channel is invalid or a fault is active (PackFaultActive), NORMAL otherwise.";
+CM_ SG_ 32 PackFaultActive "1 while a fault is active: a bit of BMS_Fault's FaultActive is set.";
 CM_ SG_ 32 PackCurrentValid "1 if PackCurrent holds a valid, filtered measurement.";
 CM_ SG_ 32 PackVoltageValid "1 if every cell voltage is valid, so that PackVoltage is their sum.";
 CM_ BO_ 48 "Heartbeat, every 10 ms: the status frame of phase 1, unchanged. The node keeps the latest value in a slot of its transmit queue, so a value not yet sent is replaced by the next one, and a missing counter value means it was replaced. Not protected end to end.";
@@ -144,7 +161,7 @@ CM_ BO_ 256 "Commands to the node, sent cyclically every 100 ms so that their lo
 CM_ SG_ 256 E2E_Crc "E2E Profile 11 CRC over the Data ID and bytes 1 to 7.";
 CM_ SG_ 256 E2E_Counter "E2E Profile 11 counter: 0 to 14, then 0 again; 15 is never sent.";
 CM_ SG_ 256 CmdTelemetryOn "0 silences the protected cyclic telemetry (BMS_PackStatus, BMS_CellVoltages1, BMS_CellVoltages2, BMS_Temperatures); the heartbeat, the task statistics and the node information go on. The node behaves as if 1 until a valid command has arrived.";
-CM_ SG_ 256 CmdClearFaultsSeq "Latched faults are cleared whenever this value changes from one valid command to the next (phase 3).";
+CM_ SG_ 256 CmdClearFaultsSeq "The node clears its DTCs whenever this value changes from one command it carries out to the next.";
 CM_ BO_ 1536 "Run-time statistics of one task per frame; the node cycles through its tasks, one frame every 200 ms. Not protected end to end.";
 CM_ SG_ 1536 TaskIndex "Which task this frame describes: 0 to the number of tasks minus 1.";
 CM_ SG_ 1536 TaskPriority "The task's FreeRTOS priority.";
@@ -156,7 +173,7 @@ CM_ SG_ 1552 SwMajor "Software version, major number.";
 CM_ SG_ 1552 SwMinor "Software version, minor number.";
 CM_ SG_ 1552 SwPatch "Software version, patch number.";
 CM_ SG_ 1552 ActiveSlot "The firmware slot the node runs from (phase 4); SNA until the node has A/B slots.";
-CM_ SG_ 1552 ResetCause "Why the node was last reset: the values of plat_reset_reason_t; SNA while the node does not know.";
+CM_ SG_ 1552 ResetCause "Why the node was last reset: the values of plat_reset_reason_t; POWER_ON for a start without a reset before it; SNA while the node does not know.";
 CM_ SG_ 1552 UptimeSeconds "Seconds since the node started.";
 CM_ BO_ 1776 "Echo request: any payload of 0 to 8 bytes. No signals; used for link tests and latency measurements.";
 CM_ BO_ 1777 "Echo reply: the payload of the request, 0 to 8 bytes.";
@@ -173,6 +190,7 @@ BA_DEF_DEF_ "GenMsgCycleTime" 0;
 BA_DEF_DEF_ "FcnE2eDataId" -1;
 BA_ "BusType" "CAN";
 BA_ "Baudrate" 500000;
+BA_ "GenMsgCycleTime" BO_ 16 100;
 BA_ "GenMsgCycleTime" BO_ 32 10;
 BA_ "GenMsgCycleTime" BO_ 48 10;
 BA_ "GenMsgCycleTime" BO_ 64 20;
@@ -181,12 +199,14 @@ BA_ "GenMsgCycleTime" BO_ 80 100;
 BA_ "GenMsgCycleTime" BO_ 256 100;
 BA_ "GenMsgCycleTime" BO_ 1536 200;
 BA_ "GenMsgCycleTime" BO_ 1552 1000;
+BA_ "FcnE2eDataId" BO_ 16 272;
 BA_ "FcnE2eDataId" BO_ 32 288;
 BA_ "FcnE2eDataId" BO_ 64 320;
 BA_ "FcnE2eDataId" BO_ 65 321;
 BA_ "FcnE2eDataId" BO_ 80 336;
 BA_ "FcnE2eDataId" BO_ 256 512;
 
+VAL_ 16 FaultMostRecent 0 "CELL_OVERVOLTAGE" 1 "CELL_UNDERVOLTAGE" 2 "OVERTEMPERATURE" 3 "UNDERTEMPERATURE" 4 "OVERCURRENT_DISCHARGE" 5 "OVERCURRENT_CHARGE" 6 "SENSOR_CHANNEL_INVALID" 7 "FRONT_END_NO_ANSWER" 8 "SAMPLE_TIMEOUT" 9 "CAN_BUS_OFF" 10 "CAN_ERROR_PASSIVE" 11 "SUPERVISION_EXPIRED" 12 "RESET_WATCHDOG" 13 "RESET_ASSERT" 14 "RESET_STACK_OVERFLOW" 15 "RESET_MALLOC_FAILED" 31 "NONE" ;
 VAL_ 32 PackState 0 "STARTUP" 1 "NORMAL" 2 "FAULT" ;
 VAL_ 64 Cell1Voltage 4095 "SNA" ;
 VAL_ 64 Cell2Voltage 4095 "SNA" ;
@@ -201,4 +221,4 @@ VAL_ 80 Temp2 255 "SNA" ;
 VAL_ 80 Temp3 255 "SNA" ;
 VAL_ 80 Temp4 255 "SNA" ;
 VAL_ 1552 ActiveSlot 0 "A" 1 "B" 3 "SNA" ;
-VAL_ 1552 ResetCause 10 "REQUESTED" 11 "WATCHDOG" 12 "POWER_LOSS" 13 "IMAGE_FAULT" 20 "ASSERT" 21 "STACK_OVERFLOW" 22 "MALLOC_FAILED" 63 "SNA" ;
+VAL_ 1552 ResetCause 0 "POWER_ON" 10 "REQUESTED" 11 "WATCHDOG" 12 "POWER_LOSS" 13 "IMAGE_FAULT" 20 "ASSERT" 21 "STACK_OVERFLOW" 22 "MALLOC_FAILED" 63 "SNA" ;

@@ -27,7 +27,7 @@
  * reset, and the caller publishes "signal not available" for it, never a made-up number. A
  * channel becomes valid again with the next plausible reading, and its filter restarts from
  * that reading. Whether a valid value is also SAFE (over-voltage, over-temperature ...) is not
- * decided here; that is the fault monitor's job (phase 3).
+ * decided here; that is the fault monitor's job (app/fault.h).
  *
  * A group of readings that the front end did not deliver at all (plat_sensor.h: the read
  * returned false) is passed in as read, with every channel of the group flagged invalid. It is
@@ -172,7 +172,8 @@ typedef struct {
 typedef enum {
     BMS_STATE_STARTUP = 0, /**< no channel is invalid, but not every one has reported yet */
     BMS_STATE_NORMAL = 1,  /**< every channel has reported, and every one is valid */
-    BMS_STATE_FAULT = 2    /**< at least one channel is invalid (phase 3: or a fault is active) */
+    BMS_STATE_FAULT = 2    /**< at least one channel is invalid (the node also sends FAULT while
+                                a DTC is active: app/telemetry.h, telemetry_pack_status()) */
 } bms_state_t;
 
 /**

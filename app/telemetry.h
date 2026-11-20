@@ -7,6 +7,7 @@
  * protected end to end (lib/e2e, AUTOSAR E2E Profile 11A) as the last step.
  *
  *   message             built by                     protected   carries
+ *   BMS_Fault           telemetry_fault()            yes         the DTCs' summary (fault.h)
  *   BMS_PackStatus      telemetry_pack_status()      yes         current, voltage, state, flags
  *   BMS_CellVoltages1   telemetry_cell_voltages1()   yes         cells 1..4
  *   BMS_CellVoltages2   telemetry_cell_voltages2()   yes         cells 5..8
@@ -20,13 +21,16 @@
  * Bits that belong to no signal are sent as 0, as the codec writes them.
  *
  * END-TO-END PROTECTION. The sender keeps one Profile 11 counter per protected message
- * (telemetry_sender_t). A builder of a protected message writes the payload, then the counter
- * and the CRC, and advances the counter: call it once for every frame that is handed to the
- * bus, and hand every frame it built to the bus, or the receiver sees a counter jump.
+ * (telemetry_sender_t for the four of the measurement chain; the caller's
+ * e2e_p11_protect_state_t for BMS_Fault, which another task sends). A builder of a protected
+ * message writes the payload, then the counter and the CRC, and advances the counter: call it
+ * once for every frame that is handed to the bus, and hand every frame it built to the bus, or
+ * the receiver sees a counter jump.
  *
  * CONTEXT. No operating system, no locks. A telemetry_sender_t belongs to the one task that
- * builds the protected messages, a telemetry_uptime_t to the one that sends BMS_NodeInfo; the
- * builders of the other messages keep no state and may be called from any task.
+ * builds the protected messages of the measurement chain, the counter of BMS_Fault to the one
+ * that sends BMS_Fault, a telemetry_uptime_t to the one that sends BMS_NodeInfo; the builders
+ * of the other messages keep no state and may be called from any task.
  */
 #ifndef FCN_TELEMETRY_H
 #define FCN_TELEMETRY_H
@@ -37,6 +41,8 @@
 #include "bms/bms.h"
 #include "can/can_frame.h"
 #include "e2e/e2e_p11.h"
+#include "fault.h"
+#include "platform.h"
 
 /** The protected messages, in the order of their counters in telemetry_sender_t. */
 typedef enum {
@@ -81,13 +87,26 @@ void telemetry_init(telemetry_sender_t *sender);
 /**
  * BMS_PackStatus from a copy of the pack state: PackCurrent and PackCurrentValid from
  * current_ma and current_valid, PackVoltage and PackVoltageValid from pack_mv and pack_valid
- * (pack_mv is the pack voltage only while pack_valid), PackState from state, PackFaultActive 0
- * (the fault monitor of phase 3 sets it). Then protected.
+ * (pack_mv is the pack voltage only while pack_valid), PackFaultActive from `fault_active`
+ * (a DTC has testFailed, fault_summary_t.active != 0), and PackState from state, except that it
+ * is FAULT while `fault_active`. Then protected.
  *
  * Returns false, with `frame` unspecified and the counter not advanced, only if packing or
  * protection refused, which nothing but a wrong build can make them do.
  */
-bool telemetry_pack_status(telemetry_sender_t *sender, const bms_pack_t *pack, can_frame_t *frame);
+bool telemetry_pack_status(telemetry_sender_t *sender, const bms_pack_t *pack, bool fault_active,
+                           can_frame_t *frame);
+
+/**
+ * BMS_Fault from a summary of the DTCs: FaultActive, FaultConfirmed, FaultMostRecent (the
+ * fault's number, or NONE), FaultWarning and FaultClearCount as fault_summary_t gives them.
+ * Then protected with `counter`, the Profile 11 state of BMS_Fault, which the one task that
+ * sends BMS_Fault keeps (set up with e2e_p11_protect_init()). Returns false as
+ * telemetry_pack_status(), and also, building nothing, if `summary->most_recent` is neither a
+ * fault nor FAULT_NONE.
+ */
+bool telemetry_fault(e2e_p11_protect_state_t *counter, const fault_summary_t *summary,
+                     can_frame_t *frame);
 
 /** BMS_CellVoltages1: cells 1 to 4 of the pack state (bit n of cell_valid for cell n + 1), each
  *  SNA while not valid. Then protected. Returns false as telemetry_pack_status(). */
@@ -112,10 +131,11 @@ bool telemetry_heartbeat(uint32_t period_counter, uint32_t tick_count, can_frame
 bool telemetry_task_stats(const telemetry_task_t *task, can_frame_t *frame);
 
 /** BMS_NodeInfo: the software version, ActiveSlot SNA (the node has no A/B slots before
- *  phase 4), ResetCause SNA (the node does not know why it was started), the uptime in
- *  seconds. Returns false only if packing refused. */
-bool telemetry_node_info(uint8_t sw_major, uint8_t sw_minor, uint8_t sw_patch, uint32_t uptime_s,
-                         can_frame_t *frame);
+ *  phase 4), ResetCause the value of `reset_cause` (plat_reset_cause(): POWER_ON or a reset
+ *  reason; SNA for a value that is neither), the uptime in seconds. Returns false only if
+ *  packing refused. */
+bool telemetry_node_info(uint8_t sw_major, uint8_t sw_minor, uint8_t sw_patch,
+                         plat_reset_reason_t reset_cause, uint32_t uptime_s, can_frame_t *frame);
 
 /** One period of the counting task has ended; `periods_per_second` of them (at least 1) make a
  *  second. Returns true if this period completed a second, which uptime->seconds then

@@ -47,8 +47,8 @@ def pack_status(counter: int, data_id_: int = 0x0120) -> bytes:
 
 
 def test_the_protected_messages_and_their_data_ids_come_from_the_dbc():
-    assert Decoder().protected == {0x020: 0x0120, 0x040: 0x0140, 0x041: 0x0141, 0x050: 0x0150,
-                                   0x100: 0x0200}
+    assert Decoder().protected == {0x010: 0x0110, 0x020: 0x0120, 0x040: 0x0140, 0x041: 0x0141,
+                                   0x050: 0x0150, 0x100: 0x0200}
     assert data_id(DB.get_message_by_frame_id(0x030)) is None
 
 

@@ -4,7 +4,7 @@
  * signal, and the adapters between arrays of raw values and the structs.
  *
  * GENERATED FILE, DO NOT EDIT. Test support, not part of the node. Made by tools/gen_can_db.py from
- * dbc/fcn.dbc, SHA-256 feb8206c28af39cac838870eddc7c089ff50245ffdfad345fcee4131dbee88c5.
+ * dbc/fcn.dbc, SHA-256 3c885b001d6267703e6d18cb32aab9cfacdde26aa433f84e84d764b504a57dfe.
  *
  * After a change of the DBC, run scripts/codegen-check.sh --update. Without --update the script
  * fails while this file is out of date; CI and scripts/check.sh run it.
@@ -12,6 +12,48 @@
 #include "can_db_table.h"
 
 #include "can_db.h"
+
+static bool pack_bms_fault(const int64_t *raw, uint8_t *data, size_t capacity)
+{
+    can_db_bms_fault_t msg;
+
+    msg.e2e_crc = (uint8_t)raw[0];
+    msg.e2e_counter = (uint8_t)raw[1];
+    msg.fault_active = (uint16_t)raw[2];
+    msg.fault_confirmed = (uint16_t)raw[3];
+    msg.fault_most_recent = (uint8_t)raw[4];
+    msg.fault_warning = (uint8_t)raw[5];
+    msg.fault_clear_count = (uint8_t)raw[6];
+    return can_db_bms_fault_pack(&msg, data, capacity);
+}
+
+static bool unpack_bms_fault(const uint8_t *data, size_t len, int64_t *raw)
+{
+    can_db_bms_fault_t msg = {0};
+    const bool unpacked = can_db_bms_fault_unpack(&msg, data, len);
+
+    if (unpacked) {
+        raw[0] = msg.e2e_crc;
+        raw[1] = msg.e2e_counter;
+        raw[2] = msg.fault_active;
+        raw[3] = msg.fault_confirmed;
+        raw[4] = msg.fault_most_recent;
+        raw[5] = msg.fault_warning;
+        raw[6] = msg.fault_clear_count;
+    }
+
+    return unpacked;
+}
+
+static const can_db_table_signal_t SIGNALS_BMS_FAULT[] = {
+    {"E2E_Crc", 0U, 8U, false, 0, 255, 0, 255},              /* uint8_t e2e_crc */
+    {"E2E_Counter", 8U, 4U, false, 0, 15, 0, 255},           /* uint8_t e2e_counter */
+    {"FaultActive", 16U, 16U, false, 0, 65535, 0, 65535},    /* uint16_t fault_active */
+    {"FaultConfirmed", 32U, 16U, false, 0, 65535, 0, 65535}, /* uint16_t fault_confirmed */
+    {"FaultMostRecent", 48U, 5U, false, 0, 31, 0, 255},      /* uint8_t fault_most_recent */
+    {"FaultWarning", 53U, 1U, false, 0, 1, 0, 255},          /* uint8_t fault_warning */
+    {"FaultClearCount", 56U, 8U, false, 0, 255, 0, 255},     /* uint8_t fault_clear_count */
+};
 
 static bool pack_bms_pack_status(const int64_t *raw, uint8_t *data, size_t capacity)
 {
@@ -311,6 +353,17 @@ static const can_db_table_signal_t SIGNALS_BMS_NODE_INFO[] = {
 };
 
 const can_db_table_message_t can_db_table[] = {
+    {
+        .name = "BMS_Fault",
+        .id = CAN_DB_BMS_FAULT_ID,
+        .dlc = CAN_DB_BMS_FAULT_DLC,
+        .cycle_ms = CAN_DB_BMS_FAULT_CYCLE_MS,
+        .e2e_data_id = 272,
+        .signal_count = 7U,
+        .signals = SIGNALS_BMS_FAULT,
+        .pack = pack_bms_fault,
+        .unpack = unpack_bms_fault,
+    },
     {
         .name = "BMS_PackStatus",
         .id = CAN_DB_BMS_PACK_STATUS_ID,

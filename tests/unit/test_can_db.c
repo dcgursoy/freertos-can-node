@@ -133,6 +133,7 @@ static void test_the_message_set_is_the_one_of_the_design(void)
         uint16_t cycle_ms;
         int32_t data_id;
     } expected[] = {
+        {0x010U, 8U, 100U, 0x0110}, /* BMS_Fault */
         {0x020U, 8U, 10U, 0x0120},  /* BMS_PackStatus */
         {0x030U, 8U, 10U, -1},      /* BMS_Heartbeat */
         {0x040U, 8U, 20U, 0x0140},  /* BMS_CellVoltages1 */
@@ -199,6 +200,9 @@ static void test_the_scaling_is_given_as_exact_fractions(void)
     TEST_ASSERT_EQUAL_UINT32(3U, CAN_DB_BMS_NODE_INFO_ACTIVE_SLOT_SNA);
     TEST_ASSERT_EQUAL_UINT32(63U, CAN_DB_BMS_NODE_INFO_RESET_CAUSE_SNA);
     TEST_ASSERT_EQUAL_UINT32(11U, CAN_DB_BMS_NODE_INFO_RESET_CAUSE_WATCHDOG);
+    TEST_ASSERT_EQUAL_UINT32(0U, CAN_DB_BMS_NODE_INFO_RESET_CAUSE_POWER_ON);
+    TEST_ASSERT_EQUAL_UINT32(31U, CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_NONE);
+    TEST_ASSERT_EQUAL_UINT32(15U, CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_MALLOC_FAILED);
     TEST_ASSERT_EQUAL_UINT32(2U, CAN_DB_BMS_PACK_STATUS_PACK_STATE_FAULT);
     TEST_ASSERT_EQUAL_INT32(-32768, CAN_DB_BMS_PACK_STATUS_PACK_CURRENT_RAW_MIN);
     TEST_ASSERT_EQUAL_INT32(32767, CAN_DB_BMS_PACK_STATUS_PACK_CURRENT_RAW_MAX);
@@ -369,6 +373,56 @@ static void test_temperatures_command_task_stats_and_node_info_by_hand(void)
     TEST_ASSERT_EQUAL_HEX32(0x12345678U, info_back.uptime_seconds);
 }
 
+/*
+ * BMS_Fault:
+ *   byte 0      E2E_Crc 0x3C
+ *   byte 1      E2E_Counter 14 in bits 0..3; bits 4..7 belong to no signal: 0x0E
+ *   bytes 2..3  FaultActive 0x1234, low byte first: 34 12
+ *   bytes 4..5  FaultConfirmed 0xFEDC: DC FE
+ *   byte 6      FaultMostRecent 21 (0b10101) in bits 0..4, FaultWarning 1 in bit 5; bits 6..7
+ *               belong to no signal: 0x35
+ *   byte 7      FaultClearCount 0xA5
+ */
+static void test_fault_by_hand(void)
+{
+    const can_db_bms_fault_t fault = {.e2e_crc = 0x3CU,
+                                      .e2e_counter = 14U,
+                                      .fault_active = 0x1234U,
+                                      .fault_confirmed = 0xFEDCU,
+                                      .fault_most_recent = 21U,
+                                      .fault_warning = 1U,
+                                      .fault_clear_count = 0xA5U};
+    const uint8_t expected[8] = {0x3C, 0x0E, 0x34, 0x12, 0xDC, 0xFE, 0x35, 0xA5};
+    uint8_t data[8];
+    can_db_bms_fault_t back;
+
+    TEST_ASSERT_TRUE(can_db_bms_fault_pack(&fault, data, sizeof(data)));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, data, 8);
+
+    (void)memset(&back, FILL, sizeof(back));
+    TEST_ASSERT_TRUE(can_db_bms_fault_unpack(&back, data, sizeof(data)));
+    TEST_ASSERT_EQUAL_HEX8(0x3CU, back.e2e_crc);
+    TEST_ASSERT_EQUAL_UINT8(14U, back.e2e_counter);
+    TEST_ASSERT_EQUAL_HEX16(0x1234U, back.fault_active);
+    TEST_ASSERT_EQUAL_HEX16(0xFEDCU, back.fault_confirmed);
+    TEST_ASSERT_EQUAL_UINT8(21U, back.fault_most_recent);
+    TEST_ASSERT_EQUAL_UINT8(1U, back.fault_warning);
+    TEST_ASSERT_EQUAL_HEX8(0xA5U, back.fault_clear_count);
+
+    /* NONE, no warning, nothing active: byte 6 holds 31 alone. */
+    const can_db_bms_fault_t none = {.e2e_crc = 0U,
+                                     .e2e_counter = 0U,
+                                     .fault_active = 0U,
+                                     .fault_confirmed = 0U,
+                                     .fault_most_recent = CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_NONE,
+                                     .fault_warning = 0U,
+                                     .fault_clear_count = 0U};
+    const uint8_t none_expected[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F, 0x00};
+
+    TEST_ASSERT_TRUE(can_db_bms_fault_pack(&none, data, sizeof(data)));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(none_expected, data, 8);
+}
+
 /* ------------------------------------------------------------------------------------------
  * Sign extension and masking, by hand
  * ---------------------------------------------------------------------------------------- */
@@ -515,7 +569,7 @@ static void test_every_signal_alone_at_its_maximum_changes_only_its_own_bits(voi
         }
     }
 
-    TEST_ASSERT_EQUAL_size_t(43U, checked); /* the signals of the DBC */
+    TEST_ASSERT_EQUAL_size_t(50U, checked); /* the signals of the DBC */
 }
 
 static void test_every_signal_cleared_alone_clears_only_its_own_bits(void)
@@ -681,6 +735,7 @@ static void test_random_frames_come_back_unchanged_in_the_bits_of_the_signals(vo
 
 static void test_the_table_reaches_every_message_by_its_identifier(void)
 {
+    TEST_ASSERT_EQUAL_size_t(7U, table_message(0x010U)->signal_count);
     TEST_ASSERT_EQUAL_size_t(8U, table_message(0x020U)->signal_count);
     TEST_ASSERT_EQUAL_size_t(2U, table_message(0x030U)->signal_count);
     TEST_ASSERT_EQUAL_size_t(6U, table_message(0x040U)->signal_count);
@@ -702,6 +757,7 @@ int main(void)
     RUN_TEST(test_pack_status_by_hand);
     RUN_TEST(test_cell_voltages_by_hand);
     RUN_TEST(test_temperatures_command_task_stats_and_node_info_by_hand);
+    RUN_TEST(test_fault_by_hand);
     RUN_TEST(test_a_signed_signal_is_sign_extended);
     RUN_TEST(test_a_value_wider_than_its_signal_is_masked);
     RUN_TEST(test_pack_refuses_null_pointers_and_a_short_buffer_and_writes_nothing);

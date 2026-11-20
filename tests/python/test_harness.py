@@ -6,7 +6,8 @@
     (fcn_tools.timing.run_with_one_retry, the command scripts/test-system.sh runs): a
     failure that is not a timing miss is never repeated;
   - the supervision of nodes by the start_node fixture and the session: a node death the test
-    did not look at fails the test, and so does a node left running at the end.
+    did not look at fails the test, a reset the test did not wait for with wait_for_reset()
+    fails it, and so does a node left running at the end.
 
 Each scratch run gets a copy of the real tests/conftest.py, so the hooks under test are the
 ones the system tests use, and stand-in nodes (shell scripts) instead of the node binary.
@@ -293,7 +294,12 @@ def test_does_not_look(start_node):
 
 def test_looks(start_node):
     node = start_node()
-    assert node.wait(timeout=10) == 20     # noticed: the test's business
+    assert node.wait_for_reset(timeout=10) == 20     # expected: the test's business
+
+
+def test_looks_but_expects_no_reset(start_node):
+    node = start_node()
+    assert node.wait(timeout=10) == 20     # seen, but a reset the test did not wait for
 
 
 def test_leaves_a_node_running(workdir, node_binary):
@@ -311,7 +317,7 @@ def stand_in_node(root: Path, body: str) -> Path:
 def test_a_node_death_the_test_did_not_look_at_fails_the_test(scratch):
     scratch.write("test_supervised.py", SUPERVISED_TESTS)
     node = stand_in_node(scratch.root, 'echo "FATAL assertion failed" >&2\nexit 20\n')
-    out = scratch.pytest("-k", "does_not_look or test_looks",
+    out = scratch.pytest("-k", "does_not_look or (test_looks and not expects_no_reset)",
                          env=dict(scratch.env, FCN_NODE=str(node)))
     assert out.returncode == 1, out.stdout
     # Both tests pass their own assertions; the one that did not look gets an error.
@@ -319,6 +325,19 @@ def test_a_node_death_the_test_did_not_look_at_fails_the_test(scratch):
     assert re.search(r"^ERROR \S*test_supervised\.py::test_does_not_look", out.stdout,
                      re.MULTILINE), out.stdout
     assert "ended by itself with status 20 while the test was not looking" in out.stdout
+
+
+def test_a_reset_the_test_did_not_wait_for_fails_the_test(scratch):
+    """A system test that does not wait for a reset with wait_for_reset() expects none: a node
+    that was reset fails it, even when the test saw the status."""
+    scratch.write("test_supervised.py", SUPERVISED_TESTS)
+    node = stand_in_node(scratch.root, 'echo "FATAL watchdog: not kicked" >&2\nexit 20\n')
+    out = scratch.pytest("-k", "test_looks", env=dict(scratch.env, FCN_NODE=str(node)))
+    assert out.returncode == 1, out.stdout
+    assert re.search(r"\b2 passed, \d+ deselected, 1 error\b", out.stdout), out.stdout
+    assert re.search(r"^ERROR \S*test_supervised\.py::test_looks_but_expects_no_reset",
+                     out.stdout, re.MULTILINE), out.stdout
+    assert "was reset (status 20) in a test that does not expect a reset" in out.stdout
 
 
 def test_a_node_left_running_at_the_end_fails_the_session(scratch):

@@ -4,7 +4,8 @@
 // in advance: a suppression with nothing behind it would wave the first real violation through.
 
 // Rule 1.4 (emergent language features): the project is written in C11 on purpose and uses
-// <stdatomic.h> for its lock-free ring and _Noreturn for the reset functions. Rule 1.4 comes
+// <stdatomic.h> for its lock-free ring and the watchdog manager's alive counters (lib/wdgm),
+// and _Noreturn for the reset functions. Rule 1.4 comes
 // from Amendment 2, which predates MISRA's own guidance for C11 (MISRA C:2023 permits both).
 misra-c2012-1.4
 

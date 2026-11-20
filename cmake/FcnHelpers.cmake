@@ -34,7 +34,11 @@ function(fcn_target_defaults target)
     target_compile_options(${target} PRIVATE ${FCN_WARNING_FLAGS})
     if(FCN_COVERAGE AND NOT ARG_NO_COVERAGE)
         # -fprofile-abs-path keeps source paths resolvable when gcovr runs from another directory.
-        target_compile_options(${target} PRIVATE --coverage -fprofile-abs-path)
+        # -fprofile-update=atomic: code that several threads run at once (the watchdog manager's
+        # checkpoint in test_wdgm) would otherwise lose counter updates, and gcov then reports
+        # branches taken a negative number of times.
+        target_compile_options(${target} PRIVATE --coverage -fprofile-abs-path
+                                                 -fprofile-update=atomic)
         target_link_options(${target} PUBLIC --coverage)
         target_compile_definitions(${target} PRIVATE FCN_COVERAGE=1)
     endif()

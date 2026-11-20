@@ -70,6 +70,11 @@ static TickType_t s_rx_cycle_ticks;
 static can_txq_t s_queue;
 static can_io_stats_t s_stats;
 
+/* The alive indications (can_io_on_alive): set before the scheduler starts, read only by the
+ * two tasks afterwards. */
+static can_io_alive_handler_t s_rx_alive;
+static can_io_alive_handler_t s_tx_alive;
+
 /* Interrupt context: turn the controller's causes into notifications. */
 static void can_io_isr(void *context, uint32_t causes, BaseType_t *woken)
 {
@@ -164,6 +169,10 @@ static void rx_task(void *arg)
 
         (void)xTaskNotifyWait(0U, UINT32_MAX, &bits, rx_wait_ticks(cycle_start));
 
+        if (s_rx_alive != NULL) {
+            s_rx_alive();
+        }
+
         /* Drain the controller's FIFO, but only a bounded number of frames per activation:
          * this task outranks every other, and its execution time per activation has to have
          * a bound for the schedulability analysis to mean anything. */
@@ -219,6 +228,10 @@ static void handle_controller_events(void)
             break;
         case PLAT_CAN_EVENT_STATE:
             requests = can_txq_on_state(&s_queue, (can_fc_state_t)event.state, plat_time_ns());
+
+            if (event.state == PLAT_CAN_ERROR_PASSIVE) {
+                s_stats.error_passive_entries++;
+            }
             break;
         default:
             break;
@@ -296,6 +309,10 @@ static void tx_task(void *arg)
 
         (void)xTaskNotifyWait(0U, UINT32_MAX, &bits, tx_wait_ticks());
 
+        if (s_tx_alive != NULL) {
+            s_tx_alive();
+        }
+
         /* Whatever woke the task, look at everything: the three steps are cheap when there
          * is nothing to do, and a cause can arrive while another is being handled. */
         handle_controller_events();
@@ -351,6 +368,12 @@ void can_io_on_rx_cycle(uint32_t period_ms, can_io_cycle_handler_t handler)
 
     s_rx_cycle_ticks = (ticks > 0U) ? ticks : 1U;
     s_rx_cycle_handler = handler;
+}
+
+void can_io_on_alive(can_io_alive_handler_t rx_alive, can_io_alive_handler_t tx_alive)
+{
+    s_rx_alive = rx_alive;
+    s_tx_alive = tx_alive;
 }
 
 bool can_io_publish(uint8_t slot, const can_frame_t *frame, uint64_t stamp_ns)

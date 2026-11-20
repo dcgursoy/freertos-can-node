@@ -25,13 +25,24 @@ set(_fcn_sanitizer_env
     "ASAN_OPTIONS=detect_stack_use_after_return=1:strict_string_checks=1:detect_leaks=1;UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1")
 set(_fcn_run_selftest "${CMAKE_CURRENT_SOURCE_DIR}/run_selftest.sh")
 
+# The self-tests of the hardware watchdog, the retained cell across resets and the sensor's
+# hang under the scheduler (wdg_selftest.c), a program of their own.
+add_executable(wdg_selftest wdg_selftest.c)
+target_compile_definitions(wdg_selftest PRIVATE _POSIX_C_SOURCE=200809L)
+target_link_libraries(wdg_selftest PRIVATE fcn_platform_posix)
+fcn_target_defaults(wdg_selftest NO_COVERAGE)
+
 # fcn_add_platform_test(<name> STATUS <exit status> LABELS <labels...>
 #                       [STDERR <regex>] [FILE <path> <regex>] [TIMEOUT <seconds>]
-#                       ARGS <selftest arguments...>)
+#                       [PROGRAM <target>] ARGS <selftest arguments...>)
 # STDERR and FILE: a line of stderr, or of the file, has to match the extended regex.
 # A test labelled "timing" may be repeated once if it exits with status 75.
+# PROGRAM: the self-test program to run, plat_selftest by default.
 function(fcn_add_platform_test name)
-    cmake_parse_arguments(ARG "" "STATUS;STDERR;TIMEOUT" "LABELS;FILE;ARGS" ${ARGN})
+    cmake_parse_arguments(ARG "" "STATUS;STDERR;TIMEOUT;PROGRAM" "LABELS;FILE;ARGS" ${ARGN})
+    if(NOT DEFINED ARG_PROGRAM)
+        set(ARG_PROGRAM plat_selftest)
+    endif()
     set(_options "")
     if("timing" IN_LIST ARG_LABELS)
         list(APPEND _options --retry-timing)
@@ -47,7 +58,7 @@ function(fcn_add_platform_test name)
     endif()
     add_test(NAME platform_${name}
              COMMAND sh "${_fcn_run_selftest}" ${_options} ${ARG_STATUS} --
-                     "$<TARGET_FILE:plat_selftest>" ${ARG_ARGS})
+                     "$<TARGET_FILE:${ARG_PROGRAM}>" ${ARG_ARGS})
     set_tests_properties(platform_${name} PROPERTIES
         LABELS "${ARG_LABELS}"
         TIMEOUT ${ARG_TIMEOUT}
@@ -61,9 +72,11 @@ endfunction()
 #                      vcan0, as a failure where FCN_REQUIRE_SOCKETCAN is set, as in CI)
 #   test_posix_sim     the simulation control protocol
 #   test_posix_sensor  the sensor front-end model and its "sensor." commands, also served
-#                      from a thread of their own while the test reads (run under TSan too)
+#                      from a thread of their own while the test reads (run under TSan too),
+#                      and the hang of "sensor.hang" with a reader thread of its own
+#   test_posix_retained the retained-RAM cell: starts and resets played by the test
 find_package(Threads REQUIRED)
-foreach(_test IN ITEMS can_backend posix_sim posix_sensor)
+foreach(_test IN ITEMS can_backend posix_sim posix_sensor posix_retained)
     add_executable(test_${_test} test_${_test}.c)
     target_compile_definitions(test_${_test} PRIVATE _POSIX_C_SOURCE=200809L)
     target_link_libraries(test_${_test} PRIVATE fcn_host_io unity Threads::Threads)
@@ -141,6 +154,30 @@ fcn_add_platform_test(reset_log STATUS 10 LABELS platform
 # not caught.
 fcn_add_platform_test(shutdown_guard STATUS 70 LABELS platform TIMEOUT 3
                       STDERR "^FATAL the scheduler did not stop in time$" ARGS guard)
+
+# The hardware watchdog. Not kicked after six kicks, it resets with status 11 (the self-test
+# exits 0 when that came no earlier than the timeout after the last kick and at most 50 ms
+# later; 75 if later); kicked every quarter timeout for 3 s, it lets the run end orderly.
+fcn_add_platform_test(wdg_expire STATUS 0 LABELS platform timing PROGRAM wdg_selftest
+                      STDERR "^FATAL watchdog: not kicked for [0-9]+ ms \\(timeout 200 ms\\)$"
+                      ARGS expire 200)
+fcn_add_platform_test(wdg_kicked STATUS 0 LABELS platform timing PROGRAM wdg_selftest
+                      ARGS kicked 200 3)
+fcn_add_platform_test(wdg_start_rules STATUS 0 LABELS platform PROGRAM wdg_selftest
+                      ARGS start-rules)
+fcn_add_platform_test(wdg_kick_cost STATUS 0 LABELS platform PROGRAM wdg_selftest
+                      ARGS kick-cost 100000)
+# The retained cell across real resets of a FreeRTOS program, a watchdog reset among them.
+fcn_add_platform_test(retained_resets STATUS 0 LABELS platform PROGRAM wdg_selftest
+                      ARGS retained "${_dir}/selftest_retained_cell.bin")
+fcn_add_platform_test(retained_watchdog STATUS 0 LABELS platform PROGRAM wdg_selftest
+                      STDERR "^FATAL watchdog: not kicked for [0-9]+ ms \\(timeout 100 ms\\)$"
+                      ARGS watchdog-cause 100 "${_dir}/selftest_retained_wdg.bin")
+# sensor.hang under the scheduler: "on" blocks the reading task, "spin" starves the ones below.
+fcn_add_platform_test(sensor_hang_on STATUS 0 LABELS platform PROGRAM wdg_selftest
+                      ARGS hang on)
+fcn_add_platform_test(sensor_hang_spin STATUS 0 LABELS platform PROGRAM wdg_selftest
+                      ARGS hang spin)
 
 # An orderly stop on SIGTERM must leave through main() with status 0.
 add_test(NAME platform_sigterm

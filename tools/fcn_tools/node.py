@@ -3,6 +3,12 @@
 The node is a Linux process that stands in for a microcontroller, so this module plays the
 bench around it: it applies power (starts the process), observes how the node went down (the
 exit status is the reset reason, see platform/include/platform.h) and can pull the plug.
+
+A reset ends the process, but on a board the microcontroller starts again at once, with its
+retained RAM intact. The bench does the same with restarted(): a new run of the same node,
+with the same options and the same retained-RAM cell (`retained_file`, the node's
+`--retained-file`), so that the new run learns why the last one ended. Removing the cell's file
+before the restart is a loss of power.
 """
 from __future__ import annotations
 
@@ -35,6 +41,10 @@ RESET_ASSERT = 20
 RESET_STACK_OVERFLOW = 21
 RESET_MALLOC_FAILED = 22
 
+#: The exit statuses that are resets of the node, after which a board starts again by itself.
+RESETS = frozenset({RESET_REQUESTED, RESET_WATCHDOG, RESET_POWER_LOSS, RESET_IMAGE_FAULT,
+                    RESET_ASSERT, RESET_STACK_OVERFLOW, RESET_MALLOC_FAILED})
+
 
 @dataclass(eq=False)
 class NodeProcess:
@@ -46,10 +56,14 @@ class NodeProcess:
     name: str = "node"
     can: str | None = None        # bus to attach to ("udp:21000", "socketcan:vcan0")
     sim_port: int | None = None   # serve simulation control on this port; None: off
+    # The retained-RAM cell (--retained-file); None: no cell, every start is a power-on.
+    retained_file: Path | None = None
     _proc: subprocess.Popen | None = field(default=None, init=False, repr=False)
     # True once the caller has taken note of how the run ended: it waited for the node,
     # stopped it, or killed it on purpose. See unnoticed_end().
     _end_noticed: bool = field(default=False, init=False, repr=False)
+    # True once the caller has waited for a reset with wait_for_reset(). See unexpected_reset().
+    _reset_awaited: bool = field(default=False, init=False, repr=False)
 
     @property
     def log_path(self) -> Path:
@@ -78,6 +92,7 @@ class NodeProcess:
         for path in (self.log_path, self.stats_path, self.stdout_path, self.stderr_path):
             path.unlink(missing_ok=True)
         self._end_noticed = False
+        self._reset_awaited = False
         command = [
             str(self.binary),
             "--log-file", str(self.log_path),
@@ -87,6 +102,8 @@ class NodeProcess:
             command += ["--can", self.can]
         if self.sim_port is not None:
             command += ["--sim-port", str(self.sim_port)]
+        if self.retained_file is not None:
+            command += ["--retained-file", str(self.retained_file)]
         command += self.args
         # A session of its own: a Ctrl-C aimed at the test runner must not reach the node
         # behind the test's back. FCN_DIE_WITH_PARENT carries this process's id: the node
@@ -146,6 +163,28 @@ class NodeProcess:
         assert self._proc is not None
         self._proc.send_signal(signum)
 
+    def wait_for_reset(self, timeout: float) -> int:
+        """Wait for the node to end by itself, as a reset ends it, and return the exit status;
+        raises AssertionError if it ended in any other way. TimeoutExpired if it does not end
+        within `timeout` seconds (the caller decides whether that is a timing tolerance).
+        This is how a test says that it expects a reset; see unexpected_reset()."""
+        self._reset_awaited = True
+        status = self.wait(timeout=timeout)
+        assert status in RESETS, (f"{self.name} ended with status {status}, not a reset\n"
+                                  f"--- stderr\n{self.stderr()}")
+        return status
+
+    def restarted(self, name: str | None = None) -> "NodeProcess":
+        """A new run of this node, as a board starts again after a reset: the same binary,
+        options, bus, simulation control port and retained-RAM cell, not yet started. It gets
+        files of its own, under `name` (default: this run's name with "-again"), so that this
+        run's log and statistics stay. This run must have ended: two runs never share a cell."""
+        assert self._proc is not None and self._proc.poll() is not None, \
+            f"{self.name} is still running"
+        return NodeProcess(workdir=self.workdir, args=tuple(self.args), binary=self.binary,
+                           name=name or f"{self.name}-again", can=self.can,
+                           sim_port=self.sim_port, retained_file=self.retained_file)
+
     def kill(self) -> None:
         """Pull the plug: SIGKILL, no chance to clean up. A test that calls this has decided
         how the run ends, so the end counts as noticed."""
@@ -180,6 +219,24 @@ class NodeProcess:
         if status == 0 and stderr:
             return f"{self.name} exited 0 but wrote to stderr\n--- stderr (last lines)\n{tail}"
         return None
+
+    def unexpected_reset(self) -> str | None:
+        """A reset of this run that the caller did not expect, or None.
+
+        A run that ended with one of the statuses in RESETS (the watchdog's 11 among them) was
+        reset, and a test expects a reset only by waiting for it with wait_for_reset(). Any
+        other test whose node was reset fails, also one that looked at the status itself
+        (wait(), stop()): so every system test that does not expect a reset also shows that
+        its node's hardware watchdog was kicked for the whole run.
+        """
+        if self._proc is None:
+            return None
+        status = self._proc.poll()
+        if status is None or status not in RESETS or self._reset_awaited:
+            return None
+        tail = "\n".join(self.stderr().strip().splitlines()[-20:])
+        return (f"{self.name} was reset (status {status}) in a test that does not expect a "
+                f"reset (it never called wait_for_reset())\n--- stderr (last lines)\n{tail}")
 
     def stderr(self) -> str:
         """What the node wrote to stderr so far (fatal messages go there, not to the log)."""

@@ -45,7 +45,7 @@
  * or interrupt, also concurrently, as long as no two calls write the same buffer.
  *
  * GENERATED FILE, DO NOT EDIT. The interface of the codec. Made by tools/gen_can_db.py from
- * dbc/fcn.dbc, SHA-256 feb8206c28af39cac838870eddc7c089ff50245ffdfad345fcee4131dbee88c5.
+ * dbc/fcn.dbc, SHA-256 3c885b001d6267703e6d18cb32aab9cfacdde26aa433f84e84d764b504a57dfe.
  *
  * After a change of the DBC, run scripts/codegen-check.sh --update. Without --update the script
  * fails while this file is out of date; CI and scripts/check.sh run it.
@@ -56,6 +56,159 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/* -------------------------------------------------------------------------------------------------
+ * BMS_Fault: 0x010, 8 bytes, every 100 ms; from BMS to TESTER. Protected end to end (E2E Profile
+ * 11A), Data ID 0x0110; the CRC of the Data ID bytes is 0xA9.
+ * The node's diagnostic trouble codes, every 100 ms, sent by the task that owns them after the last
+ * change it made in the period, so that every change goes out in the frame of the period that made
+ * it. Protected end to end. Fault n (the value table of FaultMostRecent, app/fault.h) is bit n of
+ * FaultActive and FaultConfirmed.
+ * ---------------------------------------------------------------------------------------------- */
+#define CAN_DB_BMS_FAULT_ID            0x010U
+#define CAN_DB_BMS_FAULT_DLC           8U
+#define CAN_DB_BMS_FAULT_CYCLE_MS      100U
+#define CAN_DB_BMS_FAULT_E2E_PROTECTED 1U
+#define CAN_DB_BMS_FAULT_E2E_DATA_ID   0x0110U
+
+/*
+ * E2E_Crc: bits 0..7 (8 bits, unsigned); raw 0..255; physical = raw, range 0..255. E2E Profile 11
+ * CRC over the Data ID and bytes 1 to 7.
+ */
+#define CAN_DB_BMS_FAULT_E2E_CRC_START      0U
+#define CAN_DB_BMS_FAULT_E2E_CRC_LENGTH     8U
+#define CAN_DB_BMS_FAULT_E2E_CRC_RAW_MIN    0U
+#define CAN_DB_BMS_FAULT_E2E_CRC_RAW_MAX    255U
+#define CAN_DB_BMS_FAULT_E2E_CRC_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_FAULT_E2E_CRC_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_FAULT_E2E_CRC_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_FAULT_E2E_CRC_OFFSET_DEN ((int32_t)1)
+
+/*
+ * E2E_Counter: bits 8..11 (4 bits, unsigned); raw 0..15; physical = raw, range 0..14. E2E Profile
+ * 11 counter: 0 to 14, then 0 again; 15 is never sent.
+ */
+#define CAN_DB_BMS_FAULT_E2E_COUNTER_START      8U
+#define CAN_DB_BMS_FAULT_E2E_COUNTER_LENGTH     4U
+#define CAN_DB_BMS_FAULT_E2E_COUNTER_RAW_MIN    0U
+#define CAN_DB_BMS_FAULT_E2E_COUNTER_RAW_MAX    15U
+#define CAN_DB_BMS_FAULT_E2E_COUNTER_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_FAULT_E2E_COUNTER_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_FAULT_E2E_COUNTER_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_FAULT_E2E_COUNTER_OFFSET_DEN ((int32_t)1)
+
+/*
+ * FaultActive: bits 16..31 (16 bits, unsigned); raw 0..65535; physical = raw, range 0..65535. Bit
+ * n: the DTC of fault n has testFailed (ISO 14229-1 status bit 0), the fault is present now.
+ * PackFaultActive is 1 while any bit is.
+ */
+#define CAN_DB_BMS_FAULT_FAULT_ACTIVE_START      16U
+#define CAN_DB_BMS_FAULT_FAULT_ACTIVE_LENGTH     16U
+#define CAN_DB_BMS_FAULT_FAULT_ACTIVE_RAW_MIN    0U
+#define CAN_DB_BMS_FAULT_FAULT_ACTIVE_RAW_MAX    65535U
+#define CAN_DB_BMS_FAULT_FAULT_ACTIVE_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_FAULT_FAULT_ACTIVE_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_FAULT_FAULT_ACTIVE_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_FAULT_FAULT_ACTIVE_OFFSET_DEN ((int32_t)1)
+
+/*
+ * FaultConfirmed: bits 32..47 (16 bits, unsigned); raw 0..65535; physical = raw, range 0..65535.
+ * Bit n: the DTC of fault n has confirmedDTC (status bit 3): the fault occurred since the node
+ * started or since the last clear (CmdClearFaultsSeq).
+ */
+#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_START      32U
+#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_LENGTH     16U
+#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_RAW_MIN    0U
+#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_RAW_MAX    65535U
+#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_OFFSET_DEN ((int32_t)1)
+
+/*
+ * FaultMostRecent: bits 48..52 (5 bits, unsigned); raw 0..31; physical = raw, range 0..15. Value
+ * table: 0 CELL_OVERVOLTAGE, 1 CELL_UNDERVOLTAGE, 2 OVERTEMPERATURE, 3 UNDERTEMPERATURE, 4
+ * OVERCURRENT_DISCHARGE, 5 OVERCURRENT_CHARGE, 6 SENSOR_CHANNEL_INVALID, 7 FRONT_END_NO_ANSWER, 8
+ * SAMPLE_TIMEOUT, 9 CAN_BUS_OFF, 10 CAN_ERROR_PASSIVE, 11 SUPERVISION_EXPIRED, 12 RESET_WATCHDOG,
+ * 13 RESET_ASSERT, 14 RESET_STACK_OVERFLOW, 15 RESET_MALLOC_FAILED, 31 NONE. The fault whose DTC
+ * went to testFailed most recently since the start or the last clear; NONE if none did.
+ */
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_START                  48U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_LENGTH                 5U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RAW_MIN                0U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RAW_MAX                31U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_FACTOR_NUM             ((int32_t)1)
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_FACTOR_DEN             ((int32_t)1)
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_OFFSET_NUM             ((int32_t)0)
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_OFFSET_DEN             ((int32_t)1)
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_CELL_OVERVOLTAGE       0U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_CELL_UNDERVOLTAGE      1U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_OVERTEMPERATURE        2U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_UNDERTEMPERATURE       3U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_OVERCURRENT_DISCHARGE  4U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_OVERCURRENT_CHARGE     5U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_SENSOR_CHANNEL_INVALID 6U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_FRONT_END_NO_ANSWER    7U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_SAMPLE_TIMEOUT         8U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_CAN_BUS_OFF            9U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_CAN_ERROR_PASSIVE      10U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_SUPERVISION_EXPIRED    11U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_WATCHDOG         12U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_ASSERT           13U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_STACK_OVERFLOW   14U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_MALLOC_FAILED    15U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_NONE                   31U
+
+/*
+ * FaultWarning: bit 53 (1 bit, unsigned); raw 0..1; physical = raw, range 0..1. 1 while a DTC
+ * requests the warning indicator (status bit 7): a limit of the pack was exceeded, or its
+ * measurement failed, since the start or the last clear.
+ */
+#define CAN_DB_BMS_FAULT_FAULT_WARNING_START      53U
+#define CAN_DB_BMS_FAULT_FAULT_WARNING_LENGTH     1U
+#define CAN_DB_BMS_FAULT_FAULT_WARNING_RAW_MIN    0U
+#define CAN_DB_BMS_FAULT_FAULT_WARNING_RAW_MAX    1U
+#define CAN_DB_BMS_FAULT_FAULT_WARNING_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_FAULT_FAULT_WARNING_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_FAULT_FAULT_WARNING_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_FAULT_FAULT_WARNING_OFFSET_DEN ((int32_t)1)
+
+/*
+ * FaultClearCount: bits 56..63 (8 bits, unsigned); raw 0..255; physical = raw, range 0..255. Clears
+ * of the DTCs carried out since the node started, modulo 256.
+ */
+#define CAN_DB_BMS_FAULT_FAULT_CLEAR_COUNT_START      56U
+#define CAN_DB_BMS_FAULT_FAULT_CLEAR_COUNT_LENGTH     8U
+#define CAN_DB_BMS_FAULT_FAULT_CLEAR_COUNT_RAW_MIN    0U
+#define CAN_DB_BMS_FAULT_FAULT_CLEAR_COUNT_RAW_MAX    255U
+#define CAN_DB_BMS_FAULT_FAULT_CLEAR_COUNT_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_FAULT_FAULT_CLEAR_COUNT_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_FAULT_FAULT_CLEAR_COUNT_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_FAULT_FAULT_CLEAR_COUNT_OFFSET_DEN ((int32_t)1)
+
+/** The raw signal values of BMS_Fault, in the order of their start bits. */
+typedef struct {
+    uint8_t e2e_crc;           /**< E2E_Crc */
+    uint8_t e2e_counter;       /**< E2E_Counter */
+    uint16_t fault_active;     /**< FaultActive */
+    uint16_t fault_confirmed;  /**< FaultConfirmed */
+    uint8_t fault_most_recent; /**< FaultMostRecent */
+    uint8_t fault_warning;     /**< FaultWarning */
+    uint8_t fault_clear_count; /**< FaultClearCount */
+} can_db_bms_fault_t;
+
+/**
+ * Write the CAN_DB_BMS_FAULT_DLC data bytes of BMS_Fault into data[0] to data[7]. Returns false,
+ * writing nothing, if a pointer is NULL or `capacity`, the size of `data` in bytes, is less than
+ * the DLC.
+ */
+bool can_db_bms_fault_pack(const can_db_bms_fault_t *msg, uint8_t *data, size_t capacity);
+
+/**
+ * Read the signals of BMS_Fault from `len` data bytes. Returns false, leaving *msg as it was, if a
+ * pointer is NULL or `len` is not CAN_DB_BMS_FAULT_DLC.
+ */
+bool can_db_bms_fault_unpack(can_db_bms_fault_t *msg, const uint8_t *data, size_t len);
 
 /* -------------------------------------------------------------------------------------------------
  * BMS_PackStatus: 0x020, 8 bytes, every 10 ms; from BMS to TESTER. Protected end to end (E2E
@@ -124,7 +277,7 @@
 /*
  * PackState: bits 48..49 (2 bits, unsigned); raw 0..3; physical = raw, range 0..2. Value table: 0
  * STARTUP, 1 NORMAL, 2 FAULT. STARTUP until every channel has delivered a reading, FAULT while a
- * channel is invalid, NORMAL otherwise.
+ * channel is invalid or a fault is active (PackFaultActive), NORMAL otherwise.
  */
 #define CAN_DB_BMS_PACK_STATUS_PACK_STATE_START      48U
 #define CAN_DB_BMS_PACK_STATUS_PACK_STATE_LENGTH     2U
@@ -140,7 +293,7 @@
 
 /*
  * PackFaultActive: bit 50 (1 bit, unsigned); raw 0..1; physical = raw, range 0..1. 1 while a fault
- * is active (phase 3).
+ * is active: a bit of BMS_Fault's FaultActive is set.
  */
 #define CAN_DB_BMS_PACK_STATUS_PACK_FAULT_ACTIVE_START      50U
 #define CAN_DB_BMS_PACK_STATUS_PACK_FAULT_ACTIVE_LENGTH     1U
@@ -669,9 +822,8 @@ bool can_db_bms_temperatures_unpack(can_db_bms_temperatures_t *msg, const uint8_
 #define CAN_DB_TESTER_COMMAND_CMD_TELEMETRY_ON_OFFSET_DEN ((int32_t)1)
 
 /*
- * CmdClearFaultsSeq: bits 24..31 (8 bits, unsigned); raw 0..255; physical = raw, range 0..255.
- * Latched faults are cleared whenever this value changes from one valid command to the next (phase
- * 3).
+ * CmdClearFaultsSeq: bits 24..31 (8 bits, unsigned); raw 0..255; physical = raw, range 0..255. The
+ * node clears its DTCs whenever this value changes from one command it carries out to the next.
  */
 #define CAN_DB_TESTER_COMMAND_CMD_CLEAR_FAULTS_SEQ_START      24U
 #define CAN_DB_TESTER_COMMAND_CMD_CLEAR_FAULTS_SEQ_LENGTH     8U
@@ -866,9 +1018,10 @@ bool can_db_bms_task_stats_unpack(can_db_bms_task_stats_t *msg, const uint8_t *d
 
 /*
  * ResetCause: bits 26..31 (6 bits, unsigned); raw 0..63; physical = raw, range 0..62. Value table:
- * 10 REQUESTED, 11 WATCHDOG, 12 POWER_LOSS, 13 IMAGE_FAULT, 20 ASSERT, 21 STACK_OVERFLOW, 22
- * MALLOC_FAILED, 63 SNA. Why the node was last reset: the values of plat_reset_reason_t; SNA while
- * the node does not know.
+ * 0 POWER_ON, 10 REQUESTED, 11 WATCHDOG, 12 POWER_LOSS, 13 IMAGE_FAULT, 20 ASSERT, 21
+ * STACK_OVERFLOW, 22 MALLOC_FAILED, 63 SNA. Why the node was last reset: the values of
+ * plat_reset_reason_t; POWER_ON for a start without a reset before it; SNA while the node does not
+ * know.
  */
 #define CAN_DB_BMS_NODE_INFO_RESET_CAUSE_START          26U
 #define CAN_DB_BMS_NODE_INFO_RESET_CAUSE_LENGTH         6U
@@ -878,6 +1031,7 @@ bool can_db_bms_task_stats_unpack(can_db_bms_task_stats_t *msg, const uint8_t *d
 #define CAN_DB_BMS_NODE_INFO_RESET_CAUSE_FACTOR_DEN     ((int32_t)1)
 #define CAN_DB_BMS_NODE_INFO_RESET_CAUSE_OFFSET_NUM     ((int32_t)0)
 #define CAN_DB_BMS_NODE_INFO_RESET_CAUSE_OFFSET_DEN     ((int32_t)1)
+#define CAN_DB_BMS_NODE_INFO_RESET_CAUSE_POWER_ON       0U
 #define CAN_DB_BMS_NODE_INFO_RESET_CAUSE_REQUESTED      10U
 #define CAN_DB_BMS_NODE_INFO_RESET_CAUSE_WATCHDOG       11U
 #define CAN_DB_BMS_NODE_INFO_RESET_CAUSE_POWER_LOSS     12U

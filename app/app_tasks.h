@@ -10,10 +10,12 @@
  *   sensor   5         every 10 ms (xTaskDelayUntil)               heartbeat; reads the front end,
  *                                                                  posts a sample
  *   process  4         a sample in the queue (or a timeout)        lib/bms, pack state, protected
- *                                                                  telemetry
+ *                                                                  telemetry, verdicts on faults
  *   can_tx   3         a producer or the controller notifies it    loads the controller's mailboxes
- *   health   2         every 100 ms (xTaskDelayUntil)              task statistics, node info,
- *                                                                  ends the run
+ *   health   2         every 100 ms (xTaskDelayUntil)              supervision and the hardware
+ *                                                                  watchdog, the DTCs and
+ *                                                                  BMS_Fault, task statistics,
+ *                                                                  node info, ends the run
  *
  * Rate-monotonic order holds for the tasks with a period of their own (sensor above health)
  * and for the receive task, modelled by its demand per tick (task_table.c): a period of 1 ms,
@@ -45,8 +47,9 @@
 #define APP_TEMPS_EVERY      10U
 #define APP_HEALTH_PERIOD_MS 100U
 
-/* The health task sends BMS_TaskStats every APP_TASK_STATS_EVERY-th period (200 ms), one task
- * per frame, and BMS_NodeInfo every APP_NODE_INFO_EVERY-th (1 s). */
+/* The health task sends BMS_Fault in every period, BMS_TaskStats in every APP_TASK_STATS_EVERY-th
+ * (200 ms; the odd periods), one task per frame, and BMS_NodeInfo in every APP_NODE_INFO_EVERY-th
+ * (1 s; periods 10, 20, ...): never more than two frames in one period (task_table.c). */
 #define APP_TASK_STATS_EVERY 2U
 #define APP_NODE_INFO_EVERY  10U
 
@@ -56,6 +59,22 @@
 
 /* Samples the queue between the sensor and the processing task holds. */
 #define APP_SAMPLE_QUEUE_LENGTH 4U
+
+/* Verdicts of the processing task on its samples (fault.h) that the queue to the health task
+ * holds: three health periods of samples, so that a verdict is lost only if the health task, the
+ * lowest-priority one, falls more than two of its periods behind. A lost verdict is counted
+ * (process.verdicts_lost): its sample does not count towards the debouncing. */
+#define APP_FAULT_VERDICT_QUEUE_LENGTH 32U
+
+/*
+ * The hardware watchdog's timeout. The health task kicks it once per period, after the
+ * supervision cycle, so in a run without a fault the kicks come APP_HEALTH_PERIOD_MS apart,
+ * plus the health task's response time (2 ms in the analysis of task_table.c). Five periods:
+ * a health job that runs up to four periods late, far beyond anything the analysis allows (a
+ * host that stalls the node's threads), does not reset the node, and a node whose kicks stop is
+ * reset at most 500 ms after the last one. app.c checks it against the IWDG's range.
+ */
+#define APP_WDG_TIMEOUT_MS 500U
 
 /* Stack of every application task, in words (StackType_t): the size meant for the target. */
 #define APP_TASK_STACK_WORDS 512U

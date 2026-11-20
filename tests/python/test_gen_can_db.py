@@ -83,6 +83,7 @@ def by_start(message) -> list:
 # The message set of the design: identifier, name, sender, DLC, cycle time (0: events), Data ID
 # (None: not protected end to end).
 MESSAGE_SET = [
+    (0x010, "BMS_Fault", "BMS", 8, 100, 0x0110),
     (0x020, "BMS_PackStatus", "BMS", 8, 10, 0x0120),
     (0x030, "BMS_Heartbeat", "BMS", 8, 10, None),
     (0x040, "BMS_CellVoltages1", "BMS", 8, 20, 0x0140),
@@ -157,7 +158,7 @@ def test_cells_and_temperatures_have_their_scaling_and_an_sna_code():
 def test_the_e2e_data_ids_have_distinct_crcs():
     model = gen.load(DBC)
     crcs = {m.name: gen.data_id_crc(m.data_id) for m in model.protected}
-    assert len(crcs) == 5 and len(set(crcs.values())) == 5, crcs
+    assert len(crcs) == 6 and len(set(crcs.values())) == 6, crcs
 
 
 # ------------------------------------------------------------------------------------------
@@ -791,7 +792,7 @@ def test_every_message_with_signals_was_compared(project_codec):
     _, db, groups = project_codec
     compared = {int(case.line.split()[1], 16) for case in groups["pack"][0]}
     assert compared == {m.frame_id for m in db.messages if m.signals}
-    assert len(groups["pack"][0]) == 8 * (1500 + 3)
+    assert len(groups["pack"][0]) == 9 * (1500 + 3)
 
 
 # ------------------------------------------------------------------------------------------

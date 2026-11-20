@@ -26,6 +26,8 @@ STAND_INS = {
     # reports go.
     "noisy": 'echo "runtime error: load of misaligned address" >&2\nexit 0\n',
     "clean": "exit 0\n",
+    # A start-up error (an unusable option): status 1, which is no reset.
+    "refuses": 'echo "cannot write --retained-file /no/such/cell" >&2\nexit 1\n',
     # Runs until it is stopped, and stops cleanly on SIGTERM.
     "runs": "trap 'exit 0' TERM\necho ready\nwhile :; do sleep 0.02; done\n",
     # Reports a stack overflow (21) when asked to stop.
@@ -191,6 +193,87 @@ def test_statistics_of_an_earlier_run_never_answer_for_this_one(stand_in, starte
     with pytest.raises(FileNotFoundError):
         node.stats()
     assert node.stderr() == "" and node.unnoticed_end() is None
+
+
+def test_the_retained_cell_is_passed_and_a_restart_keeps_it_and_the_options(stand_in, started,
+                                                                             tmp_path):
+    cell = tmp_path / "cell.bin"
+    node = started(stand_in("reports"), can="udp:21000", sim_port=21016, retained_file=cell,
+                   args=("--duration-s", "1"))
+    assert node.wait(timeout=10) == 0
+    assert (f"--sim-port 21016 --retained-file {cell} --duration-s 1") in \
+        node.stdout_path.read_text()
+
+    again = node.restarted()
+    assert (again.name, again.retained_file, again.can, again.sim_port, tuple(again.args)) == \
+        ("node-again", cell, "udp:21000", 21016, ("--duration-s", "1"))
+    assert not again.running
+    again.start()
+    assert again.wait(timeout=10) == 0
+    out = again.stdout_path.read_text()
+    assert f"--log-file {again.log_path} " in out and f"--retained-file {cell} " in out
+    # The first run's files are its own and stay.
+    assert node.stdout_path.exists() and node.stdout_path != again.stdout_path
+    assert node.restarted("third").name == "third"
+
+
+def test_a_node_that_runs_cannot_be_restarted(stand_in, started):
+    node = started(stand_in("runs"))
+    wait_until_ready(node)
+    with pytest.raises(AssertionError, match="still running"):
+        node.restarted()
+
+
+def test_wait_for_reset_takes_a_reset_and_refuses_another_end(stand_in, started):
+    node = started(stand_in("dies"))
+    assert node.wait_for_reset(timeout=10) == 20
+    assert node.unnoticed_end() is None
+
+    clean = started(stand_in("clean"), name="clean")
+    with pytest.raises(AssertionError, match="status 0, not a reset"):
+        clean.wait_for_reset(timeout=10)
+
+
+# -------------------------------------------------------------------- unexpected resets
+
+
+def test_a_reset_the_caller_did_not_wait_for_as_a_reset_is_unexpected(stand_in, started):
+    node = started(stand_in("dies"))
+    assert node.wait(timeout=10) == 20               # seen, but not waited for as a reset
+    problem = node.unexpected_reset()
+    assert problem is not None
+    assert "was reset (status 20) in a test that does not expect a reset" in problem
+    assert "FATAL assertion failed: app.c 42" in problem
+
+    stopped = started(stand_in("fails_to_stop"), name="stopped")
+    wait_until_ready(stopped)
+    assert stopped.stop(timeout=10) == 21            # a reset on the way down counts too
+    assert "status 21" in (stopped.unexpected_reset() or "")
+
+
+def test_a_reset_waited_for_or_an_end_that_is_no_reset_is_not_unexpected(stand_in, started):
+    node = started(stand_in("dies"))
+    assert node.wait_for_reset(timeout=10) == 20
+    assert node.unexpected_reset() is None
+
+    clean = started(stand_in("clean"), name="clean")
+    assert clean.wait(timeout=10) == 0
+    assert clean.unexpected_reset() is None
+
+    refused = started(stand_in("refuses"), name="refused")   # a start-up error, status 1
+    assert refused.wait(timeout=10) == 1
+    assert refused.unexpected_reset() is None
+
+    running = started(stand_in("runs"), name="running")
+    assert running.unexpected_reset() is None
+
+
+def test_a_new_start_forgets_that_a_reset_was_waited_for(stand_in, started):
+    node = started(stand_in("dies"))
+    assert node.wait_for_reset(timeout=10) == 20
+    node.start()
+    assert node.wait(timeout=10) == 20
+    assert "status 20" in (node.unexpected_reset() or "")
 
 
 def test_a_missing_binary_is_reported_before_anything_starts(tmp_path):

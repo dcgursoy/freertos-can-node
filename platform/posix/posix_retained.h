@@ -1,0 +1,79 @@
+/* SPDX-License-Identifier: MIT */
+/**
+ * @file
+ * The retained-RAM cell of the host build (plat_retained.h): a file that the node maps and
+ * that outlives the process, as RAM outlives a reset. What the cell holds and when it counts
+ * as a power-on is described in plat_retained.h; this header is the host side of it.
+ *
+ * The module knows nothing about FreeRTOS, so that its tests run without a kernel
+ * (tests/platform/test_posix_retained.c). posix_retained_open() runs on the main thread before
+ * anything else of the node; posix_retained_note_reset() is called by plat_reset() from
+ * whichever context resets; the rest by the main thread.
+ */
+#ifndef FCN_POSIX_RETAINED_H
+#define FCN_POSIX_RETAINED_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "plat_retained.h"
+#include "platform.h"
+
+/** What posix_retained_open() found, for the log and the statistics. */
+typedef struct {
+    bool open;                 /**< a cell is mapped */
+    plat_reset_reason_t cause; /**< plat_reset_cause() */
+    uint32_t resets;           /**< resets since power-on, as the cell held them at start */
+    /** Why the start is what it is: "no cell" (no file was given), "missing" (the file did
+     *  not exist), "size", "magic", "version", "crc" (a cell that is not valid), "reason" (a
+     *  valid cell whose reason is not one plat_reset() records), "no reset" (a valid cell that
+     *  recorded no reset), "reset" (a valid cell with the reason of a reset). */
+    const char *verdict;
+} posix_retained_info_t;
+
+/**
+ * Open the cell in the file `path`, or with `path` NULL run without one (every start is a
+ * power-on). Reads the cause of this start and prepares the cell for this run as
+ * plat_retained.h says: a cell that is not valid, or that recorded no reset, is written afresh
+ * (every word 0, reason PLAT_RESET_POWER_ON); a valid one keeps its reset count and reserved
+ * words and gets the reason PLAT_RESET_POWER_ON in place of the one just read.
+ *
+ * The file is created if it does not exist and given the cell's size if it has another; it is
+ * locked (flock) for as long as it is open, so that two nodes cannot share one cell. Returns
+ * false with a message for the user in `error` if the file cannot be opened, locked, sized or
+ * mapped, or a cell is already open; nothing is changed then. Main thread, once, before
+ * anything that could call plat_reset().
+ */
+bool posix_retained_open(const char *path, char *error, size_t error_len);
+
+/**
+ * Record a reset in the cell (plat_reset() calls it): the reason and one more reset, with the
+ * CRC over them; for PLAT_RESET_POWER_LOSS the cell is destroyed instead (every byte 0), so the
+ * next start is a power-on. Does nothing without a cell. Only plain stores to the mapped
+ * memory: it takes no lock and makes no system call, so any context may call it, a signal
+ * handler included. The caller makes sure that only one call happens (plat_reset() does).
+ */
+void posix_retained_note_reset(plat_reset_reason_t reason);
+
+/** Unmap the cell and release the file; the cell stays in it. Main thread, after the run. */
+void posix_retained_close(void);
+
+/** What the start found; valid after posix_retained_open(), also after posix_retained_close().
+ *  Main thread. */
+void posix_retained_get_info(posix_retained_info_t *out);
+
+/** True for the reasons plat_reset() records in the cell as they are: every reason of
+ *  plat_reset_reason_t except PLAT_RESET_POWER_ON and PLAT_RESET_POWER_LOSS. */
+bool posix_retained_reason_recorded(uint32_t reason);
+
+/** True for every reason plat_reset() accepts: the recorded ones and PLAT_RESET_POWER_LOSS. */
+bool posix_reset_reason_valid(plat_reset_reason_t reason);
+
+/** The CRC a valid cell carries: CRC-32/ISO-HDLC over every byte before `crc`. */
+uint32_t posix_retained_crc(const plat_retained_cell_t *cell);
+
+/** The name of a reason as in the DBC's value table ("WATCHDOG"), "POWER_ON", or "unknown". */
+const char *posix_reset_reason_name(plat_reset_reason_t reason);
+
+#endif /* FCN_POSIX_RETAINED_H */

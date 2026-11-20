@@ -65,6 +65,14 @@ typedef void (*can_io_rx_handler_t)(const can_frame_t *frame, uint64_t eof_ns);
  */
 typedef void (*can_io_cycle_handler_t)(void);
 
+/**
+ * Called by the receive task and by the transmit task, each with its own handler, once in every
+ * pass of its loop: the task's alive indication for the watchdog manager (app.c). Every pass
+ * begins with a wait of at most 50 ms of tick time, so a task that does not hang calls it at
+ * least that often. Keep it short and non-blocking.
+ */
+typedef void (*can_io_alive_handler_t)(void);
+
 typedef struct {
     uint32_t rx_frames;      /**< frames taken from the controller */
     uint32_t rx_unhandled;   /**< of those, frames no handler was registered for */
@@ -74,6 +82,9 @@ typedef struct {
     /** periods of the receive cycle that ended without a call of their own, because the task
      *  ran more than a period late (a host stall): one call stood for several periods */
     uint32_t rx_cycles_skipped;
+    /** state events of the controller into error passive (the bus-off events are counted by
+     *  the transmit queue, can_txq_stats_t.bus_off_count) */
+    uint32_t error_passive_entries;
 } can_io_stats_t;
 
 /** Create the two tasks and connect the interrupt. Call once, before the scheduler starts. */
@@ -100,6 +111,10 @@ bool can_io_on_frame(uint32_t id, bool extended, can_io_rx_handler_t handler);
  * starts.
  */
 void can_io_on_rx_cycle(uint32_t period_ms, can_io_cycle_handler_t handler);
+
+/** Have `rx_alive` called in every pass of the receive task's loop and `tx_alive` in every pass
+ *  of the transmit task's (either may be NULL). Call before the scheduler starts. */
+void can_io_on_alive(can_io_alive_handler_t rx_alive, can_io_alive_handler_t tx_alive);
 
 /** Publish the current value of a cyclic message (see can_txq_publish). Any task. */
 bool can_io_publish(uint8_t slot, const can_frame_t *frame, uint64_t stamp_ns);

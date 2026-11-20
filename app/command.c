@@ -103,6 +103,10 @@ void command_on_frame(command_rx_t *rx, const can_frame_t *frame)
     }
 
     if (act) {
+        if (rx->have_command && (command.cmd_clear_faults_seq != rx->clear_faults_seq)) {
+            rx->clear_requests++;
+        }
+
         rx->telemetry_on = (command.cmd_telemetry_on != 0U);
         rx->clear_faults_seq = command.cmd_clear_faults_seq;
         rx->have_command = true;
@@ -126,4 +130,9 @@ void command_on_cycle(command_rx_t *rx)
 bool command_telemetry_on(const command_rx_t *rx)
 {
     return rx->telemetry_on;
+}
+
+uint32_t command_clear_requests(const command_rx_t *rx)
+{
+    return rx->clear_requests;
 }

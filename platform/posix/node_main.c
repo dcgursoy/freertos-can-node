@@ -25,6 +25,7 @@
 #include "can_backend.h"
 #include "plat_can.h"
 #include "posix_platform.h"
+#include "posix_retained.h"
 #include "posix_sensor.h"
 #include "posix_sim.h"
 
@@ -49,6 +50,7 @@ typedef struct {
     posix_config_t platform;
     app_config_t app;
     const char *stats_path;
+    const char *retained_path; /* NULL: no retained cell, every start is a power-on */
     const char *can_spec;
     uint32_t bitrate;
     uint32_t sensor_seed;
@@ -69,6 +71,10 @@ static void print_usage(const char *program)
                  "  --duration-s N         stop after N seconds of tick time (default and 0: run\n"
                  "                         until SIGINT or SIGTERM)\n"
                  "  --stats-json PATH      write run statistics to PATH on an orderly stop\n"
+                 "  --retained-file PATH   the retained-RAM cell: the reset cause survives a\n"
+                 "                         reset in PATH, which is created if missing; remove\n"
+                 "                         it to simulate a power loss (default: no cell, every\n"
+                 "                         start is a power-on)\n"
                  "  --tick-mode MODE       locked (default) or stock\n"
                  "  --irq-mode MODE        signal (default) or poll\n"
                  "  --log-file PATH        write the log to PATH instead of stderr\n"
@@ -137,6 +143,7 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         OPT_BITRATE,
         OPT_SIM_PORT,
         OPT_SENSOR_SEED,
+        OPT_RETAINED,
         OPT_VERSION,
         OPT_HELP
     };
@@ -151,6 +158,7 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         {"bitrate", required_argument, NULL, OPT_BITRATE},
         {"sim-port", required_argument, NULL, OPT_SIM_PORT},
         {"sensor-seed", required_argument, NULL, OPT_SENSOR_SEED},
+        {"retained-file", required_argument, NULL, OPT_RETAINED},
         {"version", no_argument, NULL, OPT_VERSION},
         {"help", no_argument, NULL, OPT_HELP},
         {NULL, 0, NULL, 0}};
@@ -228,6 +236,9 @@ static int parse_options(int argc, char **argv, node_options_t *options)
                 (void)fprintf(stderr, "invalid --sensor-seed: %s (0 to 4294967295)\n", optarg);
                 result = 2;
             }
+            break;
+        case OPT_RETAINED:
+            options->retained_path = optarg;
             break;
         case OPT_VERSION:
             (void)printf("fcn_node %s (FreeRTOS %s)\n", FCN_VERSION, tskKERNEL_VERSION_NUMBER);
@@ -352,6 +363,7 @@ static void write_can_stats(FILE *file, const node_stats_t *stats)
     put_u64(file, "tx_load_failed", stats->can_io.tx_load_failed, ", ");
     put_u64(file, "rx_cycles", stats->can_io.rx_cycles, ", ");
     put_u64(file, "rx_cycles_skipped", stats->can_io.rx_cycles_skipped, ", ");
+    put_u64(file, "error_passive_entries", stats->can_io.error_passive_entries, ", ");
     put_u64(file, "rx_fifo_overruns", host.rx_fifo_overruns, ", ");
     put_u64(file, "event_fifo_overruns", host.event_fifo_overruns, ", ");
     put_u64(file, "state_events_merged", host.state_events_merged, ", ");
@@ -453,7 +465,9 @@ static void write_measurement_stats(FILE *file, const node_stats_t *stats)
     (void)fprintf(file, "  \"process\": {");
     put_u64(file, "samples", process->samples, ", ");
     put_u64(file, "timeouts", process->timeouts, ", ");
-    put_u64(file, "backlog", process->backlog, "},\n");
+    put_u64(file, "backlog", process->backlog, ", ");
+    put_u64(file, "verdicts_posted", process->verdicts_posted, ", ");
+    put_u64(file, "verdicts_lost", process->verdicts_lost, "},\n");
 
     (void)fprintf(file, "  \"pack\": {\"state\": \"%s\", ", pack_state_name(pack->state));
     put_u64(file, "updates", pack->updates, ", ");
@@ -520,6 +534,35 @@ static void write_telemetry_stats(FILE *file, const node_stats_t *stats)
     (void)fprintf(file, "\n  }},\n");
 }
 
+/*
+ * "reset" and "hw_watchdog": what the platform knows about why this run started (the
+ * retained cell, plat_retained.h) and what the hardware watchdog model counted (plat_wdg.h).
+ * The verdict is one of the fixed words of posix_retained_info_t, which need no escaping.
+ */
+static void write_platform_reset_stats(FILE *file)
+{
+    posix_retained_info_t retained;
+    posix_wdg_stats_t wdg;
+
+    posix_retained_get_info(&retained);
+    posix_wdg_get_stats(&wdg);
+
+    (void)fprintf(file, "  \"reset\": {\"cause\": \"%s\", ",
+                  posix_reset_reason_name(retained.cause));
+    put_u64(file, "cause_code", (uint64_t)retained.cause, ", ");
+    put_bool(file, "retained_cell", retained.open, ", ");
+    (void)fprintf(file, "\"verdict\": \"%s\", ", retained.verdict);
+    put_u64(file, "resets_since_power_on", retained.resets, "},\n");
+
+    (void)fprintf(file, "  \"hw_watchdog\": {");
+    put_bool(file, "started", wdg.started, ", ");
+    put_u64(file, "timeout_ms", wdg.timeout_ms, ", ");
+    put_u64(file, "kicks", wdg.kicks, ", ");
+    put_u64(file, "longest_unkicked_ns", wdg.longest_unkicked_ns, ", ");
+    put_u64(file, "gaps", wdg.gaps, ", ");
+    put_u64(file, "longest_gap_ns", wdg.longest_gap_ns, "},\n");
+}
+
 /* "command": the receiver of TESTER_Command (app/command.h). */
 static void write_command_stats(FILE *file, const node_stats_t *stats)
 {
@@ -544,12 +587,132 @@ static void write_command_stats(FILE *file, const node_stats_t *stats)
     put_u64(file, "accepted", command->accepted, ", ");
     put_u64(file, "ignored", command->ignored, ", ");
     put_bool(file, "telemetry_on", command->telemetry_on, ", ");
+    put_u64(file, "clear_requests", command->clear_requests, ", ");
 
     if (command->have_command) {
-        put_u64(file, "clear_faults_seq", command->clear_faults_seq, "}\n");
+        put_u64(file, "clear_faults_seq", command->clear_faults_seq, "},\n");
     } else {
-        (void)fprintf(file, "\"clear_faults_seq\": null}\n");
+        (void)fprintf(file, "\"clear_faults_seq\": null},\n");
     }
+}
+
+/* A DTC number in the display form of SAE J2012 and ISO 14229-1, as app/fault.h lists them:
+ * the system letter and four characters of the two high bytes, the failure type after a dash
+ * ("P1A01-00"). `out` holds at least 9 characters and the terminating zero. */
+static void dtc_code(uint32_t dtc, char out[10])
+{
+    static const char letters[] = "PCBU";
+    const unsigned int code = (unsigned int)((dtc >> 8) & 0xFFFFU);
+
+    (void)snprintf(out, 10, "%c%u%03X-%02X", letters[(code >> 14) & 3U], (code >> 12) & 3U,
+                   code & 0xFFFU, (unsigned int)(dtc & 0xFFU));
+}
+
+/* "faults": the DTCs as their owner, the health task, left them (app/fault.h), and the summary
+ * of them the last BMS_Fault carried. */
+static void write_fault_stats(FILE *file, const node_stats_t *stats)
+{
+    const fault_monitor_t *faults = &stats->faults;
+    const fault_summary_t *summary = &stats->fault_summary;
+
+    (void)fprintf(file, "  \"faults\": {");
+    put_bool(file, "pack_fault_active", summary->active != 0U, ", ");
+    put_u64(file, "active", summary->active, ", ");
+    put_u64(file, "confirmed", summary->confirmed, ", ");
+
+    if (summary->most_recent < (uint8_t)FAULT_EVENTS) {
+        (void)fprintf(file, "\"most_recent\": \"%s\", ", fault_name(summary->most_recent));
+    } else {
+        (void)fprintf(file, "\"most_recent\": null, ");
+    }
+
+    put_bool(file, "warning", summary->warning, ", ");
+    put_u64(file, "clears", faults->clears, ", ");
+    put_u64(file, "clear_requests_seen", faults->clear_requests, ",\n    ");
+    put_u64(file, "verdicts_applied", faults->verdicts, ", ");
+    put_u64(file, "health_cycles", faults->health_cycles, ", ");
+    put_u64(file, "status_changes", dtc_status_change_count(&faults->dtc), ", ");
+    (void)fprintf(file, "\"reset_cause\": \"%s\",\n    \"dtcs\": [",
+                  posix_reset_reason_name(faults->reset_cause));
+
+    for (uint32_t event = 0U; event < (uint32_t)FAULT_EVENTS; event++) {
+        dtc_entry_t entry;
+        char code[10];
+
+        (void)memset(&entry, 0, sizeof(entry));
+        (void)dtc_get(&faults->dtc, (uint16_t)event, &entry);
+        dtc_code(fault_dtc_number(event), code);
+        (void)fprintf(file, "%s\n      {", (event == 0U) ? "" : ",");
+        put_u64(file, "event", event, ", ");
+        (void)fprintf(file, "\"name\": \"%s\", ", fault_name(event));
+        put_u64(file, "dtc", fault_dtc_number(event), ", ");
+        (void)fprintf(file, "\"code\": \"%s\", ", code);
+        put_u64(file, "status", entry.status, ", ");
+        put_i64(file, "counter", entry.counter, ", ");
+        put_i64(file, "fdc", entry.fault_detection_counter, ", ");
+        put_u64(file, "failed_cycles", entry.failed_cycles, "}");
+    }
+
+    (void)fprintf(file, "\n    ]},\n");
+}
+
+static const char *local_status_name(wdgm_local_status_t status)
+{
+    static const char *const names[] = {"DEACTIVATED", "OK", "FAILED", "EXPIRED"};
+
+    return ((uint32_t)status <= (uint32_t)WDGM_LOCAL_STATUS_EXPIRED) ? names[status] : "unknown";
+}
+
+static const char *global_status_name(wdgm_global_status_t status)
+{
+    static const char *const names[] = {"DEACTIVATED", "OK", "FAILED", "EXPIRED", "STOPPED"};
+
+    return ((uint32_t)status <= (uint32_t)WDGM_GLOBAL_STATUS_STOPPED) ? names[status] : "unknown";
+}
+
+/* "watchdog_manager": the supervision of the tasks (lib/wdgm) and the kicks of the hardware
+ * watchdog, as the health task left them; "hw_watchdog" has what the watchdog itself counted. */
+static void write_supervision_stats(FILE *file, const node_stats_t *stats)
+{
+    const node_supervision_stats_t *supervision = &stats->supervision;
+
+    (void)fprintf(file, "  \"watchdog_manager\": {\"global_status\": \"%s\", ",
+                  global_status_name(supervision->status));
+    put_u64(file, "cycles", supervision->cycles, ", ");
+
+    if (supervision->first_expired < supervision->entity_count) {
+        (void)fprintf(file, "\"first_expired\": \"%s\", ",
+                      supervision->entities[supervision->first_expired].name);
+    } else {
+        (void)fprintf(file, "\"first_expired\": null, ");
+    }
+
+    put_u64(file, "expired_cycles", supervision->expired_cycles, ", ");
+    put_u64(file, "expired_tolerance", supervision->expired_tolerance, ",\n    ");
+    put_u64(file, "kicks", supervision->kicks, ", ");
+    put_u64(file, "kicks_withheld", supervision->kicks_withheld, ", ");
+    put_bool(file, "hw_started", supervision->watchdog_started, ", ");
+    put_u64(file, "hw_timeout_ms", supervision->timeout_ms, ",\n    \"entities\": [");
+
+    for (uint32_t i = 0U; (i < supervision->entity_count) && (i < WDGM_MAX_ENTITIES); i++) {
+        const node_supervised_stats_t *entity = &supervision->entities[i];
+
+        (void)fprintf(file, "%s\n      {\"name\": \"%s\", \"status\": \"%s\", ",
+                      (i == 0U) ? "" : ",", (entity->name != NULL) ? entity->name : "unknown",
+                      local_status_name(entity->status));
+        put_u64(file, "examinations", entity->examinations, ", ");
+        put_u64(file, "incorrect", entity->incorrect, ", ");
+        put_u64(file, "last_count", entity->last_count, ", ");
+        put_u64(file, "min_count", entity->min_count, ", ");
+        put_u64(file, "max_count", entity->max_count, ",\n       ");
+        put_u64(file, "expected_alive", entity->expected_alive, ", ");
+        put_u64(file, "min_margin", entity->min_margin, ", ");
+        put_u64(file, "max_margin", entity->max_margin, ", ");
+        put_u64(file, "reference_cycle", entity->reference_cycle, ", ");
+        put_u64(file, "failed_tolerance", entity->failed_tolerance, "}");
+    }
+
+    (void)fprintf(file, "\n    ]}\n");
 }
 
 static bool write_stats(const char *path, const node_options_t *options, uint64_t elapsed_ns)
@@ -593,6 +756,7 @@ static bool write_stats(const char *path, const node_options_t *options, uint64_
                   (unsigned long long)irq.serviced_by_signal,
                   (unsigned long long)irq.serviced_by_tick, (unsigned int)irq.max_nesting);
     (void)fprintf(file, "  \"log_lines_dropped\": %u,\n", (unsigned int)posix_log_dropped());
+    write_platform_reset_stats(file);
     write_can_stats(file, stats);
     (void)fprintf(file, "  \"run_time_total_us\": %llu,\n",
                   (unsigned long long)stats->total_run_time_us);
@@ -631,6 +795,8 @@ static bool write_stats(const char *path, const node_options_t *options, uint64_
     write_measurement_stats(file, stats);
     write_telemetry_stats(file, stats);
     write_command_stats(file, stats);
+    write_fault_stats(file, stats);
+    write_supervision_stats(file, stats);
     (void)fprintf(file, "}\n");
     return (fclose(file) == 0);
 }
@@ -707,7 +873,15 @@ static bool check_configuration(const node_options_t *options, char *error, size
     }
 
     return output_path_usable(options->platform.log_path, "--log-file", error, error_len) &&
-           output_path_usable(options->stats_path, "--stats-json", error, error_len);
+           output_path_usable(options->stats_path, "--stats-json", error, error_len) &&
+           output_path_usable(options->retained_path, "--retained-file", error, error_len);
+}
+
+/* "sensor.hang on" (posix_sensor.h): the sensor task's read waits as a driver waits for an
+ * interrupt that never comes, blocked one tick at a time, so that the tasks below it run. */
+static void sensor_wait_one_tick(void)
+{
+    vTaskDelay(1U);
 }
 
 int main(int argc, char **argv)
@@ -749,8 +923,24 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    /* The retained cell is read first, as a target's start-up code reads its no-init RAM
+     * before anything else runs, so that even a reset during start-up is recorded. */
+    if (!posix_retained_open(options.retained_path, error, sizeof(error))) {
+        (void)fprintf(stderr, "fcn_node: %s\n", error);
+        return EXIT_FAILURE;
+    }
+
     posix_platform_init(&options.platform);
     LOG_INF("main", "fcn_node %s starting (FreeRTOS %s)", FCN_VERSION, tskKERNEL_VERSION_NUMBER);
+
+    {
+        posix_retained_info_t retained;
+
+        posix_retained_get_info(&retained);
+        LOG_INF("main", "reset cause %s (retained cell: %s, %lu resets since power-on)",
+                posix_reset_reason_name(retained.cause), retained.verdict,
+                (unsigned long)retained.resets);
+    }
 
     /* The simulated hardware comes up before the application, as a board is powered before
      * its firmware runs. Without a bus there is no node: failing here is a start-up error. The
@@ -760,6 +950,7 @@ int main(int argc, char **argv)
 
     if (hardware_up) {
         posix_sensor_start(options.sensor_seed);
+        posix_sensor_set_wait(sensor_wait_one_tick);
         hardware_up = posix_can_start(options.can_spec, options.bitrate, error, sizeof(error));
     }
 
@@ -767,6 +958,7 @@ int main(int argc, char **argv)
         (void)fprintf(stderr, "fcn_node: %s\n", error);
         posix_sim_close();
         posix_platform_shutdown();
+        posix_retained_close();
         return EXIT_FAILURE;
     }
 
@@ -785,6 +977,7 @@ int main(int argc, char **argv)
     posix_sim_close();
     LOG_INF("main", "scheduler stopped");
     posix_platform_shutdown();
+    posix_retained_close();
 
     const int transport_error = posix_can_transport_error();
     const bool stats_written =

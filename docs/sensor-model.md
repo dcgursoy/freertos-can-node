@@ -17,7 +17,8 @@ front end itself declares invalid (an open sense wire, for example). The value o
 channel is unspecified, and the application must not use it.
 
 The application's sensor task reads the current in every 10 ms period, the cells in every
-second period and the temperatures in every tenth. The calls never block.
+second period and the temperatures in every tenth. The calls never block, unless the test bench
+makes the front end hang (`sensor.hang`, below).
 
 ## The model
 
@@ -85,8 +86,9 @@ to `temp4`; `cell1` is bit 0 of the invalid mask, and the cell signal `Cell1Volt
 | `sensor.set <channel> <value>` | the channel reports exactly `value`, as a valid reading, without noise | `<channel>=<value> t_ns=<time>` | a cell simulator drives a voltage; a stuck converter |
 | `sensor.open <channel>` | the front end flags the channel invalid | `<channel>=open t_ns=<time>` | an open sense wire |
 | `sensor.offline on\|off` | `on`: the front end answers no read at all | `offline=on t_ns=<time>` | the SPI bus fails, the front end is in reset |
-| `sensor.clear [<channel>]` | the channel follows the model again; without a channel, every channel does and the front end is on line | `<channel>=model t_ns=<time>` or `cleared=all offline=off t_ns=<time>` | |
-| `sensor.status` | nothing | `seed=<n> offline=on\|off current_reads=<n> cell_reads=<n> temp_reads=<n> unanswered=<n>` and one `<channel>=model\|open\|<held value>` per channel | |
+| `sensor.hang on\|spin\|off` | `on` and `spin`: a read does not return until `off`; `on` blocks the reading task, `spin` keeps it on the CPU (below) | `hang=on t_ns=<time>` | a transfer that never completes: the driver waits for its interrupt (`on`) or polls a busy flag (`spin`) for ever |
+| `sensor.clear [<channel>]` | the channel follows the model again; without a channel, every channel does, the front end is on line and does not hang | `<channel>=model t_ns=<time>` or `cleared=all offline=off hang=off t_ns=<time>` | |
+| `sensor.status` | nothing | `seed=<n> offline=on\|off current_reads=<n> cell_reads=<n> temp_reads=<n> unanswered=<n>`, one `<channel>=model\|open\|<held value>` per channel, then `hang=off\|on\|spin hung=<n>` | |
 
 - A channel is in one mode at a time: following the model, held at a value, or open. Each
   `set` or `open` replaces what the channel had before; the off-line state is separate and
@@ -100,10 +102,28 @@ to `temp4`; `cell1` is bit 0 of the invalid mask, and the cell signal `Cell1Volt
   that ignored the flag would publish it, and only the flag can tell the test that it did not.
 - Off line, every read returns false. The read is still counted (`*_reads`, and `unanswered`),
   and the model runs on.
+- **The hang** is the hardware fault behind the watchdog tests: a task that stops because its
+  driver never gets an answer. While it is on, every read waits at its start, and returns only
+  after `sensor.hang off` or `sensor.clear`. With `on` the read waits the way a driver waits
+  for its transfer-complete interrupt: the node blocks the sensor task one tick at a time
+  (`vTaskDelay(1)`), so the tasks below it go on running, the health task included, and only
+  something that watches the sensor task itself can see that it stopped: the watchdog manager,
+  or the processing task's timeout on the samples that no longer come. With `spin` it waits
+  the way a driver polling a busy flag does: the sensor task (priority 5) never gives up the
+  CPU as far as the scheduler can tell, so every task below it starves, the processing,
+  transmit and health tasks with it, and with the health task everything it does, such as
+  kicking the hardware watchdog. (On the host the thread sleeps 1 ms between its looks at the
+  hang, so that it does not burn a host core; the scheduler cannot see that sleep.)
+  `hung` counts the reads that had to wait, from the moment each began to; a read that is
+  waiting now is counted, so `hung` going up says that the sensor task is stuck. A read that
+  waited is taken once the hang ends and counted then in `*_reads`: the model has no clock, so
+  the readings go on with the next number, and the off-line state at that moment decides
+  whether it is answered.
 - `t_ns` is `CLOCK_MONOTONIC`, the clock of `plat_time_ns()`, at the moment the command took
   effect, so a test can measure from a fault to its consequence on the bus.
 - A wrong command is answered with `err` and a message: `usage: ...` for a wrong number of
-  arguments (or a word of more than 23 characters), `unknown channel '<name>' (current,
+  arguments or an argument that is not one of the command's words (`usage: sensor.hang
+  on|spin|off`), or a word of more than 23 characters; `unknown channel '<name>' (current,
   cell1..cell8, temp1..temp4)`, or the range message above. It changes nothing.
 
 The commands are served by the CAN hardware thread, the thread that serves all of simulation
@@ -113,9 +133,9 @@ channel's setting before the command or after it, never a mix of the two, and th
 that starts after the reply was sent sees the new setting.
 
 [`fcn_tools.simctl.SimControl`](../tools/fcn_tools/simctl.py) has a method per command:
-`sensor_status()`, `sensor_set()`, `sensor_open()`, `sensor_offline()` and `sensor_clear()`.
-Each sets a state rather than adding to one, so the client sends it again after a timeout
-(see `REPEATABLE`).
+`sensor_status()`, `sensor_set()`, `sensor_open()`, `sensor_offline()`, `sensor_hang()` (`"on"`,
+`"spin"`, `"off"`, or `True` and `False`) and `sensor_clear()`. Each sets a state rather than
+adding to one, so the client sends it again after a timeout (see `REPEATABLE`).
 
 ## What is not modelled
 
@@ -136,12 +156,23 @@ Each sets a state rather than adding to one, so the client sends it again after 
 
 - [tests/platform/test_posix_sensor.c](../tests/platform/test_posix_sensor.c): determinism
   (same seed, same readings; another seed, other noise), the profile and its boundaries, the
-  cells against current × resistance, the noise per channel, each fault, every reply, and the
-  commands served from a second thread while the test reads (also run under ThreadSanitizer by
-  `scripts/test-tsan.sh`).
+  cells against current × resistance, the noise per channel, each fault, every reply, the hang
+  of a read in a second thread (it takes no reading until the hang ends and then returns the
+  reading a run without the hang gives first), and the commands served from a second thread
+  while the test reads (also run under ThreadSanitizer by `scripts/test-tsan.sh`).
+- [tests/platform/wdg_selftest.c](../tests/platform/wdg_selftest.c) (`hang on`, `hang spin`):
+  the hang under the scheduler. With `on` a task below the reading task keeps running; with
+  `spin` it does not run at all until the hang ends.
 - [tests/python/test_simctl.py](../tests/python/test_simctl.py): the client methods.
 - [tests/system/test_sensor_control.py](../tests/system/test_sensor_control.py): the option and
-  the commands in the running node.
+  the commands in the running node; the hang in the running node: with `on` the sensor task
+  stops reading while the tasks below it run on (the processing task logs its timeout, the
+  health task finds the sensor task gone in its supervision), and the hardware watchdog resets
+  the node; with `spin` no task below the sensor task runs, SIGTERM is not served, and the
+  hardware watchdog resets the node all the same (exit status 11 both times).
+- [tests/system/test_faults.py](../tests/system/test_faults.py): what the application makes of
+  the hang: the DTCs it reports in BMS_Fault before the reset, the time to the reset, and the
+  cause the next start on the same retained cell reports.
 - [tests/system/test_telemetry.py](../tests/system/test_telemetry.py): what the node makes of the
   model. The decoded telemetry stays within the model's values and noise and follows the load
   profile's step from 2 A to 45 A; every channel opened or held beyond its sensor's range, and

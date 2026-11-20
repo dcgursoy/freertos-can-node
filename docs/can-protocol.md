@@ -30,12 +30,13 @@ against the DBC by `tests/python/test_gen_can_db.py`, so they cannot drift from 
 
 | ID | Name | Sender | DLC | Cycle | E2E Data ID | Content |
 |---|---|---|---|---|---|---|
+| 0x010 | BMS_Fault | BMS | 8 | 100 ms | 0x0110 | the diagnostic trouble codes: active and confirmed faults, the most recent one, warning indicator, clears |
 | 0x020 | BMS_PackStatus | BMS | 8 | 10 ms | 0x0120 | pack current and voltage, pack state, fault flag, valid flags |
 | 0x030 | BMS_Heartbeat | BMS | 8 | 10 ms | none | period counter and tick count: the status frame of phase 1, unchanged |
 | 0x040 | BMS_CellVoltages1 | BMS | 8 | 20 ms | 0x0140 | cells 1 to 4 |
 | 0x041 | BMS_CellVoltages2 | BMS | 8 | 20 ms | 0x0141 | cells 5 to 8 |
 | 0x050 | BMS_Temperatures | BMS | 8 | 100 ms | 0x0150 | four temperatures |
-| 0x100 | TESTER_Command | TESTER | 8 | 100 ms | 0x0200 | telemetry on/off, clear-faults sequence (phase 3) |
+| 0x100 | TESTER_Command | TESTER | 8 | 100 ms | 0x0200 | telemetry on/off, clear-faults sequence |
 | 0x600 | BMS_TaskStats | BMS | 8 | 200 ms | none | statistics of one task per frame, round robin |
 | 0x610 | BMS_NodeInfo | BMS | 8 | 1000 ms | none | software version, active slot (phase 4), reset cause, uptime |
 | 0x6F0 | TESTER_Ping | TESTER | 8 | event | none | any payload of 0 to 8 bytes, no signals |
@@ -47,7 +48,7 @@ The DBC gives ping and pong a DLC of 8, the most they carry; the frames themselv
 shorter. `TESTER_Command` is sent cyclically although it carries commands, so that the node can
 tell a tester that has gone silent from one that has nothing new to say.
 
-**Bus load.** The node sends 316 cyclic frames per second, and they occupy at most 8.53 % of
+**Bus load.** The node sends 326 cyclic frames per second, and they occupy at most 8.80 % of
 the 500 kbit/s bus (the worst case of bit stuffing for 8-byte frames, plus the intermission);
 the tester's command adds 10 frames per second, at most 0.27 %. From the DBC with:
 
@@ -68,7 +69,7 @@ EOF
 ```
 
 ```
-BMS: 7 cyclic messages, 316 frames/s, at most 42660 bit/s = 8.53 % of 500000 bit/s
+BMS: 8 cyclic messages, 326 frames/s, at most 44010 bit/s = 8.80 % of 500000 bit/s
 TESTER: 1 cyclic messages, 10 frames/s, at most 1350 bit/s = 0.27 % of 500000 bit/s
 ```
 
@@ -76,6 +77,27 @@ TESTER: 1 cyclic messages, 10 frames/s, at most 1350 bit/s = 0.27 % of 500000 bi
 
 Start bit and length in bits; range is the physical range the DBC gives (`[min|max]`), values
 are the entries of the signal's value table as raw value and name.
+
+### 0x010 BMS_Fault
+
+| Signal | Start bit | Length | Type | Factor | Offset | Unit | Range | Values | Meaning |
+|---|---|---|---|---|---|---|---|---|---|
+| E2E_Crc | 0 | 8 | unsigned | 1 | 0 |  | 0..255 |  | E2E CRC |
+| E2E_Counter | 8 | 4 | unsigned | 1 | 0 |  | 0..14 |  | E2E counter |
+| FaultActive | 16 | 16 | unsigned | 1 | 0 |  | 0..65535 |  | bit n: the DTC of fault n has testFailed, the fault is present |
+| FaultConfirmed | 32 | 16 | unsigned | 1 | 0 |  | 0..65535 |  | bit n: the DTC of fault n has confirmedDTC, the fault occurred since the start or the last clear |
+| FaultMostRecent | 48 | 5 | unsigned | 1 | 0 |  | 0..15 | 0 CELL_OVERVOLTAGE, 1 CELL_UNDERVOLTAGE, 2 OVERTEMPERATURE, 3 UNDERTEMPERATURE, 4 OVERCURRENT_DISCHARGE, 5 OVERCURRENT_CHARGE, 6 SENSOR_CHANNEL_INVALID, 7 FRONT_END_NO_ANSWER, 8 SAMPLE_TIMEOUT, 9 CAN_BUS_OFF, 10 CAN_ERROR_PASSIVE, 11 SUPERVISION_EXPIRED, 12 RESET_WATCHDOG, 13 RESET_ASSERT, 14 RESET_STACK_OVERFLOW, 15 RESET_MALLOC_FAILED, 31 NONE | the fault whose DTC went to testFailed most recently since the start or the last clear |
+| FaultWarning | 53 | 1 | unsigned | 1 | 0 |  | 0..1 |  | a DTC requests the warning indicator: a fault of the pack's limits or its measurement occurred |
+| FaultClearCount | 56 | 8 | unsigned | 1 | 0 |  | 0..255 |  | clears carried out since the start, modulo 256 |
+
+Fault *n* is entry *n* of FaultMostRecent's value table; [app/fault.h](../app/fault.h) gives the
+DTC number of each, and the application checks every entry against its own numbering at compile
+time. Bits 12 to 15, 54 and 55 are unused. The node's health task, the one task that changes
+the DTCs, sends the message once in each of its 100 ms periods, after the last change it made in
+the period: every change of the DTCs goes out in the frame of the period that made it. It is
+protected under Data ID 0x0110 (see [End-to-end protection](#end-to-end-protection)) and is not
+switched off by CmdTelemetryOn. [faults.md](faults.md) describes the faults, their DTCs and how
+a tester clears them.
 
 ### 0x020 BMS_PackStatus
 
@@ -85,8 +107,8 @@ are the entries of the signal's value table as raw value and name.
 | E2E_Counter | 8 | 4 | unsigned | 1 | 0 |  | 0..14 |  | E2E counter |
 | PackCurrent | 16 | 16 | signed | 0.01 | 0 | A | -327.68..327.67 |  | filtered, positive while discharging; valid only if PackCurrentValid |
 | PackVoltage | 32 | 16 | unsigned | 0.001 | 0 | V | 0..65.535 |  | sum of the filtered cells; valid only if PackVoltageValid |
-| PackState | 48 | 2 | unsigned | 1 | 0 |  | 0..2 | 0 STARTUP, 1 NORMAL, 2 FAULT | STARTUP until every channel has delivered a reading, FAULT while one is invalid |
-| PackFaultActive | 50 | 1 | unsigned | 1 | 0 |  | 0..1 |  | a fault is active (phase 3) |
+| PackState | 48 | 2 | unsigned | 1 | 0 |  | 0..2 | 0 STARTUP, 1 NORMAL, 2 FAULT | STARTUP until every channel has delivered a reading, FAULT while one is invalid or a fault is active |
+| PackFaultActive | 50 | 1 | unsigned | 1 | 0 |  | 0..1 |  | a fault is active: a bit of BMS_Fault's FaultActive is set |
 | PackCurrentValid | 51 | 1 | unsigned | 1 | 0 |  | 0..1 |  | PackCurrent holds a valid measurement |
 | PackVoltageValid | 52 | 1 | unsigned | 1 | 0 |  | 0..1 |  | every cell is valid, so PackVoltage is their sum |
 
@@ -149,7 +171,7 @@ counts it as superseded.
 | E2E_Crc | 0 | 8 | unsigned | 1 | 0 |  | 0..255 |  | E2E CRC |
 | E2E_Counter | 8 | 4 | unsigned | 1 | 0 |  | 0..14 |  | E2E counter |
 | CmdTelemetryOn | 16 | 1 | unsigned | 1 | 0 |  | 0..1 |  | 0 silences the protected cyclic messages (0x020, 0x040, 0x041, 0x050); the others go on. 1 until a valid command has been carried out |
-| CmdClearFaultsSeq | 24 | 8 | unsigned | 1 | 0 |  | 0..255 |  | latched faults are cleared when it changes between two valid commands (phase 3) |
+| CmdClearFaultsSeq | 24 | 8 | unsigned | 1 | 0 |  | 0..255 |  | the node clears its DTCs when it changes between two commands it carries out |
 
 ### 0x600 BMS_TaskStats
 
@@ -172,7 +194,7 @@ of them every n * 200 ms.
 | SwMinor | 8 | 8 | unsigned | 1 | 0 |  | 0..255 |  | |
 | SwPatch | 16 | 8 | unsigned | 1 | 0 |  | 0..255 |  | |
 | ActiveSlot | 24 | 2 | unsigned | 1 | 0 |  | 0..1 | 0 A, 1 B, 3 SNA | the firmware slot the node runs from; SNA until phase 4 |
-| ResetCause | 26 | 6 | unsigned | 1 | 0 |  | 0..62 | 10 REQUESTED, 11 WATCHDOG, 12 POWER_LOSS, 13 IMAGE_FAULT, 20 ASSERT, 21 STACK_OVERFLOW, 22 MALLOC_FAILED, 63 SNA | the values of `plat_reset_reason_t` (platform/include/platform.h); SNA while the node does not know |
+| ResetCause | 26 | 6 | unsigned | 1 | 0 |  | 0..62 | 0 POWER_ON, 10 REQUESTED, 11 WATCHDOG, 12 POWER_LOSS, 13 IMAGE_FAULT, 20 ASSERT, 21 STACK_OVERFLOW, 22 MALLOC_FAILED, 63 SNA | the values of `plat_reset_reason_t` (platform/include/platform.h): the reset cause of this start, read from the retained-RAM cell (`plat_reset_cause()`); POWER_ON for a start without a reset before it; SNA for a value that is none of these |
 | UptimeSeconds | 32 | 32 | unsigned | 1 | 0 | s | 0..4294967295 |  | seconds since the start |
 
 ## End-to-end protection
@@ -191,11 +213,12 @@ the PRS lists which fault each mechanism covers:
 - the counter detects repetition, loss, delay and wrong order;
 - a check in every receive period detects a sender that has stopped.
 
-Protected are the messages whose DBC attribute `FcnE2eDataId` is not -1: BMS_PackStatus
-(0x020), BMS_CellVoltages1 (0x040), BMS_CellVoltages2 (0x041), BMS_Temperatures (0x050) and
-TESTER_Command (0x100). The node protects the first four with [lib/e2e](../lib/e2e/e2e_p11.h)
-and checks the fifth. On the Python side, [fcn_tools.decode](../tools/fcn_tools/decode.py)
-checks the first four and the system tests' tester protects the fifth, both with
+Protected are the messages whose DBC attribute `FcnE2eDataId` is not -1: BMS_Fault (0x010),
+BMS_PackStatus (0x020), BMS_CellVoltages1 (0x040), BMS_CellVoltages2 (0x041), BMS_Temperatures
+(0x050) and TESTER_Command (0x100). The node protects the first five with
+[lib/e2e](../lib/e2e/e2e_p11.h) and checks the sixth. On the Python side,
+[fcn_tools.decode](../tools/fcn_tools/decode.py) checks the first five and the system tests'
+tester protects the sixth, both with
 [fcn_tools.e2e](../tools/fcn_tools/e2e.py), a second implementation written from the PRS
 without looking at lib/e2e.
 
@@ -486,6 +509,7 @@ What the DBC fixes about it, and the generator checks:
 
 | Message | Data ID | CRC of the Data ID bytes |
 |---|---|---|
+| BMS_Fault | 0x0110 | 0xA9 |
 | BMS_PackStatus | 0x0120 | 0x68 |
 | BMS_CellVoltages1 | 0x0140 | 0xF7 |
 | BMS_CellVoltages2 | 0x0141 | 0xBB |

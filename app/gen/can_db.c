@@ -5,7 +5,7 @@
  * for every signal alike.
  *
  * GENERATED FILE, DO NOT EDIT. The implementation of the codec. Made by tools/gen_can_db.py from
- * dbc/fcn.dbc, SHA-256 feb8206c28af39cac838870eddc7c089ff50245ffdfad345fcee4131dbee88c5.
+ * dbc/fcn.dbc, SHA-256 3c885b001d6267703e6d18cb32aab9cfacdde26aa433f84e84d764b504a57dfe.
  *
  * After a change of the DBC, run scripts/codegen-check.sh --update. Without --update the script
  * fails while this file is out of date; CI and scripts/check.sh run it.
@@ -84,6 +84,43 @@ static int32_t to_signed(uint32_t raw, uint32_t length)
     }
 
     return value;
+}
+
+bool can_db_bms_fault_pack(const can_db_bms_fault_t *msg, uint8_t *data, size_t capacity)
+{
+    bool packed = false;
+
+    if ((msg != NULL) && (data != NULL) && (capacity >= CAN_DB_BMS_FAULT_DLC)) {
+        (void)memset(data, 0, CAN_DB_BMS_FAULT_DLC);
+        put_bits(data, 0U, 8U, msg->e2e_crc);
+        put_bits(data, 8U, 4U, msg->e2e_counter);
+        put_bits(data, 16U, 16U, msg->fault_active);
+        put_bits(data, 32U, 16U, msg->fault_confirmed);
+        put_bits(data, 48U, 5U, msg->fault_most_recent);
+        put_bits(data, 53U, 1U, msg->fault_warning);
+        put_bits(data, 56U, 8U, msg->fault_clear_count);
+        packed = true;
+    }
+
+    return packed;
+}
+
+bool can_db_bms_fault_unpack(can_db_bms_fault_t *msg, const uint8_t *data, size_t len)
+{
+    bool unpacked = false;
+
+    if ((msg != NULL) && (data != NULL) && (len == CAN_DB_BMS_FAULT_DLC)) {
+        msg->e2e_crc = (uint8_t)get_bits(data, 0U, 8U);
+        msg->e2e_counter = (uint8_t)get_bits(data, 8U, 4U);
+        msg->fault_active = (uint16_t)get_bits(data, 16U, 16U);
+        msg->fault_confirmed = (uint16_t)get_bits(data, 32U, 16U);
+        msg->fault_most_recent = (uint8_t)get_bits(data, 48U, 5U);
+        msg->fault_warning = (uint8_t)get_bits(data, 53U, 1U);
+        msg->fault_clear_count = (uint8_t)get_bits(data, 56U, 8U);
+        unpacked = true;
+    }
+
+    return unpacked;
 }
 
 bool can_db_bms_pack_status_pack(const can_db_bms_pack_status_t *msg, uint8_t *data,

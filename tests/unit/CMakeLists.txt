@@ -18,8 +18,13 @@ fcn_add_unit_test(test_can_db SOURCES test_can_db.c LIBS fcn_can_db_table)
 fcn_add_unit_test(test_e2e_p11 SOURCES test_e2e_p11.c LIBS fcn_e2e)
 fcn_add_unit_test(test_e2e_sm SOURCES test_e2e_sm.c LIBS fcn_e2e)
 fcn_add_unit_test(test_bms SOURCES test_bms.c LIBS fcn_bms)
+fcn_add_unit_test(test_dtc SOURCES test_dtc.c LIBS fcn_dtc)
+# The watchdog manager; one test reports checkpoints from several threads (also run under
+# ThreadSanitizer by scripts/test-tsan.sh, which selects unit tests that create threads).
+fcn_add_unit_test(test_wdgm SOURCES test_wdgm.c LIBS fcn_wdgm Threads::Threads)
 # The parts of the application that need no kernel (app/signals.c, app/telemetry.c,
-# app/command.c).
+# app/command.c, app/fault.c).
 fcn_add_unit_test(test_signals SOURCES test_signals.c LIBS fcn_app_logic)
 fcn_add_unit_test(test_telemetry SOURCES test_telemetry.c LIBS fcn_app_logic)
 fcn_add_unit_test(test_command SOURCES test_command.c LIBS fcn_app_logic)
+fcn_add_unit_test(test_fault SOURCES test_fault.c LIBS fcn_app_logic)

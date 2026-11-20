@@ -9,8 +9,11 @@ through the simulation control channel. Every test gets
     other's nodes or to anything else running on the machine;
   - a clean end: its nodes are killed when it finishes, the test fails if one of them ended
     by itself without the test looking at its exit status (or exited 0 but wrote to stderr),
-    the session fails if a node is still running at the end, and the kernel kills a node
-    whose test run died.
+    or was reset (an exit status of plat_reset_reason_t, the hardware watchdog's 11 among
+    them) without the test waiting for that reset with wait_for_reset(), the session fails if
+    a node is still running at the end, and the kernel kills a node whose test run died. So a
+    system test that does not expect a reset shows, besides what it tests, that the node's
+    hardware watchdog was kicked for the whole run.
 
 With --timing-report FILE, every failed test is listed in FILE as "miss <test>" if it failed
 only on a timing tolerance (fcn_tools.timing) and as "fail <test>" otherwise; that is how
@@ -131,31 +134,60 @@ def ports(port_allocator) -> PortBlock:
 
 
 @pytest.fixture
-def start_node(workdir, node_binary, ports):
-    """Factory: start_node(*args, name="node", can=None) returns a running NodeProcess.
-
-    Without `can` the node gets the test's own UDP bus. The first node of a test serves
-    simulation control on the test's port; further nodes of the same test do not.
-    """
+def started_nodes():
+    """Every node a test started through start_node or restart_node; when the test ends, a death
+    the test did not see, or a reset it did not wait for, fails it, and every node is killed."""
     started: list[NodeProcess] = []
 
-    def _start(*args: str, name: str = "node", can: str | None = None) -> NodeProcess:
-        node = NodeProcess(
-            workdir=workdir, args=args, binary=node_binary, name=name,
-            can=can or f"udp:{ports.bus}",
-            sim_port=None if started else ports.sim,
-        ).start()
-        started.append(node)
-        return node
+    yield started
 
-    yield _start
-
-    # Asked before the nodes are killed: a death the test did not see fails the test.
-    problems = [problem for problem in (node.unnoticed_end() for node in started) if problem]
+    # Asked before the nodes are killed: a death the test did not see, or a reset it did not
+    # expect, fails the test.
+    problems = [problem for problem in (node.unnoticed_end() or node.unexpected_reset()
+                                        for node in started) if problem]
     for node in started:
         node.kill()
     if problems:
         pytest.fail("\n\n".join(problems), pytrace=False)
+
+
+@pytest.fixture
+def start_node(workdir, node_binary, ports, started_nodes):
+    """Factory: start_node(*args, name="node", can=None, retained_file=None) returns a running
+    NodeProcess.
+
+    Without `can` the node gets the test's own UDP bus. The first node of a test serves
+    simulation control on the test's port; further nodes of the same test do not, except runs
+    started by restart_node, which take the place of the run they follow. `retained_file` is
+    the node's retained-RAM cell (--retained-file).
+    """
+
+    def _start(*args: str, name: str = "node", can: str | None = None,
+               retained_file: Path | None = None) -> NodeProcess:
+        node = NodeProcess(
+            workdir=workdir, args=args, binary=node_binary, name=name,
+            can=can or f"udp:{ports.bus}",
+            sim_port=None if started_nodes else ports.sim,
+            retained_file=retained_file,
+        ).start()
+        started_nodes.append(node)
+        return node
+
+    return _start
+
+
+@pytest.fixture
+def restart_node(started_nodes):
+    """Factory: restart_node(node, name=None) starts the next run of a node that has ended, with
+    its options, bus, simulation control port and retained-RAM cell, as a board starts again
+    after a reset (NodeProcess.restarted()), and returns it running."""
+
+    def _restart(node: NodeProcess, name: str | None = None) -> NodeProcess:
+        again = node.restarted(name).start()
+        started_nodes.append(again)
+        return again
+
+    return _restart
 
 
 # ------------------------------------------------------------------------------- the bus

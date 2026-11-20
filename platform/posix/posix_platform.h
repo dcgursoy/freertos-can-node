@@ -68,6 +68,10 @@ void posix_platform_shutdown(void);
  *  port's tick and the simulated interrupts are only ever handled by task threads. */
 void posix_external_thread_setup(const char *name);
 
+/** True in a thread that called posix_external_thread_setup(): one the scheduler does not
+ *  know, which must not enter a FreeRTOS critical section. */
+bool posix_on_external_thread(void);
+
 /* -------------------------------------------------------------------- simulated interrupts */
 
 #define POSIX_IRQ_LINES 8U
@@ -206,6 +210,29 @@ typedef struct {
 } posix_can_report_t;
 
 void posix_can_get_report(posix_can_report_t *out);
+
+/* ---------------------------------------------------------------- the hardware watchdog */
+
+/** What the watchdog model (posix_wdg.c, plat_wdg.h) counted. */
+typedef struct {
+    bool started;                 /**< plat_wdg_start() succeeded */
+    uint32_t timeout_ms;          /**< its timeout; 0 if not started */
+    uint64_t kicks;               /**< plat_wdg_kick() calls since the start */
+    uint64_t longest_unkicked_ns; /**< the longest time counted without a kick: the timeout
+                                       minus this is how close the node came to a reset */
+    uint64_t gaps;                /**< passes of the model's thread that came more than 50 ms
+                                       after the previous one: host stalls, counted as 50 ms */
+    uint64_t longest_gap_ns;      /**< the longest such gap */
+} posix_wdg_stats_t;
+
+/** The figures as of now. Any thread. */
+void posix_wdg_get_stats(posix_wdg_stats_t *out);
+
+/** Stop counting: the orderly end of a run (plat_end_scheduler()). Any thread. */
+void posix_wdg_stop(void);
+
+/** Stop counting and join the model's thread. Main thread, after the scheduler has ended. */
+void posix_wdg_shutdown(void);
 
 /* -------------------------------------------------------------------------------- logging */
 

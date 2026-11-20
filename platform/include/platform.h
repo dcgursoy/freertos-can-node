@@ -15,10 +15,16 @@
 
 /**
  * Why the system is being reset. On the host the value is the exit status of the node
- * process, which is how the supervising test harness learns what happened; on a target it
- * would be stored in a reset-cause register or a no-init RAM cell.
+ * process, which is how the supervising test harness learns what happened, and plat_reset()
+ * also writes it into the retained-RAM cell (plat_retained.h), from which the next start
+ * learns it; on a target it would be stored in a reset-cause register or a no-init RAM cell.
+ *
+ * PLAT_RESET_POWER_ON is not a reason for a reset but the cause of a start that follows none:
+ * the supply came up, or the retained cell held nothing valid. plat_reset_cause() returns it;
+ * plat_reset() never takes it.
  */
 typedef enum {
+    PLAT_RESET_POWER_ON = 0,     /**< no reset: a start from power-on (plat_reset_cause() only) */
     PLAT_RESET_REQUESTED = 10,   /**< commanded: UDS ECUReset or a command frame */
     PLAT_RESET_WATCHDOG = 11,    /**< a task stopped checking in */
     PLAT_RESET_POWER_LOSS = 12,  /**< simulated loss of supply (host only) */
@@ -39,7 +45,18 @@ uint64_t plat_run_time_counter_us(void);
 /** Called by configASSERT(). Reports the location and resets with PLAT_RESET_ASSERT. */
 _Noreturn void plat_assert_failed(const char *file, int line);
 
-/** Reset the system immediately. Nothing of the running image executes after this call. */
+/**
+ * Reset the system immediately. Nothing of the running image executes after this call.
+ *
+ * `reason` is recorded where the next start finds it (plat_reset_cause()). A value that is not
+ * one of the reset reasons above, PLAT_RESET_POWER_ON included, is a programming error and
+ * resets as PLAT_RESET_ASSERT. PLAT_RESET_POWER_LOSS models a loss of supply: the retained
+ * cell is lost with it, so the next start is a power-on.
+ *
+ * Any context: a task, an interrupt handler, a critical section, and on the host also a thread
+ * outside the scheduler (the hardware watchdog's). If two contexts call it at once, the first
+ * one's reason is the one recorded and exited with; the other never returns either.
+ */
 _Noreturn void plat_reset(plat_reset_reason_t reason);
 
 /** True once an orderly stop was requested from outside (SIGINT or SIGTERM on the host).

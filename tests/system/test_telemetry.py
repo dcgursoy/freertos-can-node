@@ -48,6 +48,7 @@ TRANSPORTS = ["udp", pytest.param("socketcan", marks=pytest.mark.socketcan)]
 
 DB = load_database()
 
+FAULT = "BMS_Fault"
 HEARTBEAT = "BMS_Heartbeat"
 PACK_STATUS = "BMS_PackStatus"
 CELLS = ("BMS_CellVoltages1", "BMS_CellVoltages2")
@@ -62,6 +63,13 @@ CYCLE_MS = {message.name: message.cycle_time for message in DB.messages if messa
 CYCLIC = tuple(m.name for m in DB.messages if m.cycle_time and m.senders == ["BMS"])
 DATA_ID = Decoder(DB).protected
 PROTECTED = tuple(name for name in CYCLIC if ID[name] in DATA_ID)
+#: The messages CmdTelemetryOn switches off (app/app.c): the protected messages of the
+#: measurement chain. BMS_Fault is protected too, and goes on whatever the switch says.
+GATED = ("BMS_PackStatus", "BMS_CellVoltages1", "BMS_CellVoltages2", "BMS_Temperatures")
+assert set(GATED) == set(PROTECTED) - {FAULT}
+#: The faults of BMS_Fault by name: their numbers are the bits of FaultActive (app/fault.h).
+FAULT_NUMBER = {str(name): number for number, name in DB.get_message_by_name(FAULT)
+                .get_signal_by_name("FaultMostRecent").choices.items()}
 
 # What the application does with them (app/app_tasks.h, app/app.c): the sensor task's period is
 # the heartbeat's cycle, and every message of the measurement chain goes out with the samples
@@ -660,8 +668,9 @@ def test_task_stats_and_node_info_decode_and_agree_with_the_statistics(run):
         assert 0 <= raw["TaskCpuShare"] <= 10000, value
     assert len(values) >= len(STATS_TASKS)
 
-    # Node information every second: the version the statistics report, no slot and no reset
-    # cause yet (phases 3 and 4), and the seconds the health task has counted in its own
+    # Node information every second: the version the statistics report, no slot yet (phase 4),
+    # the reset cause of this start (a power-on: no retained cell), and the seconds the health
+    # task has counted in its own
     # periods (app/telemetry.h, telemetry_uptime_t): the n-th frame ends the n-th second and
     # says n, which is at most the seconds of the final tick count.
     major, minor, patch = (int(part) for part in stats["version"].split("."))
@@ -671,7 +680,7 @@ def test_task_stats_and_node_info_decode_and_agree_with_the_statistics(run):
         signals = value.frame.signals
         assert (signals["SwMajor"], signals["SwMinor"], signals["SwPatch"]) == \
             (major, minor, patch)
-        assert signals["ActiveSlot"] == "SNA" and signals["ResetCause"] == "SNA"
+        assert signals["ActiveSlot"] == "SNA" and signals["ResetCause"] == "POWER_ON"
         assert value.number.lo + 1 == signals["UptimeSeconds"] <= stats["tick"]["count"] // 1000
 
 
@@ -842,7 +851,11 @@ def test_each_sensor_fault_shows_as_not_available_in_the_next_frame_and_clears_a
         states = [current, *cells, *temps]
         if "faulty" in states:
             assert value.frame.signals["PackState"] == "FAULT", value
-        if all(s == "clean" for s in states):
+        # A DTC follows its channel through the health task, up to one of its periods later
+        # (app/fault.h): while one is active the state is FAULT, with PackFaultActive.
+        if raw["PackFaultActive"] == 1:
+            assert value.frame.signals["PackState"] == "FAULT", value
+        elif all(s == "clean" for s in states):
             assert value.frame.signals["PackState"] == "NORMAL", value
         for fault in faults:
             group, channel = fault.channels[0]
@@ -893,6 +906,19 @@ def test_each_sensor_fault_shows_as_not_available_in_the_next_frame_and_clears_a
     assert stats["sensor"]["unanswered"]["current"] > 0 and stats["pack"]["flagged_readings"] > 0
     assert stats["pack"]["implausible_readings"] > 0
 
+    # The faults as DTCs: the channels opened or held beyond their sensors and the front end
+    # off line were active in BMS_Fault and are confirmed until a clear; the run ended two
+    # health periods after the last fault was gone, with none active any more.
+    invalid = 1 << FAULT_NUMBER["SENSOR_CHANNEL_INVALID"]
+    no_answer = 1 << FAULT_NUMBER["FRONT_END_NO_ANSWER"]
+    heard = run.decoded(FAULT)
+    assert any(frame.raw["FaultActive"] & invalid for frame in heard)
+    assert any(frame.raw["FaultActive"] & no_answer for frame in heard)
+    assert heard[-1].raw["FaultConfirmed"] & (invalid | no_answer) == invalid | no_answer
+    assert heard[-1].raw["FaultActive"] == 0, heard[-1]
+    assert stats["faults"]["confirmed"] & (invalid | no_answer) == invalid | no_answer
+    assert stats["faults"]["active"] == 0
+
 
 # ----------------------------------------------------------------------- TESTER_Command
 
@@ -918,8 +944,8 @@ def test_telemetry_off_silences_exactly_the_protected_messages_and_on_brings_the
             tester.send(command(next(counters), True, 1))
         # Off: acted on at once, the stream being VALID. Thirty heartbeats in a row without a
         # protected frame are three cycles of the slowest of them.
-        send_until(recorder.watch(heartbeats_without(PROTECTED, 3 * EVERY["temps"])), False, 2)
-        send_until(recorder.watch(one_of_each(PROTECTED)), True, 3)
+        send_until(recorder.watch(heartbeats_without(GATED, 3 * EVERY["temps"])), False, 2)
+        send_until(recorder.watch(one_of_each(GATED)), True, 3)
         tester.send(command(next(counters), True, 3))
     finally:
         tester.close()
@@ -944,7 +970,7 @@ def test_telemetry_off_silences_exactly_the_protected_messages_and_on_brings_the
     # so an independent receiver finds the stream unbroken), and nothing else was held back.
     processed = stats["process"]["samples"]
     full = stats["sample_queue"]["full"]
-    for name in PROTECTED:
+    for name in GATED:
         message = run.message(name)
         assert message["suppressed"] > 0 and message["failed"] == 0, name
         every = CYCLE_MS[name] // SENSOR_PERIOD_MS
@@ -953,18 +979,23 @@ def test_telemetry_off_silences_exactly_the_protected_messages_and_on_brings_the
         assert carried - (0 if every == 1 else full) <= built <= carried, (name, message)
         numbered_message(run, name)
         assert all(frame.e2e.crc_ok for frame in run.decoded(name)), name
-    for name in set(CYCLIC) - set(PROTECTED):
+    for name in set(CYCLIC) - set(GATED):
         assert run.message(name)["suppressed"] == 0, name
     assert run.message(HEARTBEAT)["published"] == stats["sensor"]["periods"]
+    # BMS_Fault went on, every frame of it intact; the two changes of CmdClearFaultsSeq (1 to 2
+    # to 3) were two clear requests, and the health task carried out each.
+    assert all(frame.e2e.crc_ok for frame in run.decoded(FAULT))
+    assert command_stats["clear_requests"] == 2 and stats["faults"]["clears"] == 2
+    assert run.decoded(FAULT)[-1].raw["FaultClearCount"] == 2
 
-    # On the bus: a stretch with heartbeats and no protected frame, and every protected
-    # message before it and after it.
+    # On the bus: a stretch with heartbeats and no frame of the gated messages, and every one
+    # of them before it and after it.
     ids = [frame.arbitration_id for frame in frames]
-    protected_ids = {ID[name] for name in PROTECTED}
+    protected_ids = {ID[name] for name in GATED}
     positions = [i for i, frame_id in enumerate(ids) if frame_id in protected_ids]
     gap = max(zip(positions, positions[1:]), key=lambda pair: pair[1] - pair[0])
     inside = ids[gap[0] + 1:gap[1]]
-    assert set(inside) <= {ID[HEARTBEAT], ID[TASK_STATS], ID[NODE_INFO], ID[COMMAND]}
+    assert set(inside) <= {ID[HEARTBEAT], ID[TASK_STATS], ID[NODE_INFO], ID[COMMAND], ID[FAULT]}
     assert inside.count(ID[HEARTBEAT]) >= 3 * EVERY["temps"]
     assert protected_ids <= set(ids[:gap[0] + 1]) and protected_ids <= set(ids[gap[1]:])
     heartbeats = [frame for frame in frames if is_status(frame)]
@@ -1051,6 +1082,8 @@ def test_frames_that_fail_the_check_are_counted_and_never_acted_on(open_link, ca
     # None of the rejected frames was acted on: the telemetry was never switched off, and the
     # last command carried out is a good one.
     assert command_stats["telemetry_on"] is True and command_stats["clear_faults_seq"] == 1
+    # Every command carried out had CmdClearFaultsSeq 1: no clear was requested.
+    assert command_stats["clear_requests"] == 0 and stats["faults"]["clears"] == 0
     for name in PROTECTED:
         assert stats["telemetry"]["messages"][name]["suppressed"] == 0, name
 
@@ -1071,7 +1104,7 @@ def test_a_command_stream_that_stops_is_not_trusted_until_it_has_proved_itself_a
         # come back are not acted on, the third is, and it switches the telemetry off.
         for counter in (5, 6, 7):
             tester.send(command(counter, False, 2))
-        switched_off = recorder.until(heartbeats_without(PROTECTED, 2 * EVERY["temps"]))
+        switched_off = recorder.until(heartbeats_without(GATED, 2 * EVERY["temps"]))
     finally:
         tester.close()
     assert link.node.stop() == EXIT_OK

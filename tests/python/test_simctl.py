@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from fcn_tools.simctl import REPEATABLE, SENSOR_CHANNELS, SimControl, SimError
+from fcn_tools.simctl import HANG_MODES, REPEATABLE, SENSOR_CHANNELS, SimControl, SimError
 
 LOOPBACK = "127.0.0.1"
 
@@ -170,7 +170,7 @@ def test_a_late_answer_to_a_command_that_must_not_run_twice_is_still_taken(fake_
 
 def test_repeatable_commands_are_the_ones_that_read_or_set_a_state():
     assert REPEATABLE == {"ping", "can.status", "can.fault", "sensor.status", "sensor.set",
-                          "sensor.open", "sensor.offline", "sensor.clear"}
+                          "sensor.open", "sensor.offline", "sensor.hang", "sensor.clear"}
 
 
 # ------------------------------------------------------------------- sensor front-end model
@@ -211,6 +211,37 @@ def test_sensor_commands_carry_their_arguments(fake_node):
                              "sensor.offline off", "sensor.clear", "sensor.clear cell3"]
 
 
+def test_sensor_hang_sends_its_mode_and_takes_true_and_false_for_on_and_off(fake_node):
+    node = fake_node({"sensor.hang": lambda token, command:
+                      f"ok hang={command.split(' ')[1]} t_ns=9"})
+    with SimControl(node.port) as sim:
+        assert sim.sensor_hang() == {"hang": "on", "t_ns": "9"}
+        assert sim.sensor_hang("spin") == {"hang": "spin", "t_ns": "9"}
+        assert sim.sensor_hang("off") == {"hang": "off", "t_ns": "9"}
+        sim.sensor_hang(True)
+        sim.sensor_hang(False)
+    assert node.requests == ["sensor.hang on", "sensor.hang spin", "sensor.hang off",
+                             "sensor.hang on", "sensor.hang off"]
+    assert HANG_MODES == ("on", "spin", "off")
+
+
+@pytest.mark.parametrize("mode", ["busy", "ON", "", None, 1, 0])
+def test_sensor_hang_takes_only_its_modes_and_sends_nothing_otherwise(fake_node, mode):
+    node = fake_node({"sensor.hang": "ok hang=on t_ns=1"})
+    with SimControl(node.port) as sim:
+        with pytest.raises(ValueError, match="a hang mode is one of on, spin, off"):
+            sim.sensor_hang(mode)
+    assert node.requests == []
+
+
+def test_a_refused_hang_raises_with_the_nodes_message(fake_node):
+    node = fake_node({"sensor.hang": "err usage: sensor.hang on|spin|off"})
+    with SimControl(node.port) as sim:
+        with pytest.raises(SimError, match=r"usage: sensor\.hang on\|spin\|off"):
+            sim.sensor_hang("spin")
+    assert node.requests == ["sensor.hang spin"]
+
+
 @pytest.mark.parametrize("value", [3.7, "12", True, None])
 def test_sensor_set_takes_only_a_whole_number_and_sends_nothing_otherwise(fake_node, value):
     node = fake_node({"sensor.set": "ok cell1=1 t_ns=1"})
@@ -234,6 +265,7 @@ def test_a_refused_sensor_command_raises_with_the_nodes_message(fake_node):
     (lambda sim: sim.sensor_set("cell1", 5), "sensor.set cell1 5"),
     (lambda sim: sim.sensor_open("cell1"), "sensor.open cell1"),
     (lambda sim: sim.sensor_offline(True), "sensor.offline on"),
+    (lambda sim: sim.sensor_hang("spin"), "sensor.hang spin"),
     (lambda sim: sim.sensor_clear(), "sensor.clear"),
 ])
 def test_a_sensor_command_is_asked_again_when_the_first_attempt_goes_unanswered(fake_node, call,

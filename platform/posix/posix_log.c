@@ -56,6 +56,11 @@ void posix_external_thread_setup(const char *name)
     t_external_thread = true;
 }
 
+bool posix_on_external_thread(void)
+{
+    return t_external_thread;
+}
+
 void posix_log_sink(const char *line, size_t len)
 {
     log_record_t record;

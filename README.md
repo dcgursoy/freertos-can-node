@@ -7,7 +7,7 @@ measurements on CAN and takes fail-safe A/B firmware updates over the same bus. 
 as a Linux process on the FreeRTOS POSIX port, and its CAN controller, flash and sensors are
 simulated around it, so that all of it builds, runs and is tested on a laptop and in CI.
 
-> **Work in progress: phases 0 to 2 of 8 are done.** This page is a placeholder until the
+> **Work in progress: phases 0 to 3 of 8 are done.** This page is a placeholder until the
 > last phase. The sections below describe only what exists today and quote no results; the
 > final README will take every number from `results/*.json`.
 
@@ -18,8 +18,8 @@ simulated around it, so that all of it builds, runs and is tested on a laptop an
 | 0 | Repository, FreeRTOS kernel, build presets, host platform layer, unit tests, sanitizers, coverage, static analysis, CI | done |
 | 1 | CAN stack: CRCs, frame bit timing, controller model with fault confinement, transmit queue, SocketCAN and UDP transports, CAN tasks | done |
 | 2 | Application: tasks and IPC, DBC, end-to-end protection, telemetry | done |
-| 3 | Fault handling: trouble codes, watchdogs, bus-off recovery | next |
-| 4 | Simulated NOR flash, bootloader, A/B update logic | |
+| 3 | Fault handling: trouble codes, the fault frame, watchdogs, reset cause | done |
+| 4 | Simulated NOR flash, bootloader, A/B update logic | next |
 | 5 | ISO-TP, UDS download, end-to-end update | |
 | 6 | Measurements and plots | |
 | 7 | Cortex-M3 build in QEMU with a real bootloader jump | |
@@ -169,6 +169,53 @@ No timing of the application has been measured yet; that is phase 6.
   ID or the wrong length, which the node must count and never act on, and a stream that stops,
   which the node must not trust again until it has proved itself.
 
+## What phase 3 adds
+
+The node now notices when something goes wrong, keeps it as a diagnostic trouble code, tells
+the bus, and resets itself when one of its tasks hangs. [docs/faults.md](docs/faults.md)
+describes all of it; as in phase 2, no timing of the application has been measured for a
+target yet.
+
+- **Diagnostic trouble codes** ([lib/dtc](lib/dtc/dtc.h)). DTCs shaped for UDS, so that phase 5
+  can serve them over ReadDTCInformation and ClearDiagnosticInformation: 24-bit DTC numbers,
+  all eight bits of the ISO 14229-1 status byte with a written rule for each and every choice
+  the norm leaves marked, counter-based debouncing in the style of the AUTOSAR Diagnostic Event
+  Manager, the first and most recent failed and confirmed DTC, and reads by status mask. Pure
+  C, no globals, the state in the caller's memory. Tested against a reference model written in
+  the test from the bit definitions, on random tables and random sequences of reports.
+- **The faults** ([app/fault.c](app/fault.c)). Sixteen faults in one table, each with its DTC
+  number, its limits, its debouncing and a written reason for every value: cell voltage,
+  temperature and current limits with hysteresis, an invalid or silent sensor front end,
+  samples that stop coming, bus off and error passive (the fault confinement of phase 1 now
+  feeds them), a supervised task that stopped, and a start after a reset caused by a fault.
+- **One owner for the DTCs.** The processing task judges every sample where the data is and
+  hands the verdict to the health task through a queue; the health task alone changes the DTCs,
+  so that the schedulability check of phase 2 still holds for the transmit task
+  ([docs/architecture.md](docs/architecture.md#schedulability)).
+- **The fault frame** BMS_Fault at identifier 0x010, protected end to end like the telemetry:
+  the active and confirmed faults, the most recent one, the warning indicator and the count of
+  clears, every 100 ms and in the period of every change. BMS_PackStatus says FAULT while a
+  fault is active, and a tester clears the DTCs by changing CmdClearFaultsSeq.
+- **Two watchdogs.** A watchdog manager in pure C ([lib/wdgm](lib/wdgm/wdgm.h)), the alive
+  supervision of the AUTOSAR Watchdog Manager with its requirement numbers in the code, to
+  which four tasks report; and a hardware watchdog modelled on the STM32 IWDG
+  ([plat_wdg.h](platform/include/plat_wdg.h)), which the health task kicks only while the
+  manager allows it. A task that stops is reported in BMS_Fault before the node is reset; a
+  task that keeps the CPU is caught by the hardware watchdog alone.
+- **The reset cause** ([plat_retained.h](platform/include/plat_retained.h)). What a
+  microcontroller keeps in RAM across a reset is modelled by a cell with a magic, a version and
+  a CRC, on the host a file the node maps (`--retained-file`); removing it is a loss of power.
+  The next start reports why the last run ended, in its statistics, in BMS_NodeInfo and, after
+  a reset caused by a fault, as a DTC. The cell has room for phase 4's boot attempts.
+- **A hang from outside.** `sensor.hang on|spin` makes the simulated sensor front end hang, as
+  a transfer that never completes would, so that the watchdog tests need no hook in the
+  application.
+- **Tests.** Unit tests of the new modules, each challenged with planted defects; system tests
+  that apply every fault from outside and check its DTC in BMS_Fault, in BMS_PackStatus and in
+  the statistics, status byte included, while the fault lasts and after it; the clear; the
+  watchdog reset and the next start, with and without the retained cell; and a check in the
+  test harness that the node of no other system test was ever reset.
+
 ## Build and test
 
 Ubuntu 24.04 (natively, or under WSL2):
@@ -192,9 +239,10 @@ scripts/check.sh
 `scripts/check.sh` runs the checks CI runs: that the code generated from the DBC is current,
 static analysis, the debug and release builds, the unit and platform tests under
 AddressSanitizer and UndefinedBehaviorSanitizer, the tests of code shared between threads
-under ThreadSanitizer (the lock-free ring, the CAN driver against the controller's hardware
-thread, and the sensor model read by one thread while another serves its simulation control
-commands), coverage of `lib/`, the system tests and the verification of the bug log. The
+under ThreadSanitizer (the lock-free ring, the watchdog manager's alive counters, the CAN
+driver against the controller's hardware thread, and the sensor model read by one thread while
+another serves its simulation control commands), coverage of `lib/`, the system tests and the
+verification of the bug log. The
 individual steps are `scripts/codegen-check.sh`, `scripts/static-analysis.sh`,
 `scripts/build.sh`, `scripts/test-unit.sh`, `scripts/test-tsan.sh`, `scripts/coverage.sh`,
 `scripts/test-system.sh` and `scripts/buglog-verify.sh`. A test whose verdict depends on the
@@ -221,8 +269,9 @@ SocketCAN interface `vcan0`, and runs the timing benchmark for the record.
 ```
 lib/             portable C11 modules: no OS calls, no malloc; covered by the unit tests
 app/             the FreeRTOS application: tasks and their IPC (app.c), the conversions to the
-                 DBC (signals.c), the frames (telemetry.c), the command receiver (command.c);
-                 gen/ is generated from the DBC by tools/gen_can_db.py
+                 DBC (signals.c), the frames (telemetry.c), the command receiver (command.c),
+                 the faults and their DTCs (fault.c); gen/ is generated from the DBC by
+                 tools/gen_can_db.py
 dbc/             the CAN messages (fcn.dbc), the source of app/gen/ and of the Python decoders
 platform/        include/ is what the application expects from a platform;
                  posix/ implements it on Linux under the FreeRTOS POSIX port
@@ -236,7 +285,7 @@ bench/           measurement scripts; they write results/
 results/         measured data (JSON with provenance) and plots; host timing only
 scripts/         one script per build, test and analysis step
 docs/            the application, the CAN protocol, the simulated CAN bus, the sensor model,
-                 bug log, MISRA deviations, notes on WSL
+                 fault handling, bug log, MISRA deviations, notes on WSL
 third_party/     FreeRTOS-Kernel and Unity, pinned submodules
 ```
 

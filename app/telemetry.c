@@ -58,8 +58,9 @@ _Static_assert(CAN_DB_BMS_TASK_STATS_TASK_OVERRUNS_FACTOR_DEN == 1, "TaskOverrun
 _Static_assert(CAN_DB_BMS_NODE_INFO_UPTIME_SECONDS_FACTOR_DEN == 1, "UptimeSeconds: seconds");
 _Static_assert(CAN_DB_BMS_NODE_INFO_UPTIME_SECONDS_LENGTH == 32U, "UptimeSeconds: 32 bits");
 
-/* ResetCause carries the numbers of plat_reset_reason_t. Phase 2 sends SNA only, but the table
- * is the contract for the phases that know the cause. */
+/* ResetCause carries the numbers of plat_reset_reason_t, the cause of this start included. */
+_Static_assert(CAN_DB_BMS_NODE_INFO_RESET_CAUSE_POWER_ON == (uint32_t)PLAT_RESET_POWER_ON,
+               "ResetCause: POWER_ON");
 _Static_assert(CAN_DB_BMS_NODE_INFO_RESET_CAUSE_REQUESTED == (uint32_t)PLAT_RESET_REQUESTED,
                "ResetCause: REQUESTED");
 _Static_assert(CAN_DB_BMS_NODE_INFO_RESET_CAUSE_WATCHDOG == (uint32_t)PLAT_RESET_WATCHDOG,
@@ -79,6 +80,68 @@ _Static_assert(CAN_DB_BMS_NODE_INFO_RESET_CAUSE_MALLOC_FAILED == (uint32_t)PLAT_
 /* The cell masks of bms_pack_t have one bit per cell, cell 1 in bit 0; two messages of four. */
 _Static_assert(BMS_CELLS == 8U, "two cell messages of four cells");
 _Static_assert(BMS_TEMPS == 4U, "one temperature message of four");
+
+/* BMS_Fault: protected like the others, a bit of each mask per fault, and the value table of
+ * FaultMostRecent numbered as fault_event_t, one assertion per fault. */
+_Static_assert(CAN_DB_BMS_FAULT_E2E_PROTECTED == 1U, "BMS_Fault is protected");
+_Static_assert(CAN_DB_BMS_FAULT_DLC == E2E_P11_MAX_DATA_LEN, "BMS_Fault: 8 bytes");
+_Static_assert(CAN_DB_BMS_FAULT_E2E_CRC_START == (E2E_P11_CRC_BYTE * 8U), "CRC: byte 0");
+_Static_assert(CAN_DB_BMS_FAULT_E2E_COUNTER_START == (E2E_P11_COUNTER_BYTE * 8U),
+               "counter: low nibble of byte 1");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_ACTIVE_LENGTH == 16U, "FaultActive: a bit per fault");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_CONFIRMED_LENGTH == 16U, "FaultConfirmed: a bit per fault");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_CLEAR_COUNT_LENGTH == 8U, "FaultClearCount: modulo 256");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_NONE == FAULT_NONE, "FaultMostRecent: NONE");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_CELL_OVERVOLTAGE ==
+                   (uint32_t)FAULT_CELL_OVERVOLTAGE,
+               "FaultMostRecent: CELL_OVERVOLTAGE");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_CELL_UNDERVOLTAGE ==
+                   (uint32_t)FAULT_CELL_UNDERVOLTAGE,
+               "FaultMostRecent: CELL_UNDERVOLTAGE");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_OVERTEMPERATURE ==
+                   (uint32_t)FAULT_OVERTEMPERATURE,
+               "FaultMostRecent: OVERTEMPERATURE");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_UNDERTEMPERATURE ==
+                   (uint32_t)FAULT_UNDERTEMPERATURE,
+               "FaultMostRecent: UNDERTEMPERATURE");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_OVERCURRENT_DISCHARGE ==
+                   (uint32_t)FAULT_OVERCURRENT_DISCHARGE,
+               "FaultMostRecent: OVERCURRENT_DISCHARGE");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_OVERCURRENT_CHARGE ==
+                   (uint32_t)FAULT_OVERCURRENT_CHARGE,
+               "FaultMostRecent: OVERCURRENT_CHARGE");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_SENSOR_CHANNEL_INVALID ==
+                   (uint32_t)FAULT_SENSOR_CHANNEL_INVALID,
+               "FaultMostRecent: SENSOR_CHANNEL_INVALID");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_FRONT_END_NO_ANSWER ==
+                   (uint32_t)FAULT_FRONT_END_NO_ANSWER,
+               "FaultMostRecent: FRONT_END_NO_ANSWER");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_SAMPLE_TIMEOUT == (uint32_t)FAULT_SAMPLE_TIMEOUT,
+               "FaultMostRecent: SAMPLE_TIMEOUT");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_CAN_BUS_OFF == (uint32_t)FAULT_CAN_BUS_OFF,
+               "FaultMostRecent: CAN_BUS_OFF");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_CAN_ERROR_PASSIVE ==
+                   (uint32_t)FAULT_CAN_ERROR_PASSIVE,
+               "FaultMostRecent: CAN_ERROR_PASSIVE");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_SUPERVISION_EXPIRED ==
+                   (uint32_t)FAULT_SUPERVISION_EXPIRED,
+               "FaultMostRecent: SUPERVISION_EXPIRED");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_WATCHDOG == (uint32_t)FAULT_RESET_WATCHDOG,
+               "FaultMostRecent: RESET_WATCHDOG");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_ASSERT == (uint32_t)FAULT_RESET_ASSERT,
+               "FaultMostRecent: RESET_ASSERT");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_STACK_OVERFLOW ==
+                   (uint32_t)FAULT_RESET_STACK_OVERFLOW,
+               "FaultMostRecent: RESET_STACK_OVERFLOW");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_MALLOC_FAILED ==
+                   (uint32_t)FAULT_RESET_MALLOC_FAILED,
+               "FaultMostRecent: RESET_MALLOC_FAILED");
+_Static_assert((uint32_t)FAULT_EVENTS == 16U, "every fault has its entry above");
+
+/* The E2E configuration of BMS_Fault, as s_e2e_config below for the other four. */
+static const e2e_p11_config_t s_fault_e2e_config = {.data_id = CAN_DB_BMS_FAULT_E2E_DATA_ID,
+                                                    .data_len = CAN_DB_BMS_FAULT_DLC,
+                                                    .max_delta_counter = 1U};
 
 /*
  * The E2E configuration of each protected message, in the order of telemetry_protected_t. The
@@ -137,15 +200,16 @@ void telemetry_init(telemetry_sender_t *sender)
     }
 }
 
-bool telemetry_pack_status(telemetry_sender_t *sender, const bms_pack_t *pack, can_frame_t *frame)
+bool telemetry_pack_status(telemetry_sender_t *sender, const bms_pack_t *pack, bool fault_active,
+                           can_frame_t *frame)
 {
     const can_db_bms_pack_status_t msg = {
         .e2e_crc = 0U,
         .e2e_counter = 0U,
         .pack_current = signals_pack_current(pack->current_valid ? pack->current_ma : 0),
         .pack_voltage = signals_pack_voltage(pack->pack_valid ? pack->pack_mv : 0U),
-        .pack_state = signals_pack_state(pack->state),
-        .pack_fault_active = 0U,
+        .pack_state = signals_pack_state(fault_active ? BMS_STATE_FAULT : pack->state),
+        .pack_fault_active = fault_active ? 1U : 0U,
         .pack_current_valid = pack->current_valid ? 1U : 0U,
         .pack_voltage_valid = pack->pack_valid ? 1U : 0U};
     bool built;
@@ -249,16 +313,67 @@ bool telemetry_task_stats(const telemetry_task_t *task, can_frame_t *frame)
     return can_db_bms_task_stats_pack(&msg, frame->data, sizeof(frame->data));
 }
 
-bool telemetry_node_info(uint8_t sw_major, uint8_t sw_minor, uint8_t sw_patch, uint32_t uptime_s,
-                         can_frame_t *frame)
+bool telemetry_fault(e2e_p11_protect_state_t *counter, const fault_summary_t *summary,
+                     can_frame_t *frame)
 {
-    const can_db_bms_node_info_t msg = {
-        .sw_major = sw_major,
-        .sw_minor = sw_minor,
-        .sw_patch = sw_patch,
-        .active_slot = (uint8_t)CAN_DB_BMS_NODE_INFO_ACTIVE_SLOT_SNA,
-        .reset_cause = (uint8_t)CAN_DB_BMS_NODE_INFO_RESET_CAUSE_SNA,
-        .uptime_seconds = uptime_s};
+    const can_db_bms_fault_t msg = {.e2e_crc = 0U,
+                                    .e2e_counter = 0U,
+                                    .fault_active = summary->active,
+                                    .fault_confirmed = summary->confirmed,
+                                    .fault_most_recent = summary->most_recent,
+                                    .fault_warning = summary->warning ? 1U : 0U,
+                                    .fault_clear_count = summary->clears};
+    bool built = (summary->most_recent < (uint8_t)FAULT_EVENTS) ||
+                 (summary->most_recent == (uint8_t)FAULT_NONE);
+
+    start_frame(frame, CAN_DB_BMS_FAULT_ID, CAN_DB_BMS_FAULT_DLC);
+
+    if (built) {
+        built = can_db_bms_fault_pack(&msg, frame->data, sizeof(frame->data));
+    }
+
+    if (built) {
+        built = e2e_p11_protect(&s_fault_e2e_config, counter, frame->data, (size_t)frame->dlc) ==
+                E2E_E_OK;
+    }
+
+    return built;
+}
+
+/* ResetCause: the value of a cause the value table names, SNA for any other. */
+static uint8_t reset_cause_raw(plat_reset_reason_t cause)
+{
+    uint8_t raw = (uint8_t)CAN_DB_BMS_NODE_INFO_RESET_CAUSE_SNA;
+
+    switch (cause) {
+    case PLAT_RESET_POWER_ON:
+    case PLAT_RESET_REQUESTED:
+    case PLAT_RESET_WATCHDOG:
+    case PLAT_RESET_POWER_LOSS:
+    case PLAT_RESET_IMAGE_FAULT:
+    case PLAT_RESET_ASSERT:
+    case PLAT_RESET_STACK_OVERFLOW:
+    case PLAT_RESET_MALLOC_FAILED:
+        raw = (uint8_t)cause;
+        break;
+    default:
+        /* not a cause: SNA */
+        break;
+    }
+
+    return raw;
+}
+
+bool telemetry_node_info(uint8_t sw_major, uint8_t sw_minor, uint8_t sw_patch,
+                         plat_reset_reason_t reset_cause, uint32_t uptime_s, can_frame_t *frame)
+{
+    const can_db_bms_node_info_t msg = {.sw_major = sw_major,
+                                        .sw_minor = sw_minor,
+                                        .sw_patch = sw_patch,
+                                        .active_slot =
+                                            (uint8_t)CAN_DB_BMS_NODE_INFO_ACTIVE_SLOT_SNA,
+                                        .reset_cause = reset_cause_raw(reset_cause),
+                                        .uptime_seconds = uptime_s};
 
     start_frame(frame, CAN_DB_BMS_NODE_INFO_ID, CAN_DB_BMS_NODE_INFO_DLC);
 

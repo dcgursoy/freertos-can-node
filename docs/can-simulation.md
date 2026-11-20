@@ -173,7 +173,8 @@ answered with `? err malformed request`.
 | `sensor.set <channel> <value>` | holds a channel of the sensor front end (`current`, `cell1`..`cell8`, `temp1`..`temp4`) at a value, which it reports as a valid reading |
 | `sensor.open <channel>` | lets the front end declare the channel invalid, as with an open sense wire |
 | `sensor.offline on\|off` | takes the whole front end off line (it answers no read) or back |
-| `sensor.clear [<channel>]` | ends the fault of one channel, or with no channel every sensor fault, off line included |
+| `sensor.hang on\|spin\|off` | makes every read of the front end wait until `off`: `on` blocks the sensor task, `spin` keeps it on the CPU so that the tasks below it starve (the fault behind the watchdog tests) |
+| `sensor.clear [<channel>]` | ends the fault of one channel, or with no channel every sensor fault, off line and hang included |
 
 `fcn_tools.simctl.SimControl` is the client the tests use. The node carries out every request
 datagram it receives and does not remember tokens, so a request repeated after a timeout can
