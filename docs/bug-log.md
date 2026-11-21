@@ -119,7 +119,7 @@ unserved; `results/platform_timing.json` (`interrupt_storm`) has the measured ra
 
 **Evidence.** [failing output](buglog/002-nested-interrupt-handlers/failing-output.txt),
 [patch that re-creates the bug](buglog/002-nested-interrupt-handlers/reintroduce.patch).
-The bug is in commits `323055e` to `68ba365`.
+The bug is in commits `7a347ab` to `e3c2f4b`.
 
 ---
 
@@ -168,7 +168,7 @@ both changed.)
 
 **Evidence.** [failing output](buglog/003-tick-count-while-suspended/failing-output.txt),
 [patch that re-creates the bug](buglog/003-tick-count-while-suspended/reintroduce.patch).
-The bug is in commits `323055e` to `e6db709`.
+The bug is in commits `7a347ab` to `c754d4c`.
 
 ---
 
@@ -267,7 +267,7 @@ the wall clock.
 **Evidence.** [failing output](buglog/005-received-frames-ahead-of-the-mailboxes/failing-output.txt),
 [patch that re-creates the bug](buglog/005-received-frames-ahead-of-the-mailboxes/reintroduce.patch).
 The verification runs the unit test (`test.sh`) and the system test (`test-flood.sh`). The bug
-is in commit `b6c3534`.
+is in commit `a4039fa`.
 
 ---
 
@@ -327,7 +327,7 @@ have.
 output](buglog/006-abort-took-back-frames-loaded-after-it/failing-output.txt), [patch that
 re-creates the bug](buglog/006-abort-took-back-frames-loaded-after-it/reintroduce.patch). The
 patch removes the comparison with the abort mark, so the abort empties the whole ring again.
-The bug is in commit `b6c3534`.
+The bug is in commit `a4039fa`.
 
 ---
 
@@ -402,7 +402,7 @@ limit. Stopping the node before the window takes the host out of that question.
 [patch that re-creates the bug](buglog/007-receive-fifo-overran-at-1-mbit/reintroduce.patch).
 The patch sets the batch back to 16 and removes the compile-time check, which would otherwise
 refuse that value. The verification runs the system test (`test.sh`). The bug is in commit
-`b6c3534`.
+`a4039fa`.
 
 ---
 
@@ -456,7 +456,7 @@ checks the counting in the UDP backend.
 **Evidence.** [failing output](buglog/008-lost-transport-went-unnoticed/failing-output.txt),
 [patch that re-creates the bug](buglog/008-lost-transport-went-unnoticed/reintroduce.patch).
 The patch makes the hardware thread's handler of transport failures return at once. The bug is
-in commit `b6c3534`.
+in commit `a4039fa`.
 
 ---
 
@@ -501,4 +501,4 @@ start fits the stack it was created with, plus one signal frame.
 **Evidence.** [failing output](buglog/009-task-frame-left-out-of-stack-depth/failing-output.txt),
 [patch that re-creates the bug](buglog/009-task-frame-left-out-of-stack-depth/reintroduce.patch).
 With the patch the body task is reported at 512 bytes, the floor. The bug is in commits
-`323055e` to `b6c3534`.
+`7a347ab` to `a4039fa`.
