@@ -90,7 +90,7 @@ def test_a_hanging_front_end_stops_the_sensor_task_but_not_the_tasks_below_it(st
     assert node.wait_for_reset(timeout=RESET_WAIT_S) == RESET_WATCHDOG
     assert "FATAL watchdog: not kicked for" in node.stderr()
     log = node.log()
-    assert "no sample from the sensor task" in log          # the processing task ran
+    assert "no sample from the sensor task" in log          # the processing task timed out
     assert "supervision: sensor expired" in log             # and so did the health task
 
 

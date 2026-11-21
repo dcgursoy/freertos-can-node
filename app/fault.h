@@ -48,12 +48,26 @@
  *   - the health task judges the CAN controller and the watchdog manager itself, once per
  *     cycle (fault_health_cycle());
  *   - the receive task counts the clear requests of TESTER_Command (command.h); the health task
- *     carries them out (fault_clear_if_requested());
+ *     carries them out (fault_clear_if_requested()), in order with the evidence: the
+ *     processing task tags every verdict with the count of requests when it posts it, and a
+ *     verdict that carries a request not yet carried out clears the DTCs before it is worked
+ *     in (fault_apply()). Evidence handed over after a request was counted survives its
+ *     clear; evidence handed over before it does not;
  *   - a task that wants to know the state reads the summary (fault_summary_t) that the health
  *     task publishes after every cycle (in the node, PackFaultActive of the processing task).
  * The DTCs change only in the health task's job, and the health task sends BMS_Fault at the
  * end of every job, after the last change: the frame goes out at once on every change, and
- * every 100 ms without one.
+ * every 100 ms without one. A fault whose testFailed rose in the job is active in that job's
+ * summary even if it has passed again since (THE SUMMARY OF A PERIOD below), so that a fault
+ * decided by one piece of evidence that comes and goes within one job still reaches
+ * FaultActive, PackFaultActive and the log.
+ *
+ * THE SUMMARY OF A PERIOD. The monitor keeps, between two calls of fault_summary(), which DTCs
+ * had testFailed rise (0 to 1) and fall (1 to 0, by a pass or by a clear). The summary reports
+ * a fault active if its testFailed is set at the end of the period or rose during it, and hands
+ * the edges to the caller for its log (fault_changes_t); then it forgets them. A clear forgets
+ * the rises before it for the summary, so that the summary of a period with a clear holds
+ * nothing from before the clear; the rises after the clear are kept.
  *
  * WHAT THE NODE DOES ABOUT A FAULT IN PHASE 3: it reports it. A DTC, BMS_Fault, PackFaultActive
  * and PackState FAULT, a line in the log. It does not act on the pack: the node has no
@@ -128,11 +142,13 @@ _Static_assert((uint32_t)FAULT_EVENTS < FAULT_NONE, "FAULT_NONE is no fault");
  * processing task judges (0..FAULT_SAMPLE_TIMEOUT): bit n of `failing` is evidence of fault n,
  * bit n of `passing` evidence that it is absent. A fault in neither mask was not judged (the
  * sample did not carry its measurements, or the evidence was not conclusive). No bit is in
- * both.
+ * both. `clear_requests` is the receiver's count of clear requests (command_clear_requests())
+ * at the moment the verdict was handed over: the poster sets it, the judges leave it 0.
  */
 typedef struct {
     uint16_t failing;
     uint16_t passing;
+    uint32_t clear_requests;
 } fault_verdict_t;
 
 /** What the health task reads, once per cycle, for the faults it judges itself. */
@@ -144,14 +160,24 @@ typedef struct {
     wdgm_global_status_t supervision; /**< the watchdog manager's global status now */
 } fault_health_inputs_t;
 
-/** What BMS_Fault reports: a picture of the DTCs. */
+/** What BMS_Fault reports: a picture of the DTCs at the end of a period (THE SUMMARY OF A
+ *  PERIOD). */
 typedef struct {
-    uint16_t active;     /**< bit n: the DTC of fault n has testFailed */
+    uint16_t active;     /**< bit n: the DTC of fault n has testFailed, or its testFailed rose
+                              in the period (after its clear, if the period had one) */
     uint16_t confirmed;  /**< bit n: the DTC of fault n has confirmedDTC */
     uint8_t most_recent; /**< the fault of DTC_RECORD_MOST_RECENT_FAILED, or FAULT_NONE */
     uint8_t clears;      /**< clears carried out since the start, modulo 256 */
     bool warning;        /**< a DTC has warningIndicatorRequested */
 } fault_summary_t;
+
+/** The changes of testFailed in a period, for a log: a fault in both `rose` and `fell` changed
+ *  both ways, and `failed` tells in which order it ended (set: it fell, then rose). */
+typedef struct {
+    uint16_t rose;   /**< bit n: testFailed of fault n went from 0 to 1 */
+    uint16_t fell;   /**< bit n: it went from 1 to 0, by a pass or by a clear */
+    uint16_t failed; /**< bit n: the DTC of fault n has testFailed at the end of the period */
+} fault_changes_t;
 
 /** The monitor: the DTC state and what the monitors remember. Set up with fault_init(); read
  *  the members for diagnosis, write none. */
@@ -164,6 +190,11 @@ typedef struct {
     uint32_t clear_requests;         /**< the receiver's count of clear requests carried out */
     uint32_t clears;                 /**< clears carried out */
     plat_reset_reason_t reset_cause; /**< the cause given to fault_init() */
+    uint16_t failed;                 /**< bit n: the DTC of fault n has testFailed */
+    uint16_t rose;                   /**< testFailed rose since the last summary */
+    uint16_t fell;                   /**< testFailed fell since the last summary (a clear too) */
+    uint16_t latched; /**< of `rose`, those that rose after the last clear: active in the next
+                           summary even if they have passed again */
 } fault_monitor_t;
 
 /**
@@ -190,20 +221,25 @@ bool fault_init(fault_monitor_t *monitor, plat_reset_reason_t cause);
  *   - FRONT_END_NO_ANSWER: failing if `unanswered` holds a group the sample carries; passing
  *     otherwise;
  *   - SAMPLE_TIMEOUT: passing (the sample came).
- * No state, any context (the node: the processing task).
+ * `clear_requests` is left 0 for the poster to set. No state, any context (the node: the
+ * processing task).
  */
 void fault_judge_sample(const bms_sample_t *sample, uint8_t unanswered, const bms_pack_t *pack,
                         fault_verdict_t *verdict);
 
 /** The verdict on a wait for a sample that timed out: SAMPLE_TIMEOUT failing, nothing else
- *  judged. No state, any context (the node: the processing task). */
+ *  judged, `clear_requests` 0 for the poster to set. No state, any context (the node: the
+ *  processing task). */
 void fault_judge_timeout(fault_verdict_t *verdict);
 
-/** Work one verdict into the DTCs, in the order of the faults: DTC_REPORT_PREFAILED for every
- *  failing fault and DTC_REPORT_PREPASSED for every passing one, or the matured
+/** Work one verdict into the DTCs. First, if the verdict carries a count of clear requests
+ *  newer than the count carried out (fault_clear_if_requested()), clear: the verdict's
+ *  evidence came after that request. Then, in the order of the faults: DTC_REPORT_PREFAILED for
+ *  every failing fault and DTC_REPORT_PREPASSED for every passing one, or the matured
  *  DTC_REPORT_FAILED and DTC_REPORT_PASSED for a fault whose threshold is 1 (-1), which the
  *  first piece of evidence decides (fault.c, THE TABLE OF FAULTS). Bits beyond the processing
- *  task's faults are ignored; a fault in both masks counts as failing. The owner only. */
+ *  task's faults are ignored; a fault in both masks counts as failing. The owner only, with the
+ *  verdicts in the order they were posted. */
 void fault_apply(fault_monitor_t *monitor, const fault_verdict_t *verdict);
 
 /**
@@ -220,16 +256,19 @@ void fault_health_cycle(fault_monitor_t *monitor, const fault_health_inputs_t *i
 
 /**
  * Carry out the clear requests of TESTER_Command: if `requests` (command_rx_t.clear_requests,
- * which only grows, modulo 2^32) differs from the count carried out so far, clear every DTC
- * (dtc_clear_all(), ClearDiagnosticInformation for all groups) once, however many requests came
- * since, and count the clear. Returns true if it cleared. A fault still present comes back as
- * soon as its monitor has debounced it again; the reset faults, judged only at the start, stay
- * cleared. The owner only.
+ * which only grows, modulo 2^32) is newer than the count carried out so far (ahead of it by 1
+ * to 2^31 - 1), clear every DTC (dtc_clear_all(), ClearDiagnosticInformation for all groups)
+ * once, however many requests came since, and count the clear; an older count, or the same,
+ * clears nothing. Returns true if it cleared. The clear ends the testFailed of every DTC that
+ * had it (a fall, for the log) and forgets the rises of the period before it (THE SUMMARY OF A
+ * PERIOD). A fault still present comes back as soon as its monitor has debounced it again; the
+ * reset faults, judged only at the start, stay cleared. The owner only.
  */
 bool fault_clear_if_requested(fault_monitor_t *monitor, uint32_t requests);
 
-/** The summary of the DTCs, for BMS_Fault. The owner only. */
-void fault_summary(const fault_monitor_t *monitor, fault_summary_t *summary);
+/** The summary of the DTCs at the end of a period, for BMS_Fault, and the changes of testFailed
+ *  in the period, for the log (THE SUMMARY OF A PERIOD); a new period begins. The owner only. */
+void fault_summary(fault_monitor_t *monitor, fault_summary_t *summary, fault_changes_t *changes);
 
 /** The name of a fault as in the DBC's value table ("CELL_OVERVOLTAGE"), or "unknown". Any
  *  context. */

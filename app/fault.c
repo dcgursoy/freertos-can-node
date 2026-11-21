@@ -383,6 +383,7 @@ void fault_judge_sample(const bms_sample_t *sample, uint8_t unanswered, const bm
 
     verdict->failing = 0U;
     verdict->passing = bit_of(FAULT_SAMPLE_TIMEOUT);
+    verdict->clear_requests = 0U;
 
     if ((groups & BMS_SAMPLE_CELLS) != 0U) {
         judge_cells(sample, pack, verdict);
@@ -405,6 +406,32 @@ void fault_judge_timeout(fault_verdict_t *verdict)
 {
     verdict->failing = bit_of(FAULT_SAMPLE_TIMEOUT);
     verdict->passing = 0U;
+    verdict->clear_requests = 0U;
+}
+
+/* After a report of `event`: its testFailed as lib/dtc has it now, and the edge, if any, for
+ * the summary of the period (fault.h, THE SUMMARY OF A PERIOD). */
+static void note_test_failed(fault_monitor_t *monitor, fault_event_t event)
+{
+    const uint16_t mask = bit_of(event);
+    const bool was = (monitor->failed & mask) != 0U;
+    dtc_entry_t entry;
+    bool is = false;
+
+    if (dtc_get(&monitor->dtc, (uint16_t)event, &entry)) {
+        is = (entry.status & DTC_STATUS_TF) != 0U;
+    }
+
+    if (is && !was) {
+        monitor->failed = (uint16_t)(monitor->failed | mask);
+        monitor->rose = (uint16_t)(monitor->rose | mask);
+        monitor->latched = (uint16_t)(monitor->latched | mask);
+    } else if (was && !is) {
+        monitor->failed = (uint16_t)(monitor->failed & (uint16_t)~mask);
+        monitor->fell = (uint16_t)(monitor->fell | mask);
+    } else {
+        /* no change of testFailed */
+    }
 }
 
 /* One piece of evidence for one fault, or nothing: PREFAILED or PREPASSED, or the matured
@@ -417,13 +444,26 @@ static void report(fault_monitor_t *monitor, fault_event_t event, bool failing, 
         (void)dtc_report(&monitor->dtc, (uint16_t)event,
                          (config->failed_threshold == 1) ? DTC_REPORT_FAILED
                                                          : DTC_REPORT_PREFAILED);
+        note_test_failed(monitor, event);
     } else if (passing) {
         (void)dtc_report(&monitor->dtc, (uint16_t)event,
                          (config->passed_threshold == -1) ? DTC_REPORT_PASSED
                                                           : DTC_REPORT_PREPASSED);
+        note_test_failed(monitor, event);
     } else {
         /* not judged */
     }
+}
+
+/* Whether the receiver's count of clear requests `requests` is ahead of `carried_out`, the
+ * count the monitor has carried out. The count only grows, modulo 2^32, and the monitor is never
+ * 2^31 requests behind it, so a difference of 1 to 2^31 - 1 is ahead and any other, behind or
+ * equal. */
+static bool newer_requests(uint32_t requests, uint32_t carried_out)
+{
+    const uint32_t ahead = requests - carried_out;
+
+    return (ahead != 0U) && (ahead < 0x80000000UL);
 }
 
 bool fault_init(fault_monitor_t *monitor, plat_reset_reason_t cause)
@@ -454,6 +494,11 @@ void fault_apply(fault_monitor_t *monitor, const fault_verdict_t *verdict)
 {
     const uint16_t failing = (uint16_t)(verdict->failing & SAMPLE_MASK);
     const uint16_t passing = (uint16_t)(verdict->passing & SAMPLE_MASK & (uint16_t)~failing);
+
+    /* A request the processing task had seen when it handed the verdict over is carried out
+     * before the verdict's evidence, so that the clear erases what came before the request
+     * and nothing after it. */
+    (void)fault_clear_if_requested(monitor, verdict->clear_requests);
 
     for (uint32_t event = 0U; event < SAMPLE_FAULTS; event++) {
         const uint16_t mask = (uint16_t)(1UL << event);
@@ -488,11 +533,16 @@ bool fault_clear_if_requested(fault_monitor_t *monitor, uint32_t requests)
 {
     bool cleared = false;
 
-    if (requests != monitor->clear_requests) {
+    if (newer_requests(requests, monitor->clear_requests)) {
         monitor->clear_requests = requests;
         cleared = dtc_clear_all(&monitor->dtc);
 
         if (cleared) {
+            /* Every testFailed ends here; the rises before the clear stay in the log's edges
+             * but no longer count for the summary. */
+            monitor->fell = (uint16_t)(monitor->fell | monitor->failed);
+            monitor->failed = 0U;
+            monitor->latched = 0U;
             monitor->clears++;
         }
     }
@@ -500,7 +550,7 @@ bool fault_clear_if_requested(fault_monitor_t *monitor, uint32_t requests)
     return cleared;
 }
 
-void fault_summary(const fault_monitor_t *monitor, fault_summary_t *summary)
+void fault_summary(fault_monitor_t *monitor, fault_summary_t *summary, fault_changes_t *changes)
 {
     dtc_entry_t entry;
 
@@ -510,7 +560,7 @@ void fault_summary(const fault_monitor_t *monitor, fault_summary_t *summary)
         if (dtc_get(&monitor->dtc, (uint16_t)event, &entry)) {
             const uint16_t mask = bit_of((fault_event_t)event);
 
-            if ((entry.status & DTC_STATUS_TF) != 0U) {
+            if (((entry.status & DTC_STATUS_TF) != 0U) || ((monitor->latched & mask) != 0U)) {
                 summary->active = (uint16_t)(summary->active | mask);
             }
 
@@ -531,6 +581,13 @@ void fault_summary(const fault_monitor_t *monitor, fault_summary_t *summary)
     }
 
     summary->clears = (uint8_t)(monitor->clears & 0xFFU);
+
+    changes->rose = monitor->rose;
+    changes->fell = monitor->fell;
+    changes->failed = monitor->failed;
+    monitor->rose = 0U;
+    monitor->fell = 0U;
+    monitor->latched = 0U;
 }
 
 const char *fault_name(uint32_t event)

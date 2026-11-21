@@ -387,7 +387,9 @@ static void test_the_first_command_carried_out_requests_no_clear(void)
 /*
  * A frame that is not carried out requests nothing, whatever it carries: a damaged one, a
  * repeated one, and those of a stream that is INVALID after a timeout. The command carried out
- * after them is compared with the last one carried out (7), not with the frames in between.
+ * after a damaged frame, in a stream that stayed VALID, is compared with the last one carried
+ * out, not with the frame in between; the first one carried out after the timeout only sets
+ * the reference again (7), and the change after it (8) is the request.
  */
 static void test_frames_not_carried_out_request_no_clear(void)
 {
@@ -419,6 +421,70 @@ static void test_frames_not_carried_out_request_no_clear(void)
     TEST_ASSERT_EQUAL_UINT32(1U, command_clear_requests(&s_rx));
 }
 
+/* Tester A (faults sequence 7) goes away: three periods without a frame take the stream from
+ * VALID to INVALID. */
+static void lose_the_stream_of_tester_a(void)
+{
+    valid_with_telemetry_off();
+
+    for (uint32_t i = 0U; i < 3U; i++) {
+        command_on_cycle(&s_rx);
+    }
+
+    TEST_ASSERT_EQUAL(E2E_SM_INVALID, s_rx.sm.sm_state);
+}
+
+/*
+ * Tester B starts after A went away, with a counter of its own from 0 and a value of its own, 0
+ * (a pack master after a reset long enough to lose the stream is the same case). Its first
+ * frame is out of sequence for the receiver, which still has A's counter (WRONGSEQUENCE,
+ * neither an OK nor an error for the state machine), and the OKs after it make the stream
+ * VALID again; the first command of B carried out then is compared with nothing: A's value,
+ * from before the stream was lost, is no reference for it, and B clears nothing by starting.
+ * B's own change afterwards is a request.
+ */
+static void test_a_tester_that_starts_after_another_went_away_requests_no_clear(void)
+{
+    uint32_t frames = 0U;
+
+    lose_the_stream_of_tester_a();
+    TEST_ASSERT_EQUAL(E2E_E_OK, e2e_p11_protect_init(&s_tester));
+
+    while ((s_rx.sm.sm_state != E2E_SM_VALID) && (frames < 10U)) {
+        periods_with_commands(1U, true, 0U);
+        frames++;
+    }
+
+    TEST_ASSERT_EQUAL(E2E_SM_VALID, s_rx.sm.sm_state);
+    TEST_ASSERT_EQUAL_UINT32(1U, s_rx.status.wrong_sequence);
+    TEST_ASSERT_EQUAL_UINT8(0U, s_rx.clear_faults_seq);
+    periods_with_commands(2U, true, 0U);
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0U, command_clear_requests(&s_rx),
+                                     "a tester that starts requested a clear");
+
+    periods_with_commands(1U, true, 1U);
+    TEST_ASSERT_EQUAL_UINT32(1U, command_clear_requests(&s_rx));
+}
+
+/*
+ * Tester A comes back after the timeout with its next counter but a value it changed while the
+ * stream was lost (7 -> 8): the first command carried out after the timeout only sets the
+ * reference, so nothing is requested. A sees FaultClearCount unchanged and changes the value
+ * again (8 -> 9): that one is a request.
+ */
+static void test_a_tester_back_with_a_changed_value_requests_no_clear(void)
+{
+    lose_the_stream_of_tester_a();
+
+    periods_with_commands(3U, true, 8U);
+    TEST_ASSERT_EQUAL(E2E_SM_VALID, s_rx.sm.sm_state);
+    TEST_ASSERT_EQUAL_UINT8(8U, s_rx.clear_faults_seq);
+    TEST_ASSERT_EQUAL_UINT32(0U, command_clear_requests(&s_rx));
+
+    periods_with_commands(1U, true, 9U);
+    TEST_ASSERT_EQUAL_UINT32(1U, command_clear_requests(&s_rx));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -439,5 +505,7 @@ int main(void)
     RUN_TEST(test_a_changed_clear_faults_seq_between_two_commands_carried_out_is_one_request);
     RUN_TEST(test_the_first_command_carried_out_requests_no_clear);
     RUN_TEST(test_frames_not_carried_out_request_no_clear);
+    RUN_TEST(test_a_tester_that_starts_after_another_went_away_requests_no_clear);
+    RUN_TEST(test_a_tester_back_with_a_changed_value_requests_no_clear);
     return UNITY_END();
 }

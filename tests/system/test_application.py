@@ -31,6 +31,12 @@ PROTECTED = {0x020: 0x0120, 0x040: 0x0140, 0x041: 0x0141, 0x050: 0x0150}
 ID_COMMAND = 0x100
 COMMAND_DATA_ID = 0x0200
 
+# The messages sent in a pass of the sensor task or with its sample (app/app.c, WHO SENDS
+# WHAT), and the period of that task.
+PER_SENSOR_PASS = {"BMS_Heartbeat", "BMS_PackStatus", "BMS_CellVoltages1", "BMS_CellVoltages2",
+                   "BMS_Temperatures"}
+SENSOR_PERIOD_MS = 10
+
 
 @pytest.fixture(scope="module")
 def dbc():
@@ -145,10 +151,14 @@ def test_every_cyclic_message_is_published_with_the_samples_or_periods_it_belong
     assert messages["BMS_TaskStats"]["published"] == 10
     assert messages["BMS_NodeInfo"]["published"] == 2
 
-    # In the node's own time, each at its cycle time.
+    # In the node's own time, each at its cycle time. The messages of the sensor task's passes
+    # leave out the periods it skipped after an overrun (app/app.c, sensor_task()).
     for name, message in messages.items():
-        expected = stats["tick"]["count"] / message["cycle_ms"]
-        assert abs(message["published"] - expected) <= 2, (name, message, stats["tick"])
+        ticks = stats["tick"]["count"]
+        if name in PER_SENSOR_PASS:
+            ticks -= sensor["skipped_periods"] * SENSOR_PERIOD_MS
+        expected = ticks / message["cycle_ms"]
+        assert abs(message["published"] - expected) <= 2, (name, message, stats["tick"], sensor)
         assert message["failed"] == 0 and message["suppressed"] == 0, name
         assert message["queue"]["produced"] == message["published"], name
 

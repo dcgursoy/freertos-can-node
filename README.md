@@ -212,9 +212,15 @@ target yet.
   application.
 - **Tests.** Unit tests of the new modules, each challenged with planted defects; system tests
   that apply every fault from outside and check its DTC in BMS_Fault, in BMS_PackStatus and in
-  the statistics, status byte included, while the fault lasts and after it; the clear; the
-  watchdog reset and the next start, with and without the retained cell; and a check in the
-  test harness that the node of no other system test was ever reset.
+  the statistics, status byte included, while the fault lasts and after it, with two
+  exceptions: SAMPLE_TIMEOUT, during which no sample and so no BMS_PackStatus comes, is checked
+  in BMS_PackStatus and in the statistics once the stall has ended and the node has survived
+  it, and SUPERVISION_EXPIRED ends in a reset, which writes no statistics and leaves no after;
+  a fault that comes and goes within one health period; the clear, ordered against the
+  evidence; the watchdog reset and the next start, with and without the retained cell; and
+  checks in the test harness that the node of no other system test was ever reset, and that
+  in every run that ended in order every kick the health task decided on reached the hardware
+  watchdog.
 
 ## Build and test
 

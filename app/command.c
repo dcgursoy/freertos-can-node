@@ -75,6 +75,12 @@ static e2e_p_check_status_t check_and_step(command_rx_t *rx, const uint8_t *data
         rx->sm_errors++;
     }
 
+    /* A stream that is not VALID has lost its reference for clear requests: the next command
+     * carried out may come from another tester, or from this one after a restart. */
+    if (rx->sm.sm_state != E2E_SM_VALID) {
+        rx->clear_reference_valid = false;
+    }
+
     return verdict;
 }
 
@@ -103,13 +109,14 @@ void command_on_frame(command_rx_t *rx, const can_frame_t *frame)
     }
 
     if (act) {
-        if (rx->have_command && (command.cmd_clear_faults_seq != rx->clear_faults_seq)) {
+        if (rx->clear_reference_valid && (command.cmd_clear_faults_seq != rx->clear_faults_seq)) {
             rx->clear_requests++;
         }
 
         rx->telemetry_on = (command.cmd_telemetry_on != 0U);
         rx->clear_faults_seq = command.cmd_clear_faults_seq;
         rx->have_command = true;
+        rx->clear_reference_valid = true;
         rx->accepted++;
     } else {
         rx->ignored++;

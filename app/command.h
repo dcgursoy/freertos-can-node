@@ -20,10 +20,17 @@
  * Acting on a command means:
  *   - CmdTelemetryOn becomes the node's telemetry switch (command_telemetry_on());
  *   - CmdClearFaultsSeq is stored, and if it differs from that of the command acted on before
- *     it, a request to clear the DTCs is counted (clear_requests; the owner of the DTCs carries
- *     it out, fault.h). The first command acted on sets the reference and requests nothing: a
- *     tester that starts, or that comes back after a timeout with the value it had, clears
- *     nothing by doing so.
+ *     it while the stream stayed VALID, a request to clear the DTCs is counted (clear_requests;
+ *     the owner of the DTCs carries it out, fault.h). The first command acted on after the
+ *     stream started, or after it was lost (any step of the state machine that leaves it
+ *     anything but VALID), only sets the reference and requests nothing: a tester that starts,
+ *     another tester after one went away, or a tester that comes back after a timeout or a
+ *     restart, with whatever value, clears nothing by doing so, as long as its stream was lost
+ *     in between. A sender that comes back before that (silent for at most one period, or two
+ *     if its counter happens to go on in sequence; COMMAND_SM_* below) cannot be told from the
+ *     one before it, and a changed value from it is a request. The price: a tester that
+ *     changed its value while the stream was lost has requested nothing; it sees
+ *     FaultClearCount unchanged in BMS_Fault and changes the value again.
  * Before the first command that is acted on, the telemetry switch is on. Afterwards it keeps
  * the value of the last command acted on, also while the command stream is lost: a node whose
  * tester went away does not change its behaviour by itself.
@@ -91,12 +98,16 @@ typedef struct {
     uint32_t sm_errors;    /**< state machine steps that did not return E2E_E_OK (never) */
     uint32_t accepted;     /**< frames whose command was carried out */
     uint32_t ignored;      /**< frames whose command was not, see WHAT IS CARRIED OUT */
-    /** commands acted on whose CmdClearFaultsSeq differed from the one before (wraps) */
+    /** commands acted on whose CmdClearFaultsSeq differed from the one before, in a stream that
+     *  stayed VALID between the two (wraps) */
     uint32_t clear_requests;
-    uint8_t clear_faults_seq; /**< CmdClearFaultsSeq of the last command acted on */
-    bool have_command;        /**< a command has been acted on since command_init() */
-    bool telemetry_on;        /**< the telemetry switch */
-    bool frame_in_period;     /**< a frame has arrived since the last command_on_cycle() */
+    uint8_t clear_faults_seq;   /**< CmdClearFaultsSeq of the last command acted on */
+    bool have_command;          /**< a command has been acted on since command_init() */
+    bool clear_reference_valid; /**< clear_faults_seq is the reference for a clear request: a
+                                     command has been acted on since the stream last became
+                                     VALID */
+    bool telemetry_on;          /**< the telemetry switch */
+    bool frame_in_period;       /**< a frame has arrived since the last command_on_cycle() */
 } command_rx_t;
 
 /** No command seen: Profile 11 and the state machine initialised (NODATA), telemetry on,

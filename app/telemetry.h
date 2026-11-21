@@ -88,8 +88,8 @@ void telemetry_init(telemetry_sender_t *sender);
  * BMS_PackStatus from a copy of the pack state: PackCurrent and PackCurrentValid from
  * current_ma and current_valid, PackVoltage and PackVoltageValid from pack_mv and pack_valid
  * (pack_mv is the pack voltage only while pack_valid), PackFaultActive from `fault_active`
- * (a DTC has testFailed, fault_summary_t.active != 0), and PackState from state, except that it
- * is FAULT while `fault_active`. Then protected.
+ * (a fault is active in the summary, fault_summary_t.active != 0), and PackState from state,
+ * except that it is FAULT while `fault_active`. Then protected.
  *
  * Returns false, with `frame` unspecified and the counter not advanced, only if packing or
  * protection refused, which nothing but a wrong build can make them do.

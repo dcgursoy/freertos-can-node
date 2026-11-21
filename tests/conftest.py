@@ -7,13 +7,20 @@ through the simulation control channel. Every test gets
     upload it;
   - its own UDP ports (a bus and a simulation control port), so tests cannot talk to each
     other's nodes or to anything else running on the machine;
-  - a clean end: its nodes are killed when it finishes, the test fails if one of them ended
-    by itself without the test looking at its exit status (or exited 0 but wrote to stderr),
-    or was reset (an exit status of plat_reset_reason_t, the hardware watchdog's 11 among
-    them) without the test waiting for that reset with wait_for_reset(), the session fails if
-    a node is still running at the end, and the kernel kills a node whose test run died. So a
-    system test that does not expect a reset shows, besides what it tests, that the node's
-    hardware watchdog was kicked for the whole run.
+  - a clean end: when it finishes, its nodes that still run are stopped in order (SIGTERM,
+    as stop() does; one that has not ended STOP_TIMEOUT_S later is killed, and the test
+    fails). The test fails if one of its nodes ended by itself without the test looking at
+    its exit status (or exited 0 but wrote to stderr), did not end in order when the harness
+    stopped it, was reset (an exit status of plat_reset_reason_t, the hardware watchdog's 11
+    among them) without the test waiting for that reset with wait_for_reset(), or ended in
+    order with statistics that show a kick of the hardware watchdog missing
+    (NodeProcess.lost_kicks()). The session fails if a node is still running at the end, and
+    the kernel kills a node whose test run died. The reset check shows that no node was
+    reset without the test waiting for it; the kick check, that in every run that ended in
+    order the hardware watchdog was started and every kick the health task decided on
+    reached it. Neither shows that the kicks came often enough in a run shorter than the
+    watchdog's timeout (500 ms) or in the last 500 ms before an orderly stop, which switches
+    the watchdog off: the watchdog cannot reset the node there.
 
 With --timing-report FILE, every failed test is listed in FILE as "miss <test>" if it failed
 only on a timing tolerance (fcn_tools.timing) and as "fail <test>" otherwise; that is how
@@ -31,6 +38,7 @@ import fcntl
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,11 +50,16 @@ import pytest
 from fcn_tools import bus as bus_module
 from fcn_tools import node as node_module
 from fcn_tools import paths
-from fcn_tools.node import NodeProcess
+from fcn_tools.node import EXIT_OK, NodeProcess
 from fcn_tools.ports import PortAllocator, PortBlock
 from fcn_tools.timing import TimingToleranceMissed
 
 SOCKETCAN_INTERFACE = os.environ.get("FCN_TEST_CAN_INTERFACE", "vcan0")
+
+#: How long the end of a test waits for a node it stops (SIGTERM) to end: the node stops at the
+#: end of the health period it is in (100 ms, app/app.c), the rest is room for a slow host. Not
+#: a timing tolerance: a node that does not end in this time is killed, and the test fails.
+STOP_TIMEOUT_S = 5.0
 
 # Written into an artifacts directory the harness created; only such a directory is ever
 # emptied by it.
@@ -133,20 +146,42 @@ def ports(port_allocator) -> PortBlock:
     block.release()
 
 
+def _stop_in_order(node: NodeProcess) -> str | None:
+    """Stop a node that the test left running, as stop() does; what went wrong, or None."""
+    try:
+        status = node.stop(timeout=STOP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return (f"{node.name} had not ended {STOP_TIMEOUT_S} s after the end of the test asked "
+                "it to stop (SIGTERM), and was killed (SIGKILL): it wrote no statistics, so its "
+                "kicks were not checked")
+    if status == EXIT_OK:
+        return None
+    tail = "\n".join(node.stderr().strip().splitlines()[-20:])
+    return (f"{node.name} ended with status {status}, not in order, when the end of the test "
+            f"asked it to stop (SIGTERM)\n--- stderr (last lines)\n{tail}")
+
+
 @pytest.fixture
 def started_nodes():
-    """Every node a test started through start_node or restart_node; when the test ends, a death
-    the test did not see, or a reset it did not wait for, fails it, and every node is killed."""
+    """Every node a test started through start_node or restart_node. When the test ends, the
+    nodes that still run are stopped in order, and the test fails on a death it did not see,
+    a node that did not stop in order, a reset it did not wait for, or a kick of the hardware
+    watchdog missing from a run that ended in order."""
     started: list[NodeProcess] = []
 
     yield started
 
-    # Asked before the nodes are killed: a death the test did not see, or a reset it did not
-    # expect, fails the test.
-    problems = [problem for problem in (node.unnoticed_end() or node.unexpected_reset()
-                                        for node in started) if problem]
+    # A node that still runs has not ended by itself (unnoticed_end() has nothing to say about
+    # it yet); stopping it in order makes its statistics, and with them its kicks, checkable.
+    problems = []
     for node in started:
-        node.kill()
+        problem = _stop_in_order(node) if node.running else None
+        problem = (problem or node.unnoticed_end() or node.unexpected_reset()
+                   or node.lost_kicks())
+        if problem:
+            problems.append(problem)
+    for node in started:
+        node.kill()     # every node has ended by now; this only makes sure
     if problems:
         pytest.fail("\n\n".join(problems), pytrace=False)
 

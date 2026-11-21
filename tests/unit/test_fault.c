@@ -89,6 +89,7 @@ static fault_verdict_t judge(uint8_t unanswered)
     (void)memset(&verdict, 0xA5, sizeof(verdict));
     fault_judge_sample(&s_sample, unanswered, &s_pack, &verdict);
     TEST_ASSERT_EQUAL_HEX16_MESSAGE(0U, verdict.failing & verdict.passing, "failing and passing");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0U, verdict.clear_requests, "the poster tags it");
     return verdict;
 }
 
@@ -114,20 +115,40 @@ static void apply(fault_event_t event, bool failing, uint32_t count)
 {
     const uint16_t mask = BIT(event);
     const fault_verdict_t verdict = {.failing = failing ? mask : (uint16_t)0U,
-                                     .passing = failing ? (uint16_t)0U : mask};
+                                     .passing = failing ? (uint16_t)0U : mask,
+                                     .clear_requests = s_monitor.clear_requests};
 
     for (uint32_t i = 0U; i < count; i++) {
         fault_apply(&s_monitor, &verdict);
     }
 }
 
-static fault_summary_t summary(void)
+/* The summary of the period since the last one, and its changes of testFailed in `changes`. */
+static fault_summary_t summary_with(fault_changes_t *changes)
 {
     fault_summary_t out;
 
     (void)memset(&out, 0xA5, sizeof(out));
-    fault_summary(&s_monitor, &out);
+    (void)memset(changes, 0xA5, sizeof(*changes));
+    fault_summary(&s_monitor, &out, changes);
     return out;
+}
+
+static fault_summary_t summary(void)
+{
+    fault_changes_t changes;
+
+    return summary_with(&changes);
+}
+
+/* One verdict: `failing` and `passing` as given, tagged with the count of clear requests the
+ * processing task had read when it posted it. */
+static void apply_tagged(uint16_t failing, uint16_t passing, uint32_t clear_requests)
+{
+    const fault_verdict_t verdict = {
+        .failing = failing, .passing = passing, .clear_requests = clear_requests};
+
+    fault_apply(&s_monitor, &verdict);
 }
 
 static void health(uint32_t bus_offs, uint32_t passive_entries, can_fc_state_t state,
@@ -437,6 +458,7 @@ static void test_a_sample_passes_the_timeout_and_a_timeout_fails_only_it(void)
     fault_judge_timeout(&verdict);
     TEST_ASSERT_EQUAL_HEX16(BIT(FAULT_SAMPLE_TIMEOUT), verdict.failing);
     TEST_ASSERT_EQUAL_HEX16(0U, verdict.passing);
+    TEST_ASSERT_EQUAL_UINT32(0U, verdict.clear_requests);
 
     /* A sample judges nothing of the health task's or the reset faults. */
     const fault_verdict_t sample = judge(0U);
@@ -676,9 +698,62 @@ static void test_a_new_clear_request_clears_every_dtc_once(void)
     TEST_ASSERT_EQUAL_HEX16(BIT(FAULT_SAMPLE_TIMEOUT), picture.active);
     TEST_ASSERT_EQUAL_UINT8((uint8_t)FAULT_SAMPLE_TIMEOUT, picture.most_recent);
 
-    /* The receiver's count wraps: a change is a change. */
+    /* A count behind the one carried out is no request: it comes from before the last clear. */
+    TEST_ASSERT_FALSE(fault_clear_if_requested(&s_monitor, 2U));
+    TEST_ASSERT_EQUAL_UINT32(1U, s_monitor.clears);
+
+    /* The receiver's count wraps: ahead by up to 2^31 - 1 is newer, also across 2^32. */
+    TEST_ASSERT_TRUE(fault_clear_if_requested(&s_monitor, 3U + 0x7FFFFFFFU));
+    TEST_ASSERT_TRUE(fault_clear_if_requested(&s_monitor, 0xFFFFFFFFU));
     TEST_ASSERT_TRUE(fault_clear_if_requested(&s_monitor, 0U));
-    TEST_ASSERT_EQUAL_UINT32(2U, s_monitor.clears);
+    TEST_ASSERT_FALSE(fault_clear_if_requested(&s_monitor, 0xFFFFFFFFU));
+    TEST_ASSERT_EQUAL_UINT32(4U, s_monitor.clears);
+}
+
+/*
+ * The order of a clear and the evidence (the health task works in a period's verdicts, then
+ * carries out a request no verdict carried). Before the request: a channel goes invalid and the
+ * front end does not answer; the receiver then counts the request (1). After it: the channel is
+ * valid again, and a sample has a read the front end did not answer, and the next one is whole
+ * again. The clear comes before the first verdict that carries the request: what came before
+ * it is gone, the failure after it survives the clear with its whole record.
+ */
+static void test_a_failure_detected_after_a_clear_request_survives_the_clear(void)
+{
+    const uint16_t invalid = BIT(FAULT_SENSOR_CHANNEL_INVALID);
+    const uint16_t no_answer = BIT(FAULT_FRONT_END_NO_ANSWER);
+    fault_changes_t changes;
+
+    apply_tagged((uint16_t)(invalid | no_answer), 0U, 0U); /* before the request */
+    apply_tagged(0U, (uint16_t)(invalid | no_answer), 1U); /* after it: the clear first */
+    TEST_ASSERT_EQUAL_UINT32(1U, s_monitor.clears);
+    apply_tagged(no_answer, invalid, 1U);
+    apply_tagged(0U, no_answer, 1U);
+    TEST_ASSERT_FALSE(fault_clear_if_requested(&s_monitor, 1U)); /* carried out already */
+    TEST_ASSERT_EQUAL_UINT32(1U, s_monitor.clears);
+
+    TEST_ASSERT_EQUAL_HEX8(PASSED_FIRST, status_of(FAULT_SENSOR_CHANNEL_INVALID));
+    TEST_ASSERT_EQUAL_HEX8(HEALED_WIR, status_of(FAULT_FRONT_END_NO_ANSWER));
+
+    /* The frame of the period: the failure after the request, active (it rose in the period)
+     * and confirmed, the most recent; nothing from before the request. */
+    const fault_summary_t picture = summary_with(&changes);
+    TEST_ASSERT_EQUAL_HEX16(no_answer, picture.active);
+    TEST_ASSERT_EQUAL_HEX16(no_answer, picture.confirmed);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)FAULT_FRONT_END_NO_ANSWER, picture.most_recent);
+    TEST_ASSERT_EQUAL_UINT8(1U, picture.clears);
+    /* For the log: both rose before the clear, the clear ended both, the front end rose after
+     * it and passed again. */
+    TEST_ASSERT_EQUAL_HEX16(invalid | no_answer, changes.rose);
+    TEST_ASSERT_EQUAL_HEX16(invalid | no_answer, changes.fell);
+    TEST_ASSERT_EQUAL_HEX16(0U, changes.failed);
+
+    /* A request that no verdict carries is carried out when the health task gets to it, after
+     * the verdicts that came before it. */
+    apply_tagged(no_answer, 0U, 1U);
+    TEST_ASSERT_TRUE(fault_clear_if_requested(&s_monitor, 2U));
+    TEST_ASSERT_EQUAL_HEX8(UNTESTED, status_of(FAULT_FRONT_END_NO_ANSWER));
+    TEST_ASSERT_EQUAL_HEX16(0U, summary().active);
 }
 
 /* FaultClearCount is the count of clears modulo 256. */
@@ -693,6 +768,85 @@ static void test_the_count_of_clears_in_the_summary_wraps_at_256(void)
 }
 
 /* ---------------------------------------------------------------------------- the summary */
+
+/*
+ * A fault decided by one piece of evidence can come and go between two summaries (one health
+ * period). The summary of that period has it active, and its changes say it rose, then fell;
+ * the summary after that has it no longer active and no change. The other way round, a fault
+ * that was active, passed and failed again in one period: active, fell then rose.
+ */
+static void test_a_fault_that_comes_and_goes_within_a_period_is_active_in_its_summary(void)
+{
+    const uint16_t mask = BIT(FAULT_FRONT_END_NO_ANSWER);
+    fault_changes_t changes;
+
+    apply(FAULT_FRONT_END_NO_ANSWER, true, 1U);
+    apply(FAULT_FRONT_END_NO_ANSWER, false, 1U);
+    TEST_ASSERT_EQUAL_HEX8(HEALED_WIR, status_of(FAULT_FRONT_END_NO_ANSWER));
+
+    fault_summary_t picture = summary_with(&changes);
+    TEST_ASSERT_EQUAL_HEX16(mask, picture.active);
+    TEST_ASSERT_EQUAL_HEX16(mask, picture.confirmed);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)FAULT_FRONT_END_NO_ANSWER, picture.most_recent);
+    TEST_ASSERT_EQUAL_HEX16(mask, changes.rose);
+    TEST_ASSERT_EQUAL_HEX16(mask, changes.fell);
+    TEST_ASSERT_EQUAL_HEX16(0U, changes.failed);
+
+    picture = summary_with(&changes);
+    TEST_ASSERT_EQUAL_HEX16(0U, picture.active);
+    TEST_ASSERT_EQUAL_HEX16(mask, picture.confirmed);
+    TEST_ASSERT_EQUAL_HEX16(0U, changes.rose | changes.fell | changes.failed);
+
+    /* Active at the start of the period, passed and failed again within it. */
+    apply(FAULT_FRONT_END_NO_ANSWER, true, 1U);
+    picture = summary_with(&changes);
+    TEST_ASSERT_EQUAL_HEX16(mask, picture.active);
+    TEST_ASSERT_EQUAL_HEX16(mask, changes.rose);
+    TEST_ASSERT_EQUAL_HEX16(0U, changes.fell);
+    apply(FAULT_FRONT_END_NO_ANSWER, false, 1U);
+    apply(FAULT_FRONT_END_NO_ANSWER, true, 1U);
+    picture = summary_with(&changes);
+    TEST_ASSERT_EQUAL_HEX16(mask, picture.active);
+    TEST_ASSERT_EQUAL_HEX16(mask, changes.rose & changes.fell);
+    TEST_ASSERT_EQUAL_HEX16(mask, changes.failed);
+
+    /* A pre-report that leaves testFailed alone is no change. */
+    apply(FAULT_CELL_OVERVOLTAGE, true, 4U);
+    (void)summary_with(&changes);
+    TEST_ASSERT_EQUAL_HEX16(0U, (changes.rose | changes.fell) & BIT(FAULT_CELL_OVERVOLTAGE));
+}
+
+/*
+ * A clear ends every testFailed (a fall, for the log) and forgets the rises of the period
+ * before it, so that the summary of the period of a clear holds nothing from before it. A rise
+ * after the clear counts, also when the fault has passed again by the summary.
+ */
+static void test_a_clear_forgets_the_rises_before_it_and_keeps_those_after_it(void)
+{
+    const uint16_t timeout = BIT(FAULT_SAMPLE_TIMEOUT);
+    const uint16_t no_answer = BIT(FAULT_FRONT_END_NO_ANSWER);
+    const uint16_t invalid = BIT(FAULT_SENSOR_CHANNEL_INVALID);
+    fault_changes_t changes;
+
+    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_WATCHDOG));
+    (void)summary(); /* the start: the reset fault is active, not a change of the run */
+    apply(FAULT_SAMPLE_TIMEOUT, true, 1U);
+    apply(FAULT_FRONT_END_NO_ANSWER, true, 1U);
+    apply(FAULT_FRONT_END_NO_ANSWER, false, 1U);
+    TEST_ASSERT_TRUE(fault_clear_if_requested(&s_monitor, 1U));
+    apply(FAULT_SENSOR_CHANNEL_INVALID, true, 1U);
+    apply(FAULT_SENSOR_CHANNEL_INVALID, false, 1U);
+
+    const fault_summary_t picture = summary_with(&changes);
+    TEST_ASSERT_EQUAL_HEX16(invalid, picture.active);
+    TEST_ASSERT_EQUAL_HEX16(invalid, picture.confirmed);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)FAULT_SENSOR_CHANNEL_INVALID, picture.most_recent);
+    TEST_ASSERT_EQUAL_HEX16(timeout | no_answer | invalid, changes.rose);
+    TEST_ASSERT_EQUAL_HEX16(timeout | no_answer | invalid | BIT(FAULT_RESET_WATCHDOG),
+                            changes.fell);
+    TEST_ASSERT_EQUAL_HEX16(0U, changes.failed);
+    TEST_ASSERT_EQUAL_HEX16(0U, summary().active);
+}
 
 /* The masks hold every fault at its bit, the most recent is the last whose testFailed rose, and
  * the indicator is requested by the faults of the pack only. */
@@ -746,7 +900,10 @@ int main(void)
     RUN_TEST(test_error_passive_is_set_at_once_and_heals_after_ten_cycles_error_active);
     RUN_TEST(test_the_supervision_fault_follows_the_global_status);
     RUN_TEST(test_a_new_clear_request_clears_every_dtc_once);
+    RUN_TEST(test_a_failure_detected_after_a_clear_request_survives_the_clear);
     RUN_TEST(test_the_count_of_clears_in_the_summary_wraps_at_256);
     RUN_TEST(test_the_summary_has_a_bit_per_fault_and_the_most_recent_one);
+    RUN_TEST(test_a_fault_that_comes_and_goes_within_a_period_is_active_in_its_summary);
+    RUN_TEST(test_a_clear_forgets_the_rises_before_it_and_keeps_those_after_it);
     return UNITY_END();
 }

@@ -32,11 +32,12 @@ typedef struct {
 
 /** What the sensor task did. */
 typedef struct {
-    uint32_t periods;        /**< periods run, the heartbeat's period counter */
-    uint32_t overruns;       /**< periods whose release had passed when the last ended */
-    uint32_t samples_posted; /**< samples the queue took */
-    uint32_t queue_full;     /**< samples the queue refused because it was full */
-    uint32_t current_reads;  /**< reads of each group, answered or not */
+    uint32_t periods;         /**< periods run (passes), the heartbeat's period counter */
+    uint32_t overruns;        /**< periods whose release had passed when the last ended */
+    uint32_t skipped_periods; /**< periods skipped after an overrun, not run (app.c) */
+    uint32_t samples_posted;  /**< samples the queue took */
+    uint32_t queue_full;      /**< samples the queue refused because it was full */
+    uint32_t current_reads;   /**< reads of each group, answered or not */
     uint32_t cell_reads;
     uint32_t temp_reads;
     uint32_t current_unanswered; /**< reads the front end did not answer */
@@ -48,6 +49,7 @@ typedef struct {
 typedef struct {
     uint32_t samples;         /**< samples taken from the queue and processed */
     uint32_t timeouts;        /**< waits for a sample that ran out (sensor supervision) */
+    uint32_t recoveries;      /**< samples that came after a timeout: ends of a stall */
     uint32_t backlog;         /**< samples that found another one waiting behind them */
     uint32_t high_water;      /**< most samples the queue held at once, as the task found it */
     uint32_t verdicts_posted; /**< verdicts on faults the queue to the health task took */

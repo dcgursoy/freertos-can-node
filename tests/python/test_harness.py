@@ -7,13 +7,17 @@
     failure that is not a timing miss is never repeated;
   - the supervision of nodes by the start_node fixture and the session: a node death the test
     did not look at fails the test, a reset the test did not wait for with wait_for_reset()
-    fails it, and so does a node left running at the end.
+    fails it, a node the test left running is stopped in order at its end and fails it if it
+    does not stop in order, a run that ended in order with a kick of the hardware watchdog
+    missing from its statistics fails it, and a node left running at the end of the session
+    fails the session.
 
 Each scratch run gets a copy of the real tests/conftest.py, so the hooks under test are the
 ones the system tests use, and stand-in nodes (shell scripts) instead of the node binary.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -286,10 +290,27 @@ import time
 from fcn_tools.node import NodeProcess
 
 
+def wait_until_ready(node):
+    deadline = time.monotonic() + 10
+    while "ready" not in node.stdout_path.read_text():
+        assert time.monotonic() < deadline, "the stand-in did not get ready"
+        time.sleep(0.01)
+
+
 def test_does_not_look(start_node):
     node = start_node()
     while node.running:
         time.sleep(0.01)                   # the node is dead; the test does not look
+
+
+def test_leaves_it_running(start_node):
+    wait_until_ready(start_node())         # the end of the test stops it
+
+
+def test_stops_it(start_node):
+    node = start_node()
+    wait_until_ready(node)
+    assert node.stop(timeout=10) == 0
 
 
 def test_looks(start_node):
@@ -338,6 +359,79 @@ def test_a_reset_the_test_did_not_wait_for_fails_the_test(scratch):
     assert re.search(r"^ERROR \S*test_supervised\.py::test_looks_but_expects_no_reset",
                      out.stdout, re.MULTILINE), out.stdout
     assert "was reset (status 20) in a test that does not expect a reset" in out.stdout
+
+
+def kick_stats(hw_kicks: int) -> str:
+    """The statistics lost_kicks() reads, of a run whose 20 supervision cycles each ended with
+    a kick, of which the hardware watchdog counted `hw_kicks`."""
+    return json.dumps({"hw_watchdog": {"started": True, "kicks": hw_kicks},
+                       "watchdog_manager": {"kicks": 20, "kicks_withheld": 0, "cycles": 20}})
+
+
+def stopping_stand_in(root: Path, stats: str) -> Path:
+    """A stand-in node that runs until SIGTERM, then writes `stats` as its statistics and ends
+    in order (status 0), as the node does."""
+    source = root / "stand_in_stats.json"
+    source.write_text(stats)
+    return stand_in_node(root, f"""\
+        while [ $# -gt 0 ]; do
+          if [ "$1" = --stats-json ]; then stats="$2"; fi
+          shift
+        done
+        trap 'cp "{source}" "$stats"; exit 0' TERM
+        echo ready
+        while :; do sleep 0.02; done
+        """)
+
+
+def test_every_run_that_ended_in_order_has_its_kicks_checked(scratch):
+    """A node the test left running is stopped in order (SIGTERM) when the test ends, so that
+    it writes its statistics; those of every run that ended in order, also of one the test
+    stopped itself, fail the test if a kick of the hardware watchdog went missing."""
+    scratch.write("test_supervised.py", SUPERVISED_TESTS)
+    lost = stopping_stand_in(scratch.root, kick_stats(hw_kicks=0))
+    out = scratch.pytest("-k", "leaves_it_running or stops_it",
+                         env=dict(scratch.env, FCN_NODE=str(lost)))
+    assert out.returncode == 1, out.stdout
+    assert re.search(r"\b2 passed, \d+ deselected, 2 errors\b", out.stdout), out.stdout
+    for test in ("leaves_it_running", "stops_it"):
+        assert re.search(rf"^ERROR \S*test_supervised\.py::test_{test}\b", out.stdout,
+                         re.MULTILINE), out.stdout
+    assert ("node lost kicks of the hardware watchdog: started True, 0 kicks counted by the "
+            "watchdog, 20 decided on and 0 withheld by the health task in 20 supervision "
+            "cycles") in out.stdout, out.stdout
+
+    kept = stopping_stand_in(scratch.root, kick_stats(hw_kicks=20))
+    out = scratch.pytest("-k", "leaves_it_running or stops_it",
+                         env=dict(scratch.env, FCN_NODE=str(kept)))
+    assert out.returncode == 0, out.stdout
+    assert re.search(r"\b2 passed, \d+ deselected in\b", out.stdout), out.stdout
+
+
+@pytest.mark.parametrize("body, shown", [
+    # Ignores SIGTERM: killed when the wait runs out.
+    ("trap '' TERM\necho ready\nexec sleep 30\n",
+     "node had not ended 0.5 s after the end of the test asked it to stop (SIGTERM), and was "
+     "killed (SIGKILL): it wrote no statistics, so its kicks were not checked"),
+    # Reports a stack overflow on the way down.
+    ("trap 'echo \"FATAL stack overflow\" >&2; exit 21' TERM\necho ready\n"
+     "while :; do sleep 0.02; done\n",
+     "node ended with status 21, not in order, when the end of the test asked it to stop "
+     "(SIGTERM)\n--- stderr (last lines)\nFATAL stack overflow"),
+], ids=["ignores_sigterm", "status_21"])
+def test_a_node_that_does_not_stop_in_order_at_the_end_of_the_test_fails_it(scratch, body,
+                                                                             shown):
+    scratch.write("test_supervised.py", SUPERVISED_TESTS)
+    # The wait of the copy shortened from 5 s, so that this test does not take 5 s.
+    conftest = scratch.tests / "conftest.py"
+    text = conftest.read_text()
+    assert "\nSTOP_TIMEOUT_S = 5.0\n" in text
+    conftest.write_text(text.replace("\nSTOP_TIMEOUT_S = 5.0\n", "\nSTOP_TIMEOUT_S = 0.5\n"))
+    node = stand_in_node(scratch.root, body)
+    out = scratch.pytest("-k", "leaves_it_running", env=dict(scratch.env, FCN_NODE=str(node)))
+    assert out.returncode == 1, out.stdout
+    assert re.search(r"\b1 passed, \d+ deselected, 1 error\b", out.stdout), out.stdout
+    assert shown in out.stdout, out.stdout
 
 
 def test_a_node_left_running_at_the_end_fails_the_session(scratch):

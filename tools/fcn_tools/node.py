@@ -46,6 +46,24 @@ RESETS = frozenset({RESET_REQUESTED, RESET_WATCHDOG, RESET_POWER_LOSS, RESET_IMA
                     RESET_ASSERT, RESET_STACK_OVERFLOW, RESET_MALLOC_FAILED})
 
 
+def lost_kicks_in(stats: dict, name: str) -> str | None:
+    """NodeProcess.lost_kicks() on the statistics `stats` of a run that ended in order (status
+    0), for a test that ran the node without a NodeProcess; `name` names the node in the
+    message. What they show wrong with the kicks of the hardware watchdog, or None."""
+    try:
+        hw, manager = stats["hw_watchdog"], stats["watchdog_manager"]
+        started, hw_kicks = hw["started"], hw["kicks"]
+        kicks, withheld, cycles = (manager["kicks"], manager["kicks_withheld"],
+                                   manager["cycles"])
+    except KeyError as missing:
+        return f"{name} wrote statistics without {missing}: its kicks cannot be checked"
+    if started is True and hw_kicks == kicks and kicks + withheld == cycles:
+        return None
+    return (f"{name} lost kicks of the hardware watchdog: started {started}, "
+            f"{hw_kicks} kicks counted by the watchdog, {kicks} decided on and {withheld} "
+            f"withheld by the health task in {cycles} supervision cycles")
+
+
 @dataclass(eq=False)
 class NodeProcess:
     """One run of the node. Use as a context manager so the process never outlives a test."""
@@ -226,8 +244,10 @@ class NodeProcess:
         A run that ended with one of the statuses in RESETS (the watchdog's 11 among them) was
         reset, and a test expects a reset only by waiting for it with wait_for_reset(). Any
         other test whose node was reset fails, also one that looked at the status itself
-        (wait(), stop()): so every system test that does not expect a reset also shows that
-        its node's hardware watchdog was kicked for the whole run.
+        (wait(), stop()). That shows that no node was reset without the test waiting for it,
+        and nothing about the kicks of a run shorter than the hardware watchdog's timeout
+        (500 ms) or of the last 500 ms before an orderly stop, which switches the watchdog off:
+        the watchdog cannot reset the node there. lost_kicks() checks the kicks themselves.
         """
         if self._proc is None:
             return None
@@ -237,6 +257,33 @@ class NodeProcess:
         tail = "\n".join(self.stderr().strip().splitlines()[-20:])
         return (f"{self.name} was reset (status {status}) in a test that does not expect a "
                 f"reset (it never called wait_for_reset())\n--- stderr (last lines)\n{tail}")
+
+    def lost_kicks(self) -> str | None:
+        """What the statistics of this run show wrong with the kicks of the hardware watchdog,
+        or None.
+
+        Checked for a run that ended in order (status 0) and wrote its statistics: the
+        hardware watchdog was started, the health task decided after every supervision cycle
+        whether to kick (watchdog_manager: kicks + kicks_withheld == cycles), and every kick it
+        decided on reached the hardware watchdog (hw_watchdog.kicks == watchdog_manager.kicks).
+        In an orderly run all three hold exactly, also in one whose supervision withheld kicks:
+        the health task decides, kicks and counts in one place (supervise() in app/app.c), and
+        nothing kicks after it has stopped the node. (A state of lib/wdgm found damaged runs no
+        counted cycle, and fails the second check.) A run that is still running, was reset or
+        was killed has written no statistics and is not checked.
+
+        That shows that every kick the health task decided on reached the hardware watchdog,
+        and nothing about whether the kicks came often enough in a run shorter than the
+        watchdog's timeout (500 ms) or in the last 500 ms before an orderly stop: the watchdog
+        cannot reset the node there.
+        """
+        if self._proc is None or self._proc.poll() != EXIT_OK:
+            return None
+        try:
+            stats = self.stats()
+        except FileNotFoundError:
+            return None
+        return lost_kicks_in(stats, self.name)
 
     def stderr(self) -> str:
         """What the node wrote to stderr so far (fatal messages go there, not to the log)."""

@@ -66,12 +66,12 @@ response-time analysis below holds for any fixed priorities and is the verdict.
 |---|---|---|---|
 | CAN interrupt | `can_rx`, `can_tx` | task notification, one bit per cause (`xTaskNotifyFromISR`, `eSetBits`) | each task waits for "something for you" from one interrupt, with a few causes that may coincide. Bits in the notification value carry them without a kernel object per cause, and a bit set while the task is busy is still there when it next waits |
 | any producer | `can_tx` | the transmit queue ([lib/can/can_txq.h](../lib/can/can_txq.h)) in short critical sections, then a notification bit | a cyclic message needs a slot that keeps only the newest value, not a FIFO: a busy bus must delay data, not queue stale values. The queue is plain C shared by several tasks, so it is guarded by `taskENTER_CRITICAL` for the few instructions an operation takes, cheaper than a mutex for that length |
-| `sensor` | `process` | FreeRTOS queue of 4 samples (`app_sample_t`: lib/bms's `bms_sample_t` and the groups the front end did not answer, copied), statically allocated | a copy decouples the two in time and in memory: the sensor task can take the next sample while the last one is processed. The sensor task never waits for room (timeout 0): a full queue costs a sample, which is counted (`sample_queue.full`) and which lib/bms sees as a gap in the sequence numbers, but it never holds up the time base. The processing task waits with a timeout of 30 ms, three sensor periods: a timeout means the sensor task has stopped delivering, and is counted (`process.timeouts`), logged and judged as the fault SAMPLE_TIMEOUT |
+| `sensor` | `process` | FreeRTOS queue of 4 samples (`app_sample_t`: lib/bms's `bms_sample_t` and the groups the front end did not answer, copied), statically allocated | a copy decouples the two in time and in memory: the sensor task can take the next sample while the last one is processed. The sensor task never waits for room (timeout 0): a full queue costs a sample, which is counted (`sample_queue.full`) and which lib/bms sees as a gap in the sequence numbers, but it never holds up the time base. The processing task waits with a timeout of 30 ms, three sensor periods: a timeout means the sensor task has stopped delivering, and is counted (`process.timeouts`) and judged as the fault SAMPLE_TIMEOUT. The processing task makes no log call; the health task logs the start and the end of such a stall from its counts (`process.timeouts`, `process.recoveries`) |
 | `process` | `health` | the pack state (`bms_pack_t`) behind a mutex with priority inheritance | shared state that a reader must see whole, written by one task and read by another. The mutex is held only to run lib/bms on one sample or to copy the state, and frames are built from the copy outside the lock. While `health` (2) holds it, `process` (4) waiting for it lifts `health` to 4, so no task between them (`can_tx`) can prolong the wait |
 | `can_rx` | `process` | the telemetry switch, one `bool` read and written in critical sections | one word, set from TESTER_Command and read once per sample: a critical section around one load or store is the cheapest correct way |
-| `process` | `health` | a FreeRTOS queue of 32 verdicts on the samples (`fault_verdict_t`, 4 bytes, [app/fault.h](../app/fault.h)), statically allocated; the processing task never waits for room, a lost verdict is counted (`process.verdicts_lost`) | the DTCs have one owner, the health task; the processing task judges each sample where the data is and hands over the verdict in its order, so that the debouncing counts samples. The owner sits below `can_tx`: the DTC work in the processing task would have added to `can_tx`'s response time, which the analysis below does not allow (see [the task table](#the-result-for-the-nodes-task-table)) |
-| `health` | `process` | the summary of the DTCs (`fault_summary_t`), written after every health period and read once per sample in critical sections | PackFaultActive and PackState FAULT follow the active faults; a few words, like the telemetry switch |
-| `can_rx` | `health` | the count of clear requests of TESTER_Command, written and read in critical sections | the health task carries out a clear once per new count (`command_rx_t.clear_requests`) |
+| `process` | `health` | a FreeRTOS queue of 32 verdicts on the samples (`fault_verdict_t`, 8 bytes: two masks and the count of clear requests the processing task read as it posted the verdict, [app/fault.h](../app/fault.h)), statically allocated; the processing task never waits for room, a lost verdict is counted (`process.verdicts_lost`) | the DTCs have one owner, the health task; the processing task judges each sample where the data is and hands over the verdict in its order, so that the debouncing counts samples, and the count tells the health task which verdicts came after a clear request. The owner sits below `can_tx`: the DTC work in the processing task would have added to `can_tx`'s response time, which the analysis below does not allow (see [the task table](#the-result-for-the-nodes-task-table)) |
+| `health` | `process` | the summary of the DTCs (`fault_summary_t`), written after every health period and read once per sample in critical sections | PackFaultActive and PackState FAULT follow the faults active in the summary; a few words, like the telemetry switch |
+| `can_rx` | `process`, `health` | the count of clear requests of TESTER_Command, written and read in critical sections | the processing task tags each verdict with it, and the health task carries out a clear once per new count (`command_rx_t.clear_requests`), before the first verdict that carries it |
 | `sensor`, `process`, `can_rx`, `can_tx` | `health` | alive indications to the watchdog manager ([lib/wdgm](../lib/wdgm/wdgm.h)), one lock-free atomic addition each | a task that hangs stops counting; the health task examines the counts once per period and kicks the hardware watchdog only while the manager allows it |
 | every task | statistics | counters each written by one task only; the health task copies them at the end after raising itself to the highest priority | no task is in the middle of an update when they are read |
 
@@ -81,9 +81,12 @@ Every kernel object of the application is allocated statically (`xTaskCreateStat
 ## From a sample to a frame
 
 1. **Release.** `sensor` returns from `xTaskDelayUntil` at its period's tick (pdFALSE, a period
-   that started late, is counted in `sensor.overruns`).
-2. **Heartbeat.** It publishes BMS_Heartbeat first: the number of the period (from 1) and the
-   tick count, the status frame of phase 1 bit for bit, from transmit-queue slot 0.
+   that started late, is counted in `sensor.overruns`). After such an overrun it does not make
+   up the periods that have passed since: it skips them (`sensor.skipped_periods`) and runs the
+   period the tick is in, on the grid of its period.
+2. **Heartbeat.** It publishes BMS_Heartbeat first: the number of the period (from 1; a count of
+   the periods it ran, so that a skipped period leaves no gap) and the tick count, the status
+   frame of phase 1 bit for bit, from transmit-queue slot 0.
 3. **Acquisition.** It reads the front end ([plat_sensor.h](../platform/include/plat_sensor.h)):
    the current in every period, the cells in every second (sample numbers 0, 2, 4, ...), the
    temperatures in every tenth (0, 10, 20, ...). The sample is stamped with `plat_time_ns()` and
@@ -121,7 +124,7 @@ Every kernel object of the application is allocated statically (`xTaskCreateStat
 
 | Message | Sender | When | Switched off by CmdTelemetryOn = 0 |
 |---|---|---|---|
-| BMS_Fault 0x010 | health | every health period, 100 ms, after the period's last change of the DTCs: they change only in that job, so every change goes out at once. A fault of the pack values reaches its DTC in the first health period after the sample that decided it (at most 100 ms) | no |
+| BMS_Fault 0x010 | health | every health period, 100 ms, after the period's last change of the DTCs: they change only in that job, so every change goes out at once, and a fault that came and went within the period is active in its frame. A fault of the pack values reaches its DTC in the first health period after the sample that decided it (at most 100 ms) | no |
 | BMS_PackStatus 0x020 | process | every sample, 10 ms | yes |
 | BMS_Heartbeat 0x030 | sensor | first thing in every period, 10 ms | no |
 | BMS_CellVoltages1/2 0x040/0x041 | process | every sample with cells, 20 ms | yes |
@@ -131,7 +134,7 @@ Every kernel object of the application is allocated statically (`xTaskCreateStat
 | BMS_Pong 0x6F1 | can_rx | for every ping | no |
 
 The heartbeat comes from the sensor task because its two numbers describe that task: the
-number of its period and the tick it was released in. The sensor task is the highest-priority
+number of the period it runs and the tick it was released in. The sensor task is the highest-priority
 periodic task and is released by the tick alone, so the numbers keep the timing of phase 1's
 status frame. The frame reaches the bus only when `can_tx` loads it, and `can_tx` (3) runs below
 `process` (4): the heartbeat goes out after the processing job of its period, and a heartbeat on
@@ -149,8 +152,9 @@ alive, the hardware watchdog a health task that no longer kicks it (SUPERVISION 
 Profile 11 and the E2E state machine) and, at the end of every 100 ms receive cycle without a
 frame, checks with "no new data". A command is carried out only while the state machine is VALID
 and only for a new, intact frame; then CmdTelemetryOn becomes the telemetry switch, and a
-CmdClearFaultsSeq that differs from that of the command carried out before it is a request to
-clear the DTCs, which the health task carries out in its next period. The parameters and what
+CmdClearFaultsSeq that differs from that of the command carried out before it, in a stream that
+stayed VALID between the two, is a request to clear the DTCs, which the health task carries out
+in its next period, in order with the evidence ([faults.md](faults.md#the-fault-frame-bms_fault-0x010)). The parameters and what
 follows from them are in
 [can-protocol.md](can-protocol.md#the-nodes-receiver-of-tester_command). After a host stall the
 receive cycle makes one check for all the periods it missed and counts the others
@@ -188,8 +192,9 @@ node, rather than the tester, stood still.
   `kicks_withheld`, `hw_started`, `hw_timeout_ms`, and per entity its `status`, `examinations`,
   `incorrect`, `last_count`, the fewest and most alive indications in one cycle (`min_count`,
   `max_count`) and its configuration;
-- in `process`, `verdicts_posted` and `verdicts_lost`; in `command`, `clear_requests`; in
-  `can.driver`, `error_passive_entries`.
+- in `process`, `verdicts_posted`, `verdicts_lost` and `recoveries` (samples that came after a
+  timeout); in `sensor`, `skipped_periods` (the periods skipped after an overrun, which `periods`
+  does not count); in `command`, `clear_requests`; in `can.driver`, `error_passive_entries`.
 
 ## Schedulability
 
@@ -276,14 +281,19 @@ as app/task_table.c applies them:
   queue, at most 5 µs; the health task suspends the scheduler while `uxTaskGetSystemState()`
   reads the task list (20 µs); `process` and `health` share the pack mutex (40 and 10 µs).
 - **Phase 3** added to two budgets. `process`: the verdict on each sample for the fault monitor
-  and its post to the health task, 10 µs (150 → 160 µs). `health`: the supervision cycle and the
-  kick (17 µs), up to a queue full of verdicts worked into the DTCs (32 × 12 µs; the task takes
-  no more than that in one period), the CAN controller's monitors, a clear and the summary
-  (40 µs), BMS_Fault (25 µs), and log lines of 100 µs: one for every fault that changed in the
-  period, at most one per fault, one for a clear and one for the expiry of a supervised task
-  (18 × 100 µs): 300 → 2566 µs, most of it the log lines of a period in which every fault
-  changes, which does not happen; the health task is the lowest-priority task, so its budget
-  delays no other. The health task's
+  and its post to the health task, 10 µs (150 → 160 µs). The processing job makes no log call:
+  a log line costs 100 µs, more than `can_tx`'s margin below, so the lines about a stall of the
+  samples are the health task's, written from the processing task's counts. `health`: the
+  supervision cycle and the kick (17 µs), up to a queue full of verdicts worked into the DTCs
+  (32 × 21 µs: each taken out and its tag of clear requests compared, then up to nine reports
+  with the read of testFailed after each for the summary of the period; the task takes no more
+  than that in one period), up to a clear before each verdict and one after them (33 × 15 µs),
+  the CAN controller's counters and monitors and the summary (40 µs), BMS_Fault (25 µs), and
+  log lines of 100 µs: two for every fault, which can rise and fall within one period, one for
+  the clears, one for the expiry of a supervised task and two for a stall of the samples
+  (36 × 100 µs): 300 → 5149 µs, most of it the log lines of a period in which every fault
+  changes twice, which does not happen; the health task is the lowest-priority task, so its
+  budget delays no other. The health task's
   frames are spread over its periods (BMS_TaskStats in the odd ones, BMS_NodeInfo in every tenth),
   so a period publishes at most two and `can_tx`'s count of passes for it stays at two. The DTC
   work belongs to the health task and not to the processing task, the task that sees the
@@ -346,23 +356,23 @@ python -m fcn_tools.sched task_table.json
 ```
 
 ```
-Utilisation U = sum of C/T = 0.7452
+Utilisation U = sum of C/T = 0.7710
   necessary          U <= 1                                       holds
   Liu and Layland    U <= n(2^(1/n) - 1) = 0.7286 for n = 7       not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx; priorities not in rate-monotonic order
-  hyperbolic         prod(C/T + 1) = 1.9028 <= 2                  not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx; priorities not in rate-monotonic order
+  hyperbolic         prod(C/T + 1) = 1.9508 <= 2                  not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx; priorities not in rate-monotonic order
 
 Priority order (a higher number is more urgent)
   rate-monotonic      no: can_tx (T 1000, priority 3) is not above sensor (T 10000, priority 5) (and 1 more pair(s))
   deadline-monotonic  no: can_tx (D 1000, priority 3) is not above sensor (D 2000, priority 5) (and 1 more pair(s))
 
-  task      prio  kind           T       D     C     J   B     R  slack  job  verdict
-  can_irq      9  sporadic      47      47     2     0  20    22     25  1/1  meets
-  tick_irq     8  periodic    1000    1000     3     0  20    25    975  1/1  meets
-  can_rx       6  sporadic    1000    1000   169     0  20   202    798  1/1  meets
-  sensor       5  periodic   10000    2000   100     0  20   306   1694  1/1  meets
-  process      4  periodic   10000   10000   160  2000  25  2479   7521  1/1  meets
-  can_tx       3  sporadic    1000    1000   479     0  20   973     27  1/1  meets
-  health       2  periodic  100000  100000  2566     0   0  9920  90080  1/1  meets
+  task      prio  kind           T       D     C     J   B      R  slack  job  verdict
+  can_irq      9  sporadic      47      47     2     0  20     22     25  1/1  meets
+  tick_irq     8  periodic    1000    1000     3     0  20     25    975  1/1  meets
+  can_rx       6  sporadic    1000    1000   169     0  20    202    798  1/1  meets
+  sensor       5  periodic   10000    2000   100     0  20    306   1694  1/1  meets
+  process      4  periodic   10000   10000   160  2000  25   2479   7521  1/1  meets
+  can_tx       3  sporadic    1000    1000   479     0  20    973     27  1/1  meets
+  health       2  periodic  100000  100000  5149     0   0  19687  80313  1/1  meets
 
 Verdict: schedulable: every task meets its deadline
 ```
@@ -377,7 +387,7 @@ design budgets, every task meets its deadline. The smallest margin relative to i
 10 µs more of `can_tx`'s response). That margin is thin, and most of `can_tx`'s 479 µs is what
 its passes cost whatever they carry: 338 µs, 13 µs for each of 26. The processing task's
 response, 2479 µs from the tick, is mostly the 2000 µs of release jitter that the sensor task's
-deadline allows it. The health task's response, 9920 µs, is a tenth of its period. The largest
+deadline allows it. The health task's response, 19687 µs, is a fifth of its period. The largest
 blocking term, 20 µs, is the health task's scheduler suspension, which the analysis counts
 against the interrupts as well, a pessimistic choice for `vTaskSuspendAll()`, which does not
 mask interrupts.

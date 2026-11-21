@@ -23,14 +23,19 @@
  *     dropped, and the processing task sees the gap in the sequence numbers (lib/bms counts it
  *     as lost). The processing task waits for a sample with a timeout of
  *     APP_SAMPLE_TIMEOUT_MS: a timeout means the sensor task has stopped delivering
- *     (supervision), and is counted, logged and judged as a fault.
+ *     (supervision), and is counted and judged as a fault. The processing task writes no log
+ *     line (task_table.c): the health task logs the start and the end of such a stall from its
+ *     counts (log_sample_wait()).
  *   - the pack state (lib/bms) is behind a mutex with priority inheritance: written by the
  *     processing task, read by the health task for its log line and the final statistics.
  *     Both hold it only to run lib/bms on one sample or to copy the state; frames are built
  *     from the copy, outside the lock.
  *   - process -> health: a queue of APP_FAULT_VERDICT_QUEUE_LENGTH verdicts on the samples
- *     (fault_verdict_t, fault.h). The processing task never waits for room; a lost verdict is
- *     counted. The health task works them into the DTCs in their order once per period.
+ *     (fault_verdict_t, fault.h), each tagged with the count of clear requests the processing
+ *     task read when it handed the verdict over. The processing task never waits for room; a
+ *     lost verdict is counted. The health task works them into the DTCs in their order once per
+ *     period, and carries out a clear request before the first verdict that carries it
+ *     (run_faults()).
  *   - the DTCs (fault_monitor_t) have one owner, the health task: it alone works the verdicts
  *     in, judges the CAN controller and the watchdog manager, carries out clears and sends
  *     BMS_Fault. After every period it publishes the summary (fault_summary_t) in a critical
@@ -45,21 +50,24 @@
  *
  * WHO SENDS WHAT
  *   - BMS_Heartbeat: the sensor task, first thing in each of its periods. It is the status
- *     frame of phase 1, and its two numbers describe exactly that task: the number of its
- *     period and the tick it was released in. The sensor task is the highest-priority periodic
- *     task and is released by the tick alone, so the numbers keep the timing of phase 1's
- *     ticker. The frame reaches the bus only when can_tx loads it, and can_tx runs below the
- *     processing task: the frame goes out after the processing job of its period, and a
- *     heartbeat on the bus says that the sensor task and can_tx both run. A processing task
- *     that blocks shows on the bus by itself: its protected messages stop while the heartbeat
- *     goes on, and their receivers' E2E checks time out. A task that hangs or keeps the CPU is
- *     found by the watchdogs (SUPERVISION below).
+ *     frame of phase 1, and its two numbers describe exactly that task: the number of the
+ *     period it runs (a count of its passes, so that the periods it skipped after an overrun,
+ *     sensor_task(), leave no gap in it) and the tick it was released in. The sensor task is
+ *     the highest-priority periodic task and is released by the tick alone, so the numbers keep
+ *     the timing of phase 1's ticker. The frame reaches the bus only when can_tx loads it, and
+ *     can_tx runs below the processing task: the frame goes out after the processing job of
+ *     its period, and a heartbeat on the bus says that the sensor task and can_tx both run.
+ *     A processing task that blocks shows on the bus by itself: its protected messages stop
+ *     while the heartbeat goes on, and their receivers' E2E checks time out. A task that hangs
+ *     or keeps the CPU is found by the watchdogs (SUPERVISION below).
  *   - BMS_PackStatus, BMS_CellVoltages1/2, BMS_Temperatures: the processing task, for every
  *     sample that carries the measurements of the message (10, 20, 100 ms), protected end to
  *     end (telemetry.c), and only while the telemetry switch is on.
  *   - BMS_Fault: the health task, in every period, after the period's last change of the DTCs,
  *     protected end to end, whatever the telemetry switch says. Nothing else changes the DTCs,
- *     so every change goes out in the frame of the period that made it.
+ *     so every change goes out in the frame of the period that made it: a fault whose
+ *     testFailed rose in the period is active in its frame, even if it passed again before the
+ *     frame (fault.h, THE SUMMARY OF A PERIOD).
  *   - BMS_TaskStats, BMS_NodeInfo: the health task.
  *   - BMS_Pong: the receive task, as in phase 1.
  *
@@ -225,17 +233,34 @@ static const message_info_t s_messages[SLOTS] = {
  *   - sensor, process: one indication per pass, a pass per 10 ms (the process task's also on
  *     each timeout of its wait, every 30 ms, while the samples do not come): 10 expected, at
  *     most 20, twice the rate of its period, so that a task whose wait no longer waits (a loop
- *     that runs through xTaskDelayUntil or the queue at once) is found as well;
+ *     that runs through xTaskDelayUntil or the queue at once) is found as well. A task that
+ *     goes on after a stall stays below it. The sensor task does not make up the periods it
+ *     missed: it skips them and keeps the grid of its period (sensor_task()). Between two
+ *     examinations it makes a pass for each period of the grid that begins in between, and
+ *     after a stall at most two more (the end of the pass that stalled, and at once the pass
+ *     of the period the tick is in): 12 when the examinations are 100 ms apart, 14 when the
+ *     health task's response time (under 20 ms, task_table.c) puts them 120 ms apart. The
+ *     processing task, after a stall of its own, finds at most the APP_SAMPLE_QUEUE_LENGTH (4)
+ *     samples the queue held and then one per pass of the sensor task: at most 4 + 14 = 18;
+ *     its timeouts come only while no sample does;
  *   - can_rx, can_tx: a pass per wake-up, at least every 50 ms (can_io.h), at most one per
  *     frame on the bus (2200 per 100 ms at 1 Mbit/s, task_table.c): 2 expected and the largest
  *     upper bound a uint16_t margin gives, 65535; a lower bound only, in effect.
  * failed_tolerance 2: two failed cycles, net of good ones in between, are tolerated, so that one
- * pass of an event-driven task that slips past the end of a cycle is not taken for a hang. A
- * task that stops makes the first cycle that begins after its last indication incorrect, and
- * the third such cycle makes it EXPIRED (T + 1 = 3): 300 to 400 ms after the last indication
- * (lib/wdgm/wdgm.h: within T + 2 reference cycles). The kick of the cycle before was the last,
- * 200 to 300 ms after it, and the hardware watchdog resets the node APP_WDG_TIMEOUT_MS after
- * that kick: 700 to 800 ms after the last indication, plus the health task's response times.
+ * pass of an event-driven task that slips past the end of a cycle is not taken for a hang, and
+ * a task that stands still for up to two cycles and then goes on is not reset for it: the
+ * cycle in which it goes on is correct again (the upper bounds above), and the good cycles
+ * after it make the entity OK. Measured from the task's last indication before the stall to its
+ * first after it, a stall of less than 300 ms leaves at most two examinations without an
+ * indication, wherever it falls against the health task's period, and one of more than 400 ms
+ * leaves three; the health task's response time moves an examination by up to its worst case,
+ * and these figures by as much. A task that stops makes the first cycle that begins after its
+ * last indication incorrect, and the third such cycle makes it EXPIRED (T + 1 = 3): 300 to
+ * 400 ms after the last indication (lib/wdgm/wdgm.h: within T + 2 reference cycles). The kick
+ * of the cycle before was the last, 200 to 300 ms after it, and the hardware watchdog resets
+ * the node APP_WDG_TIMEOUT_MS after that kick: 700 to 800 ms after the last indication, plus
+ * the health task's response times. A task that goes on after the third incorrect cycle is
+ * reset all the same: STOPPED is final.
  */
 typedef enum {
     SUPERVISED_CAN_RX = 0,
@@ -365,18 +390,29 @@ static void publish(uint8_t slot, bool built, const can_frame_t *frame, uint64_t
     }
 }
 
-static bool telemetry_switch(void)
+/* The telemetry switch and the count of clear requests, as the receive task last left them. */
+static void command_outputs(bool *telemetry_on, uint32_t *clear_requests)
 {
-    bool on;
-
     taskENTER_CRITICAL();
-    on = s_telemetry_on;
+    *telemetry_on = s_telemetry_on;
+    *clear_requests = s_clear_requests;
     taskEXIT_CRITICAL();
-
-    return on;
 }
 
-/* Whether a DTC has testFailed, as of the health task's last period. */
+/* The count of clear requests alone, as the receive task last left it. */
+static uint32_t clear_requests_counted(void)
+{
+    uint32_t requests;
+
+    taskENTER_CRITICAL();
+    requests = s_clear_requests;
+    taskEXIT_CRITICAL();
+
+    return requests;
+}
+
+/* Whether a fault is active in the summary of the health task's last period: a DTC with
+ * testFailed, or one whose testFailed rose in that period (fault.h). */
 static bool fault_active(void)
 {
     bool active;
@@ -440,6 +476,26 @@ static void acquire(app_sample_t *out, uint32_t index)
     }
 }
 
+/*
+ * The sensor task's periods lie on a grid of APP_SENSOR_PERIOD_MS from its start. After an
+ * overrun, xTaskDelayUntil() has not waited and has moved `last_wake` on by one period, to the
+ * release that has passed already; a task that went on from there would make up every period
+ * it missed, back to back. It skips them instead: `last_wake` moves on by the whole periods
+ * that have passed since, to the start of the period the tick is in, so that this pass is that
+ * period's and the next one waits for the next period of the same grid. The periods skipped
+ * are counted (skipped_periods); they have no heartbeat and no sample, and the period counter
+ * and the sample index go on from the pass before, without a gap: they count passes.
+ */
+static void skip_missed_periods(TickType_t *last_wake)
+{
+    const TickType_t period = pdMS_TO_TICKS(APP_SENSOR_PERIOD_MS);
+    const TickType_t behind = (TickType_t)(xTaskGetTickCount() - *last_wake);
+    const TickType_t missed = behind / period;
+
+    *last_wake = (TickType_t)(*last_wake + (TickType_t)(missed * period));
+    s_sensor.skipped_periods += (uint32_t)missed;
+}
+
 static void sensor_task(void *arg)
 {
     TickType_t last_wake;
@@ -456,6 +512,7 @@ static void sensor_task(void *arg)
         /* pdFALSE: the release time had passed already, the last period overran. */
         if (xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(APP_SENSOR_PERIOD_MS)) == pdFALSE) {
             s_sensor.overruns++;
+            skip_missed_periods(&last_wake);
         }
 
         periods++;
@@ -531,6 +588,7 @@ static void process_sample(const app_sample_t *sample)
     bms_pack_t pack;
     fault_verdict_t verdict;
     bool telemetry_on;
+    uint32_t clear_requests;
     bool faults;
 
     (void)xSemaphoreTake(s_pack_mutex, portMAX_DELAY);
@@ -538,12 +596,15 @@ static void process_sample(const app_sample_t *sample)
     pack = s_pack;
     (void)xSemaphoreGive(s_pack_mutex);
 
-    /* The verdict on the faults, from the copy that this sample made. */
+    /* The verdict on the faults, from the copy that this sample made, tagged with the clear
+     * requests counted by now: the health task clears before it, for a request it has not
+     * carried out yet, and so keeps this evidence. */
+    command_outputs(&telemetry_on, &clear_requests);
     fault_judge_sample(&sample->bms, sample->unanswered, &pack, &verdict);
+    verdict.clear_requests = clear_requests;
     post_verdict(&verdict);
 
     s_process.samples++;
-    telemetry_on = telemetry_switch();
     faults = fault_active();
 
     /* Each message goes out with the samples that carry its measurements, stamped with the
@@ -584,8 +645,9 @@ static void process_task(void *arg)
                 s_process.backlog++;
             }
 
+            /* Counted, not logged: the health task writes the lines (log_sample_wait()). */
             if (timed_out) {
-                LOG_INF(TAG, "samples again after %lu timeouts", (unsigned long)s_process.timeouts);
+                s_process.recoveries++;
                 timed_out = false;
             }
 
@@ -595,13 +657,9 @@ static void process_task(void *arg)
 
             s_process.timeouts++;
             fault_judge_timeout(&verdict);
+            verdict.clear_requests = clear_requests_counted();
             post_verdict(&verdict);
-
-            if (!timed_out) {
-                LOG_WRN(TAG, "no sample from the sensor task for %u ms",
-                        (unsigned int)APP_SAMPLE_TIMEOUT_MS);
-                timed_out = true;
-            }
+            timed_out = true;
         }
 
         alive(SUPERVISED_PROCESS);
@@ -712,28 +770,99 @@ static void supervise(void)
 
 /* ------------------------------------------------------------------------------ faults */
 
-/* A line for every fault that became active or stopped being active in this period. */
-static void log_fault_changes(uint16_t before, uint16_t after)
+/* What the health task last saw of the processing task's wait for samples. */
+typedef struct {
+    uint32_t timeouts;
+    uint32_t recoveries;
+    bool stalled; /* the start of a stall is logged, its end not yet */
+} sample_wait_t;
+
+static sample_wait_t s_sample_wait;
+
+/*
+ * Health task context, once per period: the lines about the processing task's wait for samples,
+ * written from its counts, so that the processing job makes no log call (task_table.c). A stall
+ * begins with the first timeout after a sample and ends with the first sample after a timeout
+ * (s_process.recoveries). At most one line of each per period: two stalls that begin and end
+ * within one period are one pair of lines, and a stall that begins in the period in which the
+ * last one ended gets its first line in the next period.
+ */
+static void log_sample_wait(void)
+{
+    uint32_t timeouts;
+    uint32_t recoveries;
+
+    taskENTER_CRITICAL();
+    timeouts = s_process.timeouts;
+    recoveries = s_process.recoveries;
+    taskEXIT_CRITICAL();
+
+    const bool timed_out = timeouts != s_sample_wait.timeouts;
+    const bool recovered = recoveries != s_sample_wait.recoveries;
+
+    if ((timed_out || recovered) && !s_sample_wait.stalled) {
+        LOG_WRN(TAG, "no sample from the sensor task for %u ms",
+                (unsigned int)APP_SAMPLE_TIMEOUT_MS);
+        s_sample_wait.stalled = true;
+    }
+
+    if (recovered) {
+        LOG_INF(TAG, "samples again after %lu timeouts", (unsigned long)timeouts);
+        s_sample_wait.stalled = false;
+    }
+
+    s_sample_wait.timeouts = timeouts;
+    s_sample_wait.recoveries = recoveries;
+}
+
+/* A line for every change of a fault's testFailed in this period: a fault that became active,
+ * and one that stopped being active (by a pass or by a clear). A fault that did both in the
+ * period gets both lines, in the order its testFailed at the end implies (set: it stopped, then
+ * became active again). */
+static void log_fault_changes(const fault_changes_t *changes)
 {
     for (uint32_t event = 0U; event < (uint32_t)FAULT_EVENTS; event++) {
         const uint16_t mask = (uint16_t)(1UL << event);
-        const bool was = (before & mask) != 0U;
-        const bool is = (after & mask) != 0U;
+        const bool rose = (changes->rose & mask) != 0U;
+        const bool fell = (changes->fell & mask) != 0U;
+        const bool failed = (changes->failed & mask) != 0U;
 
-        if (is && !was) {
+        if (fell && (!rose || failed)) {
+            LOG_INF(TAG, "fault %s no longer active", fault_name(event));
+        }
+
+        if (rose) {
             LOG_WRN(TAG, "fault %s active (DTC 0x%06lX)", fault_name(event),
                     (unsigned long)fault_dtc_number(event));
-        } else if (was && !is) {
+        }
+
+        if (fell && rose && !failed) {
             LOG_INF(TAG, "fault %s no longer active", fault_name(event));
-        } else {
-            /* no change */
         }
     }
 }
 
-/* Health task context, after the supervision cycle: work the processing task's verdicts into
- * the DTCs in their order, judge the CAN controller and the watchdog manager, carry out a clear
- * request, publish the summary, and send BMS_Fault with it. */
+/*
+ * Health task context, after the supervision cycle: work the processing task's verdicts into
+ * the DTCs in their order, judge the CAN controller and the watchdog manager, carry out the
+ * clear requests, publish the summary, and send BMS_Fault with it.
+ *
+ * The clears in order with the evidence. A verdict carries the count of clear requests the
+ * processing task had read when it posted it, and fault_apply() clears before the first one
+ * that carries a request not carried out yet. A request that no verdict of this job carries
+ * is carried out after the verdicts, before the health task's own monitors. Their inputs are
+ * read first, then the count, so that every request counted before the inputs were read is
+ * carried out before the inputs are worked in: a clear erases nothing the inputs show after
+ * its request. They show what happened since the last period, though, and cannot tell what of
+ * it came before the request: a bus-off or an entry into error passive between the last
+ * period and the request survives the clear. The count is read before the queue is
+ * emptied: every verdict posted later carries it or a newer one, since the processing task,
+ * above this one, does not block between reading the count and posting the verdict. The job
+ * takes up to as many verdicts as the queue holds, so a verdict it leaves for the next period
+ * was posted after the count was read; the queue is FIFO and the count only grows, so the tags
+ * never go back, and no verdict left for the next period comes from before a clear of this
+ * one.
+ */
 static void run_faults(void)
 {
     fault_verdict_t verdict;
@@ -741,15 +870,19 @@ static void run_faults(void)
     can_txq_stats_t queue;
     plat_can_status_t controller;
     fault_summary_t summary;
-    uint16_t before;
-    uint32_t clear_requests;
+    fault_changes_t changes;
     can_frame_t frame;
     bool more = true;
+    const uint32_t clears = s_faults.clears;
 
-    taskENTER_CRITICAL();
-    before = s_fault_summary.active;
-    clear_requests = s_clear_requests;
-    taskEXIT_CRITICAL();
+    can_io_get_stats(&io, &queue);
+    plat_can_get_status(&controller);
+
+    const fault_health_inputs_t inputs = {.bus_off_count = queue.bus_off_count,
+                                          .error_passive_entries = io.error_passive_entries,
+                                          .can_state = (can_fc_state_t)controller.state,
+                                          .supervision = wdgm_global_status(&s_wdgm)};
+    const uint32_t clear_requests = clear_requests_counted();
 
     /* At most a queue full in one period, so that the job has a bound (task_table.c): what the
      * processing task posts meanwhile waits for the next period, in its order. */
@@ -761,23 +894,16 @@ static void run_faults(void)
         }
     }
 
-    can_io_get_stats(&io, &queue);
-    plat_can_get_status(&controller);
-
-    const fault_health_inputs_t inputs = {.bus_off_count = queue.bus_off_count,
-                                          .error_passive_entries = io.error_passive_entries,
-                                          .can_state = (can_fc_state_t)controller.state,
-                                          .supervision = wdgm_global_status(&s_wdgm)};
-
+    (void)fault_clear_if_requested(&s_faults, clear_requests);
     fault_health_cycle(&s_faults, &inputs);
 
-    if (fault_clear_if_requested(&s_faults, clear_requests)) {
+    if (s_faults.clears != clears) {
         LOG_INF(TAG, "DTCs cleared: CmdClearFaultsSeq changed (clear %lu)",
                 (unsigned long)s_faults.clears);
     }
 
-    fault_summary(&s_faults, &summary);
-    log_fault_changes(before, summary.active);
+    fault_summary(&s_faults, &summary, &changes);
+    log_fault_changes(&changes);
 
     taskENTER_CRITICAL();
     s_fault_summary = summary;
@@ -797,7 +923,8 @@ static uint32_t overruns_of(const char *name)
     taskENTER_CRITICAL();
 
     if (strcmp(name, "sensor") == 0) {
-        overruns = s_sensor.overruns;
+        /* The periods it missed: those that overran, and those it skipped after them. */
+        overruns = s_sensor.overruns + s_sensor.skipped_periods;
     } else if (strcmp(name, "process") == 0) {
         overruns = s_process.backlog;
     } else if (strcmp(name, "health") == 0) {
@@ -1016,6 +1143,7 @@ static void health_task(void *arg)
 
         /* First the supervision and the kick, at the same point of every period. */
         supervise();
+        log_sample_wait();
         run_faults();
 
         if ((cycles % APP_TASK_STATS_EVERY) == 1U) {
@@ -1043,6 +1171,7 @@ static void health_task(void *arg)
 void app_start(const app_config_t *config)
 {
     const plat_reset_reason_t cause = plat_reset_cause();
+    fault_changes_t start_changes;
     bool ok;
 
     s_config = *config;
@@ -1054,9 +1183,10 @@ void app_start(const app_config_t *config)
     s_clear_requests = command_clear_requests(&s_command);
 
     /* The DTCs, with the reset faults judged from this start's cause, and their summary, so
-     * that the first BMS_PackStatus already says whether one is active. */
+     * that the first BMS_PackStatus already says whether one is active. A reset fault is
+     * active from the start, not a change: no line for it (the reset cause has one, below). */
     ok = fault_init(&s_faults, cause);
-    fault_summary(&s_faults, &s_fault_summary);
+    fault_summary(&s_faults, &s_fault_summary, &start_changes);
     ok = ok && (e2e_p11_protect_init(&s_fault_counter) == E2E_E_OK);
 
     if (cause != PLAT_RESET_POWER_ON) {

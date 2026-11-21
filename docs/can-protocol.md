@@ -84,7 +84,7 @@ are the entries of the signal's value table as raw value and name.
 |---|---|---|---|---|---|---|---|---|---|
 | E2E_Crc | 0 | 8 | unsigned | 1 | 0 |  | 0..255 |  | E2E CRC |
 | E2E_Counter | 8 | 4 | unsigned | 1 | 0 |  | 0..14 |  | E2E counter |
-| FaultActive | 16 | 16 | unsigned | 1 | 0 |  | 0..65535 |  | bit n: the DTC of fault n has testFailed, the fault is present |
+| FaultActive | 16 | 16 | unsigned | 1 | 0 |  | 0..65535 |  | bit n: the DTC of fault n has testFailed at the end of the period, or its testFailed rose during it (after the clear, in the period of a clear): the fault is present, or was since the last frame |
 | FaultConfirmed | 32 | 16 | unsigned | 1 | 0 |  | 0..65535 |  | bit n: the DTC of fault n has confirmedDTC, the fault occurred since the start or the last clear |
 | FaultMostRecent | 48 | 5 | unsigned | 1 | 0 |  | 0..15 | 0 CELL_OVERVOLTAGE, 1 CELL_UNDERVOLTAGE, 2 OVERTEMPERATURE, 3 UNDERTEMPERATURE, 4 OVERCURRENT_DISCHARGE, 5 OVERCURRENT_CHARGE, 6 SENSOR_CHANNEL_INVALID, 7 FRONT_END_NO_ANSWER, 8 SAMPLE_TIMEOUT, 9 CAN_BUS_OFF, 10 CAN_ERROR_PASSIVE, 11 SUPERVISION_EXPIRED, 12 RESET_WATCHDOG, 13 RESET_ASSERT, 14 RESET_STACK_OVERFLOW, 15 RESET_MALLOC_FAILED, 31 NONE | the fault whose DTC went to testFailed most recently since the start or the last clear |
 | FaultWarning | 53 | 1 | unsigned | 1 | 0 |  | 0..1 |  | a DTC requests the warning indicator: a fault of the pack's limits or its measurement occurred |
@@ -94,7 +94,8 @@ Fault *n* is entry *n* of FaultMostRecent's value table; [app/fault.h](../app/fa
 DTC number of each, and the application checks every entry against its own numbering at compile
 time. Bits 12 to 15, 54 and 55 are unused. The node's health task, the one task that changes
 the DTCs, sends the message once in each of its 100 ms periods, after the last change it made in
-the period: every change of the DTCs goes out in the frame of the period that made it. It is
+the period: every change of the DTCs goes out in the frame of the period that made it, and a
+fault that became active and passed again within the period is active in that frame. It is
 protected under Data ID 0x0110 (see [End-to-end protection](#end-to-end-protection)) and is not
 switched off by CmdTelemetryOn. [faults.md](faults.md) describes the faults, their DTCs and how
 a tester clears them.
@@ -108,7 +109,7 @@ a tester clears them.
 | PackCurrent | 16 | 16 | signed | 0.01 | 0 | A | -327.68..327.67 |  | filtered, positive while discharging; valid only if PackCurrentValid |
 | PackVoltage | 32 | 16 | unsigned | 0.001 | 0 | V | 0..65.535 |  | sum of the filtered cells; valid only if PackVoltageValid |
 | PackState | 48 | 2 | unsigned | 1 | 0 |  | 0..2 | 0 STARTUP, 1 NORMAL, 2 FAULT | STARTUP until every channel has delivered a reading, FAULT while one is invalid or a fault is active |
-| PackFaultActive | 50 | 1 | unsigned | 1 | 0 |  | 0..1 |  | a fault is active: a bit of BMS_Fault's FaultActive is set |
+| PackFaultActive | 50 | 1 | unsigned | 1 | 0 |  | 0..1 |  | a fault is active: a bit of FaultActive is set in the last BMS_Fault (a DTC had testFailed at the end of that period, or its testFailed rose during it) |
 | PackCurrentValid | 51 | 1 | unsigned | 1 | 0 |  | 0..1 |  | PackCurrent holds a valid measurement |
 | PackVoltageValid | 52 | 1 | unsigned | 1 | 0 |  | 0..1 |  | every cell is valid, so PackVoltage is their sum |
 
@@ -118,7 +119,7 @@ Bits 12 to 15 (the high nibble of byte 1) and 53 to 63 are unused.
 
 | Signal | Start bit | Length | Type | Factor | Offset | Unit | Range | Values | Meaning |
 |---|---|---|---|---|---|---|---|---|---|
-| PeriodCounter | 0 | 32 | unsigned | 1 | 0 |  | 0..4294967295 |  | 10 ms periods since the start; the first frame carries 1 |
+| PeriodCounter | 0 | 32 | unsigned | 1 | 0 |  | 0..4294967295 |  | 10 ms periods the node has run since the start; the first frame carries 1. A period skipped after an overrun is not counted, so the counter never jumps; TickCount shows the time |
 | TickCount | 32 | 32 | unsigned | 1 | 0 | tick | 0..4294967295 |  | the node's tick count when the frame was published (1 tick = 1 ms) |
 
 This is the status frame of phase 1 bit for bit: bytes 0 to 3 and 4 to 7, each a 32-bit
@@ -171,7 +172,7 @@ counts it as superseded.
 | E2E_Crc | 0 | 8 | unsigned | 1 | 0 |  | 0..255 |  | E2E CRC |
 | E2E_Counter | 8 | 4 | unsigned | 1 | 0 |  | 0..14 |  | E2E counter |
 | CmdTelemetryOn | 16 | 1 | unsigned | 1 | 0 |  | 0..1 |  | 0 silences the protected cyclic messages (0x020, 0x040, 0x041, 0x050); the others go on. 1 until a valid command has been carried out |
-| CmdClearFaultsSeq | 24 | 8 | unsigned | 1 | 0 |  | 0..255 |  | the node clears its DTCs when it changes between two commands it carries out |
+| CmdClearFaultsSeq | 24 | 8 | unsigned | 1 | 0 |  | 0..255 |  | the node clears its DTCs when it changes between two commands it carries out while the stream stays valid; the first command carried out after the stream started or was lost only sets the reference |
 
 ### 0x600 BMS_TaskStats
 
@@ -396,7 +397,16 @@ state machine is VALID and the frame itself was new and intact (OK or OKSOMELOST
 frame, one out of sequence, a damaged one, one with another Data ID or another length, and
 every frame while the state machine is NODATA, INIT or INVALID are counted and ignored. Before
 the first command carried out the telemetry is on; afterwards it keeps the last command's
-CmdTelemetryOn, also after a timeout. The node's statistics (`--stats-json`, `"command"`) count
+CmdTelemetryOn, also after a timeout. A change of CmdClearFaultsSeq from one command carried
+out to the next is a request to clear the DTCs only while the state machine stayed VALID
+between the two: the first command carried out after the stream started, or after any step
+that left it not VALID, sets the reference and requests nothing, so that another tester, or a
+pack master after its own reset, does not clear the node's DTCs by starting once its stream
+has been lost. A sender whose stream is not lost in between, one that is silent for at most
+one period (two, if its E2E counter happens to go on in sequence), is taken for the one before
+it: a pack master that resets that quickly and comes back with another value requests a
+clear. A tester that changed its value while its stream was lost sees FaultClearCount
+unchanged in BMS_Fault and changes it again. The node's statistics (`--stats-json`, `"command"`) count
 every status, the checks, the commands carried out and ignored, and give the state machine's
 state. [tests/system/test_telemetry.py](../tests/system/test_telemetry.py) sends each kind of
 bad frame and a stream that stops, and checks those counts exactly.

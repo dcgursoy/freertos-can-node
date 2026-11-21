@@ -464,6 +464,7 @@ def run(request, transport, port_allocator, node_binary, artifacts_root) -> Reco
         ports.release()
     assert status == EXIT_OK, node.stderr()
     assert node.stderr() == "", node.stderr()
+    assert node.lost_kicks() is None, node.lost_kicks()  # as tests/conftest.py checks its nodes
     return Recording(spec=spec, seconds=RUN_SECONDS, frames=frames, stats=node.stats(),
                      workdir=workdir)
 
@@ -484,11 +485,13 @@ def test_every_cyclic_message_is_sent_as_often_as_its_cycle_time_and_the_ticks_s
     assert all(frame is not None and frame.error is None for frame in run.all_decoded)
     assert {frame.name for frame in run.all_decoded} == set(CYCLIC)
 
-    # The node's time: the sensor task ran a period for every 10 ticks, at least until the
-    # health task's last period ended (both started at tick 0 or just after it, the sensor
-    # task first), and every heartbeat carries a tick count that is at most the final one.
-    assert health_periods * HEALTH_PERIOD_MS // SENSOR_PERIOD_MS <= periods
-    assert periods * SENSOR_PERIOD_MS <= stats["tick"]["count"]
+    # The node's time: the sensor task ran a period for every 10 ticks, or skipped it after an
+    # overrun (app/app.c, sensor_task()), at least until the health task's last period ended
+    # (both started at tick 0 or just after it, the sensor task first), and every heartbeat
+    # carries a tick count that is at most the final one.
+    grid = periods + sensor["skipped_periods"]
+    assert health_periods * HEALTH_PERIOD_MS // SENSOR_PERIOD_MS <= grid
+    assert grid * SENSOR_PERIOD_MS <= stats["tick"]["count"]
     heartbeats = [frame for frame in run.frames if is_status(frame)]
     assert all(status_fields(frame)[1] <= stats["tick"]["count"] for frame in heartbeats)
     assert all(v.frame.raw["UptimeSeconds"] <= stats["tick"]["count"] // 1000
@@ -1123,6 +1126,9 @@ def test_a_command_stream_that_stops_is_not_trusted_until_it_has_proved_itself_a
     assert command_stats["accepted"] == 4 and command_stats["ignored"] == 4
     assert command_stats["sm_state"] == "VALID"
     assert command_stats["telemetry_on"] is False and command_stats["clear_faults_seq"] == 2
+    # The first command carried out after the stream was lost only set the reference: the
+    # tester's change of CmdClearFaultsSeq while it was away (1 to 2) requested no clear.
+    assert command_stats["clear_requests"] == 0 and stats["faults"]["clears"] == 0
 
 
 # ------------------------------------------------------------------------------ the monitor

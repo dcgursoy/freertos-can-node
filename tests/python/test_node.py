@@ -4,9 +4,12 @@ small shell scripts that end the way a node can end. (tests/python/test_harness.
 that the fixtures of tests/conftest.py act on what NodeProcess reports.)
 
 What depends on it: a system test of the form "the node must not send X" passes against a
-node that died at once, unless a death the test did not look at fails the test."""
+node that died at once, unless a death the test did not look at fails the test; and a node
+whose kicks never reach the hardware watchdog passes every run shorter than the watchdog's
+timeout, unless the statistics of the run are checked (lost_kicks())."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -40,6 +43,12 @@ STAND_INS = {
                 '  if [ "$1" = --stats-json ]; then echo \'{"schema": "stand-in"}\' > "$2"; fi\n'
                 '  shift\n'
                 'done\n'),
+    # Writes $STAND_IN_STATS as its statistics and ends with status $STAND_IN_STATUS (0).
+    "writes_stats": ('while [ $# -gt 0 ]; do\n'
+                     '  if [ "$1" = --stats-json ]; then printf %s "$STAND_IN_STATS" > "$2"; fi\n'
+                     '  shift\n'
+                     'done\n'
+                     'exit "${STAND_IN_STATUS:-0}"\n'),
 }
 
 
@@ -274,6 +283,80 @@ def test_a_new_start_forgets_that_a_reset_was_waited_for(stand_in, started):
     node.start()
     assert node.wait(timeout=10) == 20
     assert "status 20" in (node.unexpected_reset() or "")
+
+
+# -------------------------------------------------------------------------- lost kicks
+
+
+def kick_stats(started=True, hw_kicks=20, kicks=20, withheld=0, cycles=20) -> str:
+    """Statistics as the node writes them, with only what lost_kicks() reads: by default those
+    of a 2 s run whose 20 supervision cycles each ended with a kick."""
+    return json.dumps({"hw_watchdog": {"started": started, "kicks": hw_kicks},
+                       "watchdog_manager": {"kicks": kicks, "kicks_withheld": withheld,
+                                            "cycles": cycles}})
+
+
+def ended_run(stand_in, started, monkeypatch, stats: str, status: int = 0,
+              name: str = "node") -> NodeProcess:
+    """A stand-in run that wrote `stats` and ended with `status`, waited for."""
+    monkeypatch.setenv("STAND_IN_STATS", stats)
+    monkeypatch.setenv("STAND_IN_STATUS", str(status))
+    node = started(stand_in("writes_stats"), name=name)
+    assert node.wait(timeout=10) == status
+    return node
+
+
+@pytest.mark.parametrize("stats", [
+    kick_stats(),
+    # A withheld kick (an expired supervision) is a decision too: 17 kicks, 3 withheld.
+    kick_stats(hw_kicks=17, kicks=17, withheld=3),
+], ids=["all_kicked", "kicks_withheld"])
+def test_an_orderly_run_whose_kicks_all_reached_the_watchdog_lost_none(stand_in, started,
+                                                                       monkeypatch, stats):
+    assert ended_run(stand_in, started, monkeypatch, stats).lost_kicks() is None
+
+
+@pytest.mark.parametrize("stats, shown", [
+    # The health task kicked, the watchdog counted none: the kick went nowhere.
+    (kick_stats(hw_kicks=0), "started True, 0 kicks counted by the watchdog, 20 decided on"),
+    # One kick the watchdog counted that the health task did not decide on.
+    (kick_stats(hw_kicks=21), "21 kicks counted by the watchdog, 20 decided on"),
+    (kick_stats(started=False), "started False"),
+    # A supervision cycle without a decision, or one decision too many.
+    (kick_stats(cycles=21), "20 decided on and 0 withheld by the health task in 21 "
+                            "supervision cycles"),
+    (kick_stats(hw_kicks=19, kicks=19, withheld=2), "19 decided on and 2 withheld"),
+], ids=["kick_lost", "kick_from_elsewhere", "not_started", "cycle_without_decision",
+        "decision_too_many"])
+def test_an_orderly_run_with_a_kick_missing_is_reported_with_its_counts(stand_in, started,
+                                                                         monkeypatch, stats,
+                                                                         shown):
+    problem = ended_run(stand_in, started, monkeypatch, stats).lost_kicks()
+    assert problem is not None and problem.startswith("node lost kicks of the hardware watchdog")
+    assert shown in problem
+
+
+def test_statistics_without_the_kick_counts_are_reported(stand_in, started, monkeypatch):
+    problem = ended_run(stand_in, started, monkeypatch, '{"schema": "stand-in"}').lost_kicks()
+    assert problem == "node wrote statistics without 'hw_watchdog': its kicks cannot be checked"
+
+
+def test_only_a_run_that_ended_in_order_with_statistics_is_checked(stand_in, started,
+                                                                    monkeypatch):
+    # Counts that are a lost kick in an orderly run (above), here after a reset (20) and a
+    # start-up error (1), which end no run in order.
+    lost = kick_stats(hw_kicks=0)
+    assert ended_run(stand_in, started, monkeypatch, lost, status=20).lost_kicks() is None
+    assert ended_run(stand_in, started, monkeypatch, lost, status=1,
+                     name="refused").lost_kicks() is None
+    clean = started(stand_in("clean"), name="clean")       # status 0, no statistics
+    assert clean.wait(timeout=10) == 0 and clean.lost_kicks() is None
+    running = started(stand_in("runs"), name="running")
+    wait_until_ready(running)
+    assert running.lost_kicks() is None
+    running.kill()
+    assert running.lost_kicks() is None
+    assert NodeProcess(workdir=Path("never-started")).lost_kicks() is None
 
 
 def test_a_missing_binary_is_reported_before_anything_starts(tmp_path):

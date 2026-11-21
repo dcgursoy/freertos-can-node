@@ -45,7 +45,7 @@
  * or interrupt, also concurrently, as long as no two calls write the same buffer.
  *
  * GENERATED FILE, DO NOT EDIT. The interface of the codec. Made by tools/gen_can_db.py from
- * dbc/fcn.dbc, SHA-256 3c885b001d6267703e6d18cb32aab9cfacdde26aa433f84e84d764b504a57dfe.
+ * dbc/fcn.dbc, SHA-256 3da8310bc4c08d0cda27c7ed24a837228262a8bab37b153ed4b11f5c754144a9.
  *
  * After a change of the DBC, run scripts/codegen-check.sh --update. Without --update the script
  * fails while this file is out of date; CI and scripts/check.sh run it.
@@ -62,7 +62,8 @@
  * 11A), Data ID 0x0110; the CRC of the Data ID bytes is 0xA9.
  * The node's diagnostic trouble codes, every 100 ms, sent by the task that owns them after the last
  * change it made in the period, so that every change goes out in the frame of the period that made
- * it. Protected end to end. Fault n (the value table of FaultMostRecent, app/fault.h) is bit n of
+ * it: a fault that became active and passed again within the period is active in that frame.
+ * Protected end to end. Fault n (the value table of FaultMostRecent, app/fault.h) is bit n of
  * FaultActive and FaultConfirmed.
  * ---------------------------------------------------------------------------------------------- */
 #define CAN_DB_BMS_FAULT_ID            0x010U
@@ -99,8 +100,9 @@
 
 /*
  * FaultActive: bits 16..31 (16 bits, unsigned); raw 0..65535; physical = raw, range 0..65535. Bit
- * n: the DTC of fault n has testFailed (ISO 14229-1 status bit 0), the fault is present now.
- * PackFaultActive is 1 while any bit is.
+ * n: the DTC of fault n has testFailed (ISO 14229-1 status bit 0) at the end of the period, or its
+ * testFailed rose during the period (after the clear, if the period had one): the fault is present,
+ * or was present since the last frame. PackFaultActive is 1 while any bit is.
  */
 #define CAN_DB_BMS_FAULT_FAULT_ACTIVE_START      16U
 #define CAN_DB_BMS_FAULT_FAULT_ACTIVE_LENGTH     16U
@@ -293,7 +295,8 @@ bool can_db_bms_fault_unpack(can_db_bms_fault_t *msg, const uint8_t *data, size_
 
 /*
  * PackFaultActive: bit 50 (1 bit, unsigned); raw 0..1; physical = raw, range 0..1. 1 while a fault
- * is active: a bit of BMS_Fault's FaultActive is set.
+ * is active: a bit of FaultActive is set in the last BMS_Fault, so a DTC had testFailed at the end
+ * of the fault owner's last 100 ms period or its testFailed rose during it.
  */
 #define CAN_DB_BMS_PACK_STATUS_PACK_FAULT_ACTIVE_START      50U
 #define CAN_DB_BMS_PACK_STATUS_PACK_FAULT_ACTIVE_LENGTH     1U
@@ -369,7 +372,9 @@ bool can_db_bms_pack_status_unpack(can_db_bms_pack_status_t *msg, const uint8_t 
 
 /*
  * PeriodCounter: bits 0..31 (32 bits, unsigned); raw 0..4294967295; physical = raw, range
- * 0..4294967295. Number of 10 ms periods since the node started; the first frame carries 1.
+ * 0..4294967295. Number of 10 ms periods the node has run since it started; the first frame carries
+ * 1. A period it skipped after an overrun is not counted, so the counter never jumps; TickCount
+ * shows the time.
  */
 #define CAN_DB_BMS_HEARTBEAT_PERIOD_COUNTER_START      0U
 #define CAN_DB_BMS_HEARTBEAT_PERIOD_COUNTER_LENGTH     32U
@@ -823,7 +828,9 @@ bool can_db_bms_temperatures_unpack(can_db_bms_temperatures_t *msg, const uint8_
 
 /*
  * CmdClearFaultsSeq: bits 24..31 (8 bits, unsigned); raw 0..255; physical = raw, range 0..255. The
- * node clears its DTCs whenever this value changes from one command it carries out to the next.
+ * node clears its DTCs whenever this value changes from one command it carries out to the next
+ * while the command stream stays valid; the first command carried out after the stream started or
+ * was lost only sets the reference.
  */
 #define CAN_DB_TESTER_COMMAND_CMD_CLEAR_FAULTS_SEQ_START      24U
 #define CAN_DB_TESTER_COMMAND_CMD_CLEAR_FAULTS_SEQ_LENGTH     8U

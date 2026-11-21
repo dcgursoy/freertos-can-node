@@ -119,7 +119,12 @@ _Static_assert(BUS_FRAMES_PER_TICK == 22U, "at most 22 frames end on the bus in 
 
 /* process: the sample out of the queue 10 us, lib/bms under the mutex 40 us, up to four frames
  * built, protected and published 25 us each, the verdict on the faults (fault_judge_sample(),
- * a comparison per reading) 5 us and the verdict into the health task's queue 5 us. */
+ * a comparison per reading) 5 us and the verdict (8 bytes, tagged with the count of clear
+ * requests read with the telemetry switch) into the health task's queue 5 us. The processing
+ * job makes no log call: a line is 100 us (the health task's budget below), more than can_tx's
+ * margin, so the lines about the processing task's wait for samples are written by the health
+ * task from its counts (app.c, log_sample_wait()). A job after a timeout of the wait is shorter:
+ * the verdict alone. */
 #define PROCESS_WCET_US 160U
 #define PACK_MUTEX_US   40U /* the processing task's longest hold of the pack mutex */
 #define CRITICAL_US     5U  /* the longest critical section around the transmit queue */
@@ -157,21 +162,31 @@ _Static_assert(TX_EVENTS_PER_TICK == 47U, "can_tx: 2 x 22 + 3 events in any 1000
  * two frames 30 us, a log line 100 us, the rest 50 us: 300 us. Phase 3 adds:
  *   - the supervision cycle of four entities 15 us, the kick 2 us;
  *   - the verdicts: at most APP_FAULT_VERDICT_QUEUE_LENGTH per period (app.c takes no more in
- *     one job), each taken out of the queue (3 us) and worked into up to nine DTCs (1 us
- *     each): 12 us per verdict;
- *   - the CAN controller's counters and state 10 us, its monitors and a clear 10 us, the
- *     summary of 16 DTCs 20 us, BMS_Fault built, protected and published 25 us;
- *   - log lines at 100 us each: one for each fault that changed, at most one per fault, one
- *     for a clear and one for the expiry of a supervised task (once per run).
- * The log lines are the largest term, and a period in which every fault changes does not
+ *     one job), each taken out of the queue and its tag of clear requests compared (3 us) and
+ *     worked into up to nine DTCs (2 us each: the report, and the read of the DTC's testFailed
+ *     after it for the summary of the period): 21 us per verdict;
+ *   - the clears: at most one before each verdict and one after the last (a tester that changes
+ *     CmdClearFaultsSeq with every command), 15 us each: every DTC cleared and the testFailed
+ *     bits it ends noted;
+ *   - the CAN controller's counters and state 10 us, its monitors 10 us, the summary of 16
+ *     DTCs 20 us, BMS_Fault built, protected and published 25 us;
+ *   - log lines at 100 us each: two for each fault, as one that rose and fell (or fell and
+ *     rose) in the period has both, one for the clears, one for the expiry of a supervised task
+ *     (once per run), and the two about the processing task's wait for samples (a stall that
+ *     began, one that ended), which it does not write itself (PROCESS_WCET_US above).
+ * The log lines are the largest term, and a period in which every fault changes twice does not
  * happen; the health task is the lowest-priority task, so its budget delays no other task. */
-#define HEALTH_LOG_LINES ((uint32_t)FAULT_EVENTS + 2U)
+#define HEALTH_LOG_LINES  ((2U * (uint32_t)FAULT_EVENTS) + 1U + 1U + 2U)
+#define HEALTH_VERDICT_US (3U + (9U * 2U))
+#define HEALTH_CLEARS     (APP_FAULT_VERDICT_QUEUE_LENGTH + 1U)
 #define HEALTH_FAULT_WORK_US                                                                       \
-    (15U + 2U + (APP_FAULT_VERDICT_QUEUE_LENGTH * 12U) + 10U + 10U + 20U + 25U +                   \
-     (HEALTH_LOG_LINES * 100U))
+    (15U + 2U + (APP_FAULT_VERDICT_QUEUE_LENGTH * HEALTH_VERDICT_US) + (HEALTH_CLEARS * 15U) +     \
+     10U + 10U + 20U + 25U + (HEALTH_LOG_LINES * 100U))
 #define HEALTH_WCET_US (300U + HEALTH_FAULT_WORK_US)
 
-_Static_assert(HEALTH_WCET_US == 2566U, "health: 300 us + the fault work of phase 3");
+_Static_assert(HEALTH_LOG_LINES == 36U, "health: 2 x 16 fault lines, the clears, the expiry, "
+                                        "and the 2 lines of the processing task's wait");
+_Static_assert(HEALTH_WCET_US == 5149U, "health: 300 us + the fault work of phase 3");
 #define HEALTH_SUSPENDED_US  20U
 #define HEALTH_PACK_MUTEX_US 10U /* a copy of the pack state */
 

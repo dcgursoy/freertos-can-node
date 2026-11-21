@@ -43,7 +43,7 @@ import can
 import pytest
 
 from fcn_tools import e2e
-from fcn_tools.bus import open_bus
+from fcn_tools.bus import ID_PING, open_bus
 from fcn_tools.decode import DecodedFrame, Decoder, load_database
 from fcn_tools.node import EXIT_OK, RESET_WATCHDOG, NodeProcess
 from fcn_tools.simctl import SimControl
@@ -135,7 +135,9 @@ def check_dtcs(stats: dict, expected: dict[str, set[int] | int]) -> dict[str, di
     counter within its thresholds and its fault detection counter mapped from it, the status
     byte `expected` gives for the DTCs a test made fail (one value or a set of them), and for
     every other DTC no bit that only a failed test sets; and the summary agrees with the
-    bytes. Returns the DTCs by name."""
+    bytes. (The summary also has a fault active whose testFailed rose in the last health period
+    and fell again; the tests stop the node after a steady period, in which none did.)
+    Returns the DTCs by name."""
     dtcs = {entry["name"]: entry for entry in stats["faults"]["dtcs"]}
     assert list(dtcs) == list(SPEC)
     active = confirmed = 0
@@ -268,19 +270,33 @@ class CommandTester:
         self._bus = open_bus(spec)
         self._sender = e2e.Sender(e2e.Config(data_id=Decoder(DB).protected[ID[COMMAND]],
                                              data_length=64))
+        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
+    def _send(self) -> None:
+        payload = DB.encode_message(COMMAND, {"E2E_Crc": 0, "E2E_Counter": 0,
+                                              "CmdTelemetryOn": 1,
+                                              "CmdClearFaultsSeq": self.seq})
+        data = self._sender.protect(payload)
+        self._bus.send(can.Message(arbitration_id=ID[COMMAND], data=data, is_extended_id=False))
+
     def _run(self) -> None:
         while not self._stop.is_set():
-            payload = DB.encode_message(COMMAND, {"E2E_Crc": 0, "E2E_Counter": 0,
-                                                  "CmdTelemetryOn": 1,
-                                                  "CmdClearFaultsSeq": self.seq})
-            data = self._sender.protect(payload)
-            self._bus.send(can.Message(arbitration_id=ID[COMMAND], data=data,
-                                       is_extended_id=False))
+            with self._lock:
+                self._send()
             self._stop.wait(0.02)
+
+    def change_now(self, seq: int, ping: bytes) -> None:
+        """Change CmdClearFaultsSeq and send a command with it at once, then a TESTER_Ping with
+        `ping` as its payload, both on this tester's bus. The node's receive task takes the
+        frames of the bus in their order and answers the ping after it has checked the command:
+        once its BMS_Pong is heard, the request has been counted."""
+        with self._lock:
+            self.seq = seq
+            self._send()
+            self._bus.send(can.Message(arbitration_id=ID_PING, data=ping, is_extended_id=False))
 
     def close(self) -> None:
         if not self._stop.is_set():
@@ -509,10 +525,12 @@ def test_a_fault_applied_from_outside_is_its_dtc_while_it_lasts_and_stays_confir
 @pytest.mark.parametrize("fault", sorted(CASES))
 def test_a_fault_still_there_after_a_clear_comes_back_as_its_dtc(open_link, fault):
     """A tester clears the DTCs (CmdClearFaultsSeq changes) while the fault is there: the
-    frame of the clear has no DTC active or confirmed and no most recent one; the fault comes
-    back as soon as its monitor has debounced it again. The run stopped while the fault is
-    active: its status byte is that of a failed test in this run, the counter at the failed
-    threshold, and the four reset faults, judged only at the start of a run, stay cleared."""
+    frame of the clear holds nothing from before the request, so it is confirmed there only if
+    it is active again, from evidence after the request; the fault comes back as soon as its
+    monitor has debounced it again, in the frame of the clear for a fault the first piece of
+    evidence decides. The run stopped while the fault is active: its status byte is that of a
+    failed test in this run, the counter at the failed threshold, and the four reset faults,
+    judged only at the start of a run, stay cleared."""
     case, spec, mask = CASES[fault], SPEC[fault], bit(fault)
     link = open_link()
     recorder = Recorder(link.bus)
@@ -536,15 +554,20 @@ def test_a_fault_still_there_after_a_clear_comes_back_as_its_dtc(open_link, faul
         recorder.stop()
     stats = link.node.stats()
 
+    # The frame of the clear: nothing from before the request; the fault itself only if the
+    # evidence after the request made it active again.
     raw = cleared.frame.raw
-    assert (raw["FaultActive"], raw["FaultConfirmed"], raw["FaultWarning"]) == (0, 0, 0), raw
-    assert cleared.frame.signals["FaultMostRecent"] == "NONE"
+    again = raw["FaultActive"]
+    assert again in (0, mask), raw
+    assert (raw["FaultConfirmed"], raw["FaultWarning"]) == (again, bool(again) and spec.warning)
+    assert cleared.frame.signals["FaultMostRecent"] == (fault if again else "NONE")
     for h in recorder.frames(FAULT, cleared.index, back.index):
         assert (h.frame.raw["FaultActive"], h.frame.raw["FaultConfirmed"]) == (0, 0), h.frame
     raw = back.frame.raw
     assert (raw["FaultActive"], raw["FaultConfirmed"], raw["FaultClearCount"]) == (mask, mask, 1)
     assert back.frame.signals["FaultMostRecent"] == fault
     assert raw["FaultWarning"] == spec.warning
+    print(f"{fault}: active again in the frame of the clear: {bool(again)}")
 
     assert (stats["faults"]["clears"], stats["faults"]["clear_requests_seen"]) == (1, 1)
     assert stats["command"]["clear_requests"] == 1
@@ -558,7 +581,9 @@ def test_a_fault_still_there_after_a_clear_comes_back_as_its_dtc(open_link, faul
     assert lines == [(fault, True), (fault, False), (fault, True)], lines
     assert link.node.log().count("DTCs cleared: CmdClearFaultsSeq changed (clear 1)") == 1
     if stats["telemetry"]["messages"][FAULT]["queue"]["superseded"] == 0:
-        assert transitions(frames) == lines
+        # Active again in the frame of the clear, the fault never left FaultActive: the clear
+        # and its return are two lines of one period and no change between two frames.
+        assert transitions(frames) == (lines[:1] if again else lines)
 
 
 def test_an_over_voltage_is_a_dtc_until_it_heals_and_a_clear_removes_its_record(
@@ -707,6 +732,134 @@ def test_bms_fault_goes_out_once_per_health_period_and_carries_every_change(open
                 checked += 1
     assert checked > 0
     check_dtcs(stats, {})
+
+
+def miss_one_read(sim: SimControl) -> int:
+    """Take the front end off line for as short as the bench can make it: on, until the node
+    has taken a read that the front end did not answer (sensor.status, asked again and again
+    without a pause), then off. Returns the reads that went unanswered, one or a few; the node
+    counts the same reads in its statistics."""
+    before = sim.sensor_status()["unanswered"]
+    sim.sensor_offline(True)
+    deadline = time.monotonic() + 5.0
+    while sim.sensor_status()["unanswered"] == before:
+        assert time.monotonic() < deadline, "the node took no reading while the front end was off"
+    sim.sensor_offline(False)
+    return sim.sensor_status()["unanswered"] - before
+
+
+@UDP_ONLY
+def test_a_fault_that_comes_and_goes_within_a_health_period_is_reported_all_the_same(open_link):
+    """FRONT_END_NO_ANSWER, which one piece of evidence decides either way, for as short as the
+    bench can make it: the front end goes off line just after a BMS_Fault frame and back as soon
+    as the node has missed a read, so that the DTC fails and passes again within one health
+    period. The frame of that period has it active all the same, a BMS_PackStatus after it says
+    PackFaultActive and FAULT, the log has the pair of lines, and no frame has a fault confirmed
+    that no frame so far had active. The statistics have the healed DTC and the reads missed."""
+    mask = bit("FRONT_END_NO_ANSWER")
+    link = open_link()
+    recorder = Recorder(link.bus)
+    try:
+        with link.node.sim() as sim:
+            recorder.next(FAULT, recorder.until(FAULT))
+            start = recorder.until(FAULT, after=recorder.mark())        # just after a frame
+            missed = miss_one_read(sim)
+            confirmed = recorder.until(FAULT, lambda f: f.raw["FaultConfirmed"] & mask,
+                                       after=start.index)
+            # The first frame without it, whenever the front end came back on line.
+            gone = recorder.until(FAULT, lambda f: (f.raw["FaultActive"] & mask) == 0,
+                                  after=confirmed.index)
+            later = recorder.next(FAULT, gone, 2)
+        assert link.node.stop() == EXIT_OK
+        recorder.quiet()
+    finally:
+        recorder.stop()
+    stats = link.node.stats()
+
+    frames = check_fault_frames(recorder, 0, None, stats)
+    shown = [h for h in recorder.frames(FAULT) if h.frame.raw["FaultActive"] & mask]
+    print(f"{missed} reads unanswered ({stats['sensor']['unanswered']}); FRONT_END_NO_ANSWER "
+          f"active in {len(shown)} BMS_Fault frames")
+    assert shown, "the fault came and went without a BMS_Fault frame that has it active"
+    seen = 0
+    for frame in frames:
+        seen |= frame.raw["FaultActive"]
+        assert frame.raw["FaultConfirmed"] & ~seen == 0, ("confirmed, never active", frame)
+    after_it = pack_statuses(recorder, shown[0], recorder.next(FAULT, shown[-1], 2)[1])
+    assert any((frame.raw["PackFaultActive"], frame.signals["PackState"]) == (1, "FAULT")
+               for frame in after_it), after_it
+    for frame in pack_statuses(recorder, later[0], later[1]):
+        assert (frame.raw["PackFaultActive"], frame.signals["PackState"]) == (0, "NORMAL"), frame
+    assert fault_lines(link.node.log()) == [("FRONT_END_NO_ANSWER", True),
+                                            ("FRONT_END_NO_ANSWER", False)]
+    dtcs = check_dtcs(stats, {"FRONT_END_NO_ANSWER": healed("FRONT_END_NO_ANSWER")})
+    assert dtcs["FRONT_END_NO_ANSWER"]["counter"] == SPEC["FRONT_END_NO_ANSWER"].passed
+    assert sum(stats["sensor"]["unanswered"].values()) == missed
+
+
+@UDP_ONLY
+def test_a_failure_detected_after_a_clear_request_survives_the_clear(open_link):
+    """A clear erases what came before its request and nothing after it. Just after a
+    BMS_Fault frame: cell5 goes open until a sample with it has been processed (its
+    BMS_PackStatus says so) and comes back, so that SENSOR_CHANNEL_INVALID fails and heals
+    before the request; then the tester changes CmdClearFaultsSeq and sends a ping behind the
+    command, and once its BMS_Pong is heard the node has counted the request; then the front end
+    misses a read (as short an outage as the bench can make). As a rule all of it falls into
+    the health period of the clear. The frame of the clear holds nothing of the channel fault;
+    the missed read is FRONT_END_NO_ANSWER, confirmed from the first frame that has it on (as a
+    rule the frame of the clear; when the host delays the test so much that the read is missed
+    in a later period, the test shows less, and says so in its output, but its verdict does not
+    change), and the statistics have its record."""
+    invalid, no_answer = bit("SENSOR_CHANNEL_INVALID"), bit("FRONT_END_NO_ANSWER")
+    link = open_link()
+    recorder = Recorder(link.bus)
+    tester = CommandTester(link.spec, seq=7)
+    try:
+        with link.node.sim() as sim:
+            recorder.next(FAULT, recorder.until(FAULT), 2)            # commands acted on
+            start = recorder.until(FAULT, after=recorder.mark())      # just after a frame
+            sim.sensor_open("cell5")
+            recorder.until(PACK_STATUS, lambda f: f.raw["PackVoltageValid"] == 0,
+                           after=start.index)
+            sim.sensor_clear("cell5")
+            request = recorder.mark()
+            tester.change_now(8, ping=b"clear-08")
+            recorder.until("BMS_Pong", after=request)
+            missed = miss_one_read(sim)
+            cleared = recorder.until(FAULT, lambda f: f.raw["FaultClearCount"] == 1,
+                                     after=start.index)
+            try:
+                kept = recorder.until(FAULT, lambda f: f.raw["FaultConfirmed"] & no_answer,
+                                      after=cleared.index)
+            except AssertionError:
+                raise AssertionError("the failure after the request was erased") from None
+            recorder.next(FAULT, kept, 2)
+        tester.close()
+        assert link.node.stop() == EXIT_OK
+        recorder.quiet()
+    finally:
+        tester.close()
+        recorder.stop()
+    stats = link.node.stats()
+
+    raw = cleared.frame.raw
+    assert (raw["FaultActive"] | raw["FaultConfirmed"]) & invalid == 0, raw
+    assert raw["FaultConfirmed"] & ~no_answer == 0, raw
+    before = [h.frame.raw["FaultConfirmed"] for h in recorder.frames(FAULT, start.index + 1,
+                                                                       cleared.index)]
+    print(f"{missed} reads unanswered after the request; the channel fault in a frame before "
+          f"the clear's: {any(c & invalid for c in before)}; the missed read in the frame of "
+          f"the clear: {kept.index == cleared.index} (health periods after it: "
+          f"{len(recorder.frames(FAULT, cleared.index + 1, kept.index + 1))})")
+    for h in recorder.frames(FAULT, kept.index):
+        assert h.frame.raw["FaultConfirmed"] == no_answer, h.frame
+    assert stats["command"]["clear_requests"] == 1 and stats["faults"]["clears"] == 1
+    dtcs = check_dtcs(stats, {"FRONT_END_NO_ANSWER": healed("FRONT_END_NO_ANSWER")})
+    assert dtcs["SENSOR_CHANNEL_INVALID"]["status"] & FAILED_BITS == 0
+    check_fault_frames(recorder, 0, None, stats)
+    assert fault_lines(link.node.log()) == [
+        ("SENSOR_CHANNEL_INVALID", True), ("SENSOR_CHANNEL_INVALID", False),
+        ("FRONT_END_NO_ANSWER", True), ("FRONT_END_NO_ANSWER", False)]
 
 
 # ------------------------------------------------------------------------- the CAN bus
@@ -905,10 +1058,15 @@ def test_a_hanging_sensor_task_ends_in_a_watchdog_reset_and_nothing_else(
         node = start_node(can=can_spec, retained_file=cell)
         recorder.until(FAULT)
         with node.sim() as sim:
-            hang = recorder.mark()
             sim.sensor_hang("on")
-            recorder.until(FAULT, lambda f: f.raw["FaultActive"] & bit("SUPERVISION_EXPIRED"),
-                           after=hang)
+            # Stuck once a read waits; from then on the front end's counts stay as they are.
+            # (5 s bounds the wait; it is not a timing tolerance.)
+            deadline = time.monotonic() + 5.0
+            while sim.sensor_status()["hung"] != 1:
+                assert time.monotonic() < deadline, "the sensor task did not get stuck"
+                time.sleep(0.01)
+            reads = sim.sensor_status()
+            recorder.until(FAULT, lambda f: f.raw["FaultActive"] & bit("SUPERVISION_EXPIRED"))
         assert node.wait_for_reset(timeout=RESET_WAIT_S) == RESET_WATCHDOG
         first_end = recorder.quiet()
 
@@ -948,10 +1106,28 @@ def test_a_hanging_sensor_task_ends_in_a_watchdog_reset_and_nothing_else(
     assert (last.raw["FaultActive"], last.raw["FaultConfirmed"]) == \
         (expected_before_reset, expected_before_reset), last
     assert last.signals["FaultMostRecent"] == "SUPERVISION_EXPIRED"
-    # The sensor task is stuck from its next read on: at most the heartbeat and the status of
-    # the period of the command after it.
-    assert len(recorder.frames(HEARTBEAT, hang, first_end)) <= 2
-    assert len(recorder.frames(PACK_STATUS, hang, first_end)) <= 2
+    # The sensor task sent nothing after the period it got stuck in, whenever the hang came.
+    # A period sends its heartbeat (PeriodCounter: the period's number, from 1), then reads
+    # the current, and the cells and the temperatures in the periods of their messages' cycle
+    # times, from the first period on (app/app.c: sensor_task(), acquire() and the asserts on
+    # the DBC's cycle times). The front end counts a reading once it no longer hangs
+    # (platform/posix/posix_sensor.c). So with n current readings counted, the stuck read is
+    # the current reading of period n + 1, unless period n still lacks its cells or
+    # temperatures: then the hang came between two reads of period n.
+    n = reads["current_reads"]
+    period_ms = DB.get_message_by_name(HEARTBEAT).cycle_time
+    cells_every = DB.get_message_by_name("BMS_CellVoltages1").cycle_time // period_ms
+    temps_every = DB.get_message_by_name("BMS_Temperatures").cycle_time // period_ms
+    period_n_complete = (reads["cell_reads"], reads["temp_reads"]) == \
+        (-(-n // cells_every), -(-n // temps_every))
+    stuck = n + 1 if period_n_complete else n
+    numbers = [h.frame.raw["PeriodCounter"] for h in recorder.frames(HEARTBEAT, 0, first_end)]
+    assert max(numbers) == stuck, (f"last heartbeats {numbers[-3:]}, stuck in period {stuck} "
+                                   f"after {n} current, {reads['cell_reads']} cell and "
+                                   f"{reads['temp_reads']} temperature readings")
+    # At most one BMS_PackStatus per sample, and only the periods before the stuck one posted
+    # a sample.
+    assert len(recorder.frames(PACK_STATUS, 0, first_end)) <= stuck - 1
     stderr = node.stderr().strip().splitlines()
     assert len(stderr) == 1 and FATAL_LINE.fullmatch(stderr[0]), stderr
     assert int(FATAL_LINE.fullmatch(stderr[0]).group(1)) >= 500
@@ -1129,6 +1305,181 @@ def test_a_spinning_sensor_task_starves_the_kicks_and_the_watchdog_resets_the_no
                  f"{SPIN_TO_RESET_S} s")
 
 
+#: A stall of the sensor task that ends, measured by the node (app/app.c, SUPERVISION): from its
+#: last alive indication before the stall to its first after it, a stall of less than 300 ms
+#: leaves at most two examinations of the watchdog manager without an indication, as many as
+#: the failed tolerance allows, and one of more than 400 ms leaves three, which make the entity
+#: EXPIRED. The windows the tests need keep 10 ms from both figures, for the tick the
+#: measurement is made in and the health task's response time.
+STALL_SURVIVED_MS = 290
+STALL_EXPIRED_MS = 410
+SENSOR_PERIOD_MS = 10
+
+
+@dataclass(frozen=True)
+class Stall:
+    """A stall of the sensor task as the node saw it."""
+
+    hung: Heard          # the heartbeat of the period whose read stalled
+    back: Heard          # the first heartbeat after the stall
+    stall_ms: int        # from the last alive indication before it to the first after it
+    expired: bool        # a BMS_Fault frame since the hang has SUPERVISION_EXPIRED
+
+
+def stall_the_sensor_task(sim: SimControl, recorder: Recorder, hold_s: float) -> Stall:
+    """Just after a BMS_Fault frame, make the front end hang (sensor.hang on), hold it for
+    `hold_s` once the sensor task is stuck in its read, and end it (sensor.hang off). The stall
+    the node saw comes from the heartbeats' tick counts: the stuck pass sent its heartbeat (the
+    period after the N readings taken by then) before its read, one period after the last alive
+    indication, and the first pass after the stall sends its heartbeat at once, in the tick the
+    stuck read returned and the stuck pass made its alive indication. Waits for two BMS_Fault
+    frames after that heartbeat: an expiry of the sensor task is in one of the frames by then."""
+    start = recorder.until(FAULT, after=recorder.mark())
+    assert sim.sensor_hang("on")["hang"] == "on"
+    deadline = time.monotonic() + 5.0
+    while sim.sensor_status()["hung"] != 1:
+        assert time.monotonic() < deadline, "the sensor task did not get stuck in its read"
+    reads = sim.sensor_status()["current_reads"]
+    time.sleep(hold_s)                  # how long the bench holds the fault, not a wait for it
+    assert sim.sensor_hang("off")["hang"] == "off"
+    hung = recorder.until(HEARTBEAT, lambda f: f.raw["PeriodCounter"] == reads + 1,
+                          after=start.index)
+    back = recorder.until(HEARTBEAT, lambda f: f.raw["PeriodCounter"] > reads + 1,
+                          after=hung.index)
+    recorder.next(FAULT, back, 2)
+    expired = any(h.frame.raw["FaultActive"] & bit("SUPERVISION_EXPIRED")
+                  for h in recorder.frames(FAULT, start.index))
+    stall_ms = back.frame.raw["TickCount"] - hung.frame.raw["TickCount"] + SENSOR_PERIOD_MS
+    return Stall(hung=hung, back=back, stall_ms=stall_ms, expired=expired)
+
+
+@pytest.mark.timing
+@UDP_ONLY
+def test_a_sensor_stall_within_the_failed_tolerance_is_survived_and_its_fault_heals(
+        open_link):
+    """The sensor task stands still for about 250 ms and goes on: two examinations without an
+    alive indication, the failed tolerance, and then a correct one, because the task skips the
+    periods it missed instead of making them up back to back (app/app.c, sensor_task()). The
+    node is not reset. SAMPLE_TIMEOUT goes active while the samples do not come and heals with
+    the first one: BMS_Fault and BMS_PackStatus report it and then no fault, the statistics
+    give its status byte and counter of a healed DTC, and the processing task's stall is a
+    pair of log lines the health task wrote. On the bus the period counter goes on without a
+    gap; the statistics count the periods the sensor task skipped. Whether a stall leaves two
+    examinations without an indication depends on how long it lasted and where it fell against
+    the health task's period, so the test decides from what the node saw: a stall the node saw
+    outside the window, or one that left fewer than two such examinations, is a timing miss."""
+    timeout = bit("SAMPLE_TIMEOUT")
+    link = open_link()
+    recorder = Recorder(link.bus)
+    try:
+        with link.node.sim() as sim:
+            recorder.next(FAULT, recorder.until(FAULT), 2)
+            stall = stall_the_sensor_task(sim, recorder, 0.23)
+            if stall.expired:
+                assert link.node.wait_for_reset(timeout=RESET_WAIT_S) == RESET_WATCHDOG
+                assert stall.stall_ms > STALL_SURVIVED_MS, (
+                    f"a stall of {stall.stall_ms} ms, within the failed tolerance, reset the "
+                    f"node\n{link.node.log()}")
+                check_timing(False, f"the stall lasted {stall.stall_ms} ms, not less than "
+                                    f"{STALL_SURVIVED_MS} ms: the node was reset")
+            gone = recorder.until(FAULT, lambda f: f.raw["FaultActive"] == 0,
+                                  after=stall.back.index)
+            after = recorder.next(FAULT, gone, 3)
+        assert link.node.stop() == EXIT_OK
+        recorder.quiet()
+    finally:
+        recorder.stop()
+    stats = link.node.stats()
+    manager = stats["watchdog_manager"]
+    (sensor,) = [entity for entity in manager["entities"] if entity["name"] == "sensor"]
+    print(f"stall of {stall.stall_ms} ms as the node saw it; sensor entity: incorrect "
+          f"{sensor['incorrect']}, counts {sensor['min_count']} to {sensor['max_count']}; "
+          f"periods skipped {stats['sensor']['skipped_periods']}")
+    check_timing(stall.stall_ms < STALL_SURVIVED_MS,
+                 f"the stall lasted {stall.stall_ms} ms, not less than {STALL_SURVIVED_MS} ms")
+    check_timing(sensor["incorrect"] == 2,
+                 f"the stall left {sensor['incorrect']} examinations without an alive "
+                 f"indication, not the 2 the failed tolerance allows")
+
+    # Supervised all along: the sensor entity failed twice and is OK again, every cycle kicked.
+    assert sensor["status"] == "OK", sensor
+    assert sensor["min_count"] == 0 and sensor["max_count"] <= 20, sensor
+    assert manager["global_status"] == "OK" and manager["kicks_withheld"] == 0, manager
+    assert manager["kicks"] == manager["cycles"], manager
+    assert all(entity["incorrect"] == 0 for entity in manager["entities"]
+               if entity["name"] != "sensor"), manager
+
+    # SAMPLE_TIMEOUT while the samples did not come, healed with the first one; no other DTC.
+    shown = recorder.frames(FAULT, stall.hung.index, gone.index)
+    assert any(h.frame.raw["FaultActive"] == timeout for h in shown), shown
+    for h in shown:
+        assert h.frame.raw["FaultActive"] & ~timeout == 0, h.frame
+    for h in [gone, *after]:
+        assert (h.frame.raw["FaultActive"], h.frame.raw["FaultConfirmed"]) == (0, timeout)
+    # The samples after the stall are processed before the health task's next job works their
+    # verdicts in, so the first BMS_PackStatus after the stall still has the fault. (It can go
+    # out before the first heartbeat after the stall: its identifier is the more urgent.)
+    assert any(frame.raw["PackFaultActive"] == 1
+               for frame in pack_statuses(recorder, stall.hung, gone)), "no PackFaultActive"
+    for frame in pack_statuses(recorder, after[1], after[2]):
+        assert (frame.raw["PackFaultActive"], frame.signals["PackState"]) == (0, "NORMAL"), frame
+    dtcs = check_dtcs(stats, {"SAMPLE_TIMEOUT": healed("SAMPLE_TIMEOUT")})
+    assert (dtcs["SAMPLE_TIMEOUT"]["counter"], dtcs["SAMPLE_TIMEOUT"]["fdc"]) == (-1, -128)
+    assert fault_lines(link.node.log()) == [("SAMPLE_TIMEOUT", True), ("SAMPLE_TIMEOUT", False)]
+
+    # The processing task's stall, logged by the health task from its counts.
+    process = stats["process"]
+    assert process["timeouts"] >= 1 and process["recoveries"] == 1, process
+    log = link.node.log()
+    assert log.count("no sample from the sensor task for 30 ms") == 1
+    assert log.count(f"samples again after {process['timeouts']} timeouts") == 1
+
+    # The sensor task skipped the periods it missed, those between the stuck pass and the first
+    # after it, with one overrun, and the period counter went on without a gap. (A host that
+    # stalls the sensor task's thread makes more of both, and can make a heartbeat be replaced
+    # before it goes out: those are timing checks.)
+    skipped = (stall.back.frame.raw["TickCount"] - stall.hung.frame.raw["TickCount"]) \
+        // SENSOR_PERIOD_MS - 1
+    overruns, skipped_periods = stats["sensor"]["overruns"], stats["sensor"]["skipped_periods"]
+    assert overruns >= 1 and skipped_periods >= skipped - 1, (skipped, stats["sensor"])
+    check_timing(overruns == 1 and abs(skipped_periods - skipped) <= 1,
+                 f"{skipped} periods skipped in the stall, but {stats['sensor']} in the run")
+    period_counters = [h.frame.raw["PeriodCounter"] for h in (stall.hung, stall.back)]
+    check_timing(period_counters[1] == period_counters[0] + 1,
+                 f"the period counters of the stuck pass and the next one: {period_counters}")
+
+
+@pytest.mark.timing
+@UDP_ONLY
+def test_a_sensor_stall_beyond_the_failed_tolerance_ends_in_a_reset(open_link):
+    """The sensor task stands still for about 450 ms and then goes on: three examinations
+    without an alive indication, wherever the stall falls against the health task's period.
+    The entity is EXPIRED and the global status STOPPED before the task goes on, and STOPPED is
+    final: no more kicks, and the hardware watchdog resets the node although the task runs
+    again. A stall the node saw shorter than the window is a timing miss."""
+    link = open_link()
+    recorder = Recorder(link.bus)
+    try:
+        with link.node.sim() as sim:
+            recorder.next(FAULT, recorder.until(FAULT), 2)
+            stall = stall_the_sensor_task(sim, recorder, 0.45)
+        print(f"stall of {stall.stall_ms} ms as the node saw it; SUPERVISION_EXPIRED reported: "
+              f"{stall.expired}")
+        if not stall.expired:
+            assert stall.stall_ms <= STALL_EXPIRED_MS, (
+                f"a stall of {stall.stall_ms} ms, beyond the failed tolerance, did not expire")
+            check_timing(False, f"the stall lasted {stall.stall_ms} ms, not more than "
+                                f"{STALL_EXPIRED_MS} ms: the node was not reset")
+        assert link.node.wait_for_reset(timeout=RESET_WAIT_S) == RESET_WATCHDOG
+    finally:
+        recorder.stop()
+    stderr = link.node.stderr().strip().splitlines()
+    assert len(stderr) == 1 and FATAL_LINE.fullmatch(stderr[0]), stderr
+    log = link.node.log()
+    assert log.count("supervision: sensor expired (0 alive in its last cycle)") == 1, log
+    assert "samples again after" in log                    # it went on, and was reset all the same
+
+
 @pytest.mark.timing
 @UDP_ONLY
 def test_a_fault_reaches_bms_fault_within_its_debounce_time_and_one_health_period(open_link):
@@ -1196,12 +1547,22 @@ def test_a_fault_reaches_bms_fault_within_its_debounce_time_and_one_health_perio
                  f"log line about it")
 
 
+#: The supervision of the design, as docs/faults.md gives it (The watchdogs in the node): per
+#: entity, in the order of the watchdog manager's table, the alive indications expected per
+#: reference cycle and the correct count from the lowest to the highest, the reference cycle
+#: (one health period) and the failed tolerance; and the expired tolerance.
+SUPERVISION = [("can_rx", 2, 1, 65535, 1, 2), ("sensor", 10, 1, 20, 1, 2),
+               ("process", 10, 1, 20, 1, 2), ("can_tx", 2, 1, 65535, 1, 2)]
+EXPIRED_TOLERANCE = 0
+
+
 def test_a_run_without_faults_supervises_every_task_and_kicks_in_every_period(start_node):
-    """The supervision of a run without a fault: every entity OK, a kick after every
-    supervision cycle and none withheld, the hardware watchdog started with the timeout of the
-    design; no DTC failed, and every one whose test ran in the 2 s has passed: the 4 reset
-    faults at the start, the supervision, error passive after 1 s and the 9 faults of the
-    samples, one status change each (bus off passes only after 5 s)."""
+    """The supervision of a run without a fault: the configuration of the design (the bounds,
+    reference cycles and tolerances of docs/faults.md), every entity OK with its counts within
+    those bounds, a kick after every supervision cycle and none withheld, the hardware watchdog
+    started with the timeout of the design; no DTC failed, and every one whose test ran in the
+    2 s has passed: the 4 reset faults at the start, the supervision, error passive after 1 s
+    and the 9 faults of the samples, one status change each (bus off passes only after 5 s)."""
     node = start_node("--duration-s", "2")
     assert node.wait(timeout=20) == EXIT_OK
     stats = node.stats()
@@ -1210,12 +1571,14 @@ def test_a_run_without_faults_supervises_every_task_and_kicks_in_every_period(st
     assert manager["global_status"] == "OK" and manager["first_expired"] is None
     assert manager["kicks"] == manager["cycles"] == 20 and manager["kicks_withheld"] == 0
     assert manager["hw_started"] is True and manager["hw_timeout_ms"] == 500
-    assert [e["name"] for e in manager["entities"]] == ["can_rx", "sensor", "process", "can_tx"]
-    for entity in manager["entities"]:
+    assert manager["expired_tolerance"] == EXPIRED_TOLERANCE
+    configured = [(e["name"], e["expected_alive"], e["expected_alive"] - e["min_margin"],
+                   e["expected_alive"] + e["max_margin"], e["reference_cycle"],
+                   e["failed_tolerance"]) for e in manager["entities"]]
+    assert configured == SUPERVISION
+    for entity, (_, _, lower, upper, _, _) in zip(manager["entities"], SUPERVISION):
         assert entity["status"] == "OK" and entity["incorrect"] == 0, entity
         assert entity["examinations"] == 20, entity
-        lower = entity["expected_alive"] - entity["min_margin"]
-        upper = entity["expected_alive"] + entity["max_margin"]
         assert lower <= entity["min_count"] <= entity["max_count"] <= upper, entity
     hw = stats["hw_watchdog"]
     assert hw["started"] is True and hw["timeout_ms"] == 500

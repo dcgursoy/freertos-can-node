@@ -202,28 +202,48 @@ made in the health task.
 
 - **The processing task** judges each sample, or each timeout of its wait for one, with
   functions that keep no state (`fault_judge_sample()`, `fault_judge_timeout()`). It posts the
-  verdict, two 16-bit masks of failing and passing evidence, to a queue of 32
-  (`APP_FAULT_VERDICT_QUEUE_LENGTH`) that it never waits on; a lost verdict is counted
-  (`process.verdicts_lost`).
+  verdict, two 16-bit masks of failing and passing evidence and the count of clear requests
+  it read as it posted it (8 bytes), to a queue of 32 (`APP_FAULT_VERDICT_QUEUE_LENGTH`) that
+  it never waits on; a lost verdict is counted (`process.verdicts_lost`). It writes no log
+  line: it counts its timeouts and the samples that come after one (`process.timeouts`,
+  `process.recoveries`), and the health task writes the lines.
 - **The health task**, in every 100 ms period:
   1. runs one supervision cycle of the watchdog manager and kicks the hardware watchdog if the
      manager allows it;
-  2. works in up to 32 verdicts, in the order of the samples, so that the debouncing counts
-     samples;
-  3. judges the CAN controller (the bus-off count of the transmit queue, the count of entries
-     into error passive, the controller's state) and the watchdog manager's global status;
-  4. carries out a clear request;
-  5. logs every fault that became active or stopped being active, and publishes the summary
+  2. logs a stall of the samples that began (`no sample from the sensor task for 30 ms`) or
+     ended (`samples again after <n> timeouts`) since its last period, from the processing
+     task's counts;
+  3. reads the CAN controller (the bus-off count of the transmit queue, the count of entries
+     into error passive, the controller's state) and the watchdog manager's global status,
+     then the count of clear requests;
+  4. works in up to 32 verdicts, in the order of the samples, so that the debouncing counts
+     samples, and clears the DTCs before the first verdict that carries a clear request it has
+     not carried out (see Clearing);
+  5. carries out a clear request that no verdict carried;
+  6. judges the CAN controller and the watchdog manager from what it read in step 3;
+  7. logs every change of a DTC's testFailed in the period, and publishes the summary
      (`fault_summary_t`) in a critical section;
-  6. sends BMS_Fault.
+  8. sends BMS_Fault.
 - **The receive task** counts the clear requests of TESTER_Command (`command_rx_t.clear_requests`).
 - **The processing task** reads the summary in a critical section for every sample:
-  BMS_PackStatus says PackFaultActive and PackState FAULT while a DTC has testFailed.
+  BMS_PackStatus says PackFaultActive and PackState FAULT while a fault is active in the
+  summary of the health task's last period.
 
 The DTCs change only in the health task's job, so BMS_Fault, sent at the end of that job, goes
 out at once on every change, and every 100 ms without one. The cost is latency: a fault of the
 pack values reaches its DTC in the first health period after the sample that decided it, at
 most 100 ms later.
+
+**The summary of a period.** A job works in up to 100 ms of evidence, and a fault that one
+piece of evidence decides (SENSOR_CHANNEL_INVALID, FRONT_END_NO_ANSWER, SAMPLE_TIMEOUT) can
+fail and pass again within it. So the fault monitor keeps the rises and falls of each DTC's
+testFailed between two summaries, and the summary has a fault active if its testFailed is set
+at the end of the period or rose during it: such a fault is active in BMS_Fault for one frame
+and in PackFaultActive for the period after it, and the log has both its lines. A fault that
+rose and fell gets its two lines in that order, one that fell and rose again in the other; one
+that changed more often in one period gets those two lines all the same. A clear forgets the
+rises before it, so that the frame of a clear holds nothing from before the request, and keeps
+the rises after it.
 
 The processing task, the task that sees the samples, is not the owner because it runs above
 `can_tx`: every microsecond in its budget is one more in `can_tx`'s response time. With the
@@ -241,7 +261,7 @@ slot 7.
 | Signal | Bits | Meaning |
 |---|---|---|
 | E2E_Crc, E2E_Counter | 0..7, 8..11 | Profile 11A |
-| FaultActive | 16..31 | bit n: the DTC of fault n has testFailed |
+| FaultActive | 16..31 | bit n: the DTC of fault n has testFailed at the end of the period, or its testFailed rose during it (after the clear, in the period of a clear) |
 | FaultConfirmed | 32..47 | bit n: the DTC of fault n has confirmedDTC: the fault occurred since the start or the last clear |
 | FaultMostRecent | 48..52 | the fault whose testFailed rose most recently since the start or the last clear; 31 NONE |
 | FaultWarning | 53 | a DTC requests the warning indicator |
@@ -250,17 +270,40 @@ slot 7.
 [can-protocol.md](can-protocol.md#0x010-bms_fault) has the full signal table.
 
 **Clearing.** A tester clears the DTCs by changing CmdClearFaultsSeq between two commands the
-node carries out (only while the command stream's E2E state machine is VALID, see
+node carries out while the command stream's E2E state machine stays VALID (see
 [can-protocol.md](can-protocol.md#the-nodes-receiver-of-tester_command)). The first command
-carried out only sets the reference, so a tester that starts, or comes back with an old value,
-clears nothing. The health task clears every DTC once per new count, after working in that
-period's verdicts, so the frame of that period has no DTC active or confirmed, no most recent
-one and no warning indicator. A fault that is still present comes back as soon as it has been
-debounced again. The reset faults are judged only at the start of a run, so once cleared they
-stay cleared for the rest of it.
+carried out after the stream started, or after it was lost, only sets the reference, so a
+tester that starts, another tester after one went away, or a tester or pack master that comes
+back after a timeout or its own reset clears nothing, whatever value it brings, as long as its
+stream was lost in between. The node can tell only that: a sender whose stream is not lost,
+one that is silent for at most one period (two, if its E2E counter happens to go on in
+sequence; [can-protocol.md](can-protocol.md#the-nodes-receiver-of-tester_command)), is taken
+for the one before it, so a pack master that resets that quickly and comes back with another
+value requests a clear. The price of the rule is that a tester that changed its value while its
+stream was lost has requested nothing: it sees FaultClearCount unchanged and changes the value
+again.
+
+The receive task counts a request when the command arrives; the health task carries it out in
+order with the evidence. Each verdict carries the count of requests the processing task had
+read when it posted it, and the health task clears every DTC before the first verdict that
+carries a count it has not carried out, or after the period's verdicts for a request that no
+verdict carried, and before it judges the CAN controller and the watchdog manager, whose
+inputs it read before the count. So a clear erases the evidence handed over before its request
+and none handed over after it: the frame of the clear has no DTC active or confirmed, no most
+recent one and no warning indicator from before the request, and a fault detected after the
+request is in it already or, handed over after the clear's period, in the frame of the period
+it was handed over in. (Evidence of the samples is "handed over"
+when the processing task reads the count for its verdict, just before it posts it. The CAN
+controller's inputs say what happened since the health task's last period, and the job cannot
+tell what of it came before the request: a bus-off or an entry into error passive between the
+last period and the request survives the clear.)
+Requests that arrive between two verdicts are carried out once, however many they are. A fault
+that is still present comes back as soon as it has been debounced again. The reset faults are
+judged only at the start of a run, so once cleared they stay cleared for the rest of it.
 
 **What the node does about a fault in phase 3: it reports it.** It sets the DTC, sends BMS_Fault,
-sets PackFaultActive and PackState FAULT, and writes a line to its log
+sets PackFaultActive and PackState FAULT, and writes a line to its log for every change of the
+DTC's testFailed, a clear included
 (`fault CELL_OVERVOLTAGE active (DTC 0x1A0100)`, `fault CELL_OVERVOLTAGE no longer active`). It
 has no contactor or current limit to command; opening the contactors is the decision of the
 pack's master, which reads BMS_Fault.
@@ -409,9 +452,26 @@ can_tx tasks each report an alive indication once per pass of their loop (the CA
 | can_rx, can_tx | 2 | 1 to 65535 | a pass per wake-up, at least every 50 ms, up to one per frame on the bus: a lower bound only, in effect |
 
 The lower bound of every entity is 1: the supervision is there to find a task that has stopped.
-Timing within a period is the business of the overrun counters (BMS_TaskStats). The failed
-tolerance is 2 (one pass of an event-driven task that slips past the end of a cycle is not taken
-for a hang) and the expired tolerance 0. The health task is not supervised: it is the task that
+Timing within a period is the business of the overrun counters (BMS_TaskStats). A task that
+goes on after a stall stays below the upper bound of 20. The sensor task does not make up the
+periods it missed after an overrun: it skips them, keeps the grid of its 10 ms period, and
+counts them (`sensor.skipped_periods`; BMS_TaskStats counts them as overruns), so between two
+examinations it makes a pass for every period of the grid that begins in between and, after a
+stall, at most two more (the end of the pass that stalled, and at once the pass of the period
+the tick is in): 12 when the examinations are 100 ms apart, 14 when the health task's response
+time, under 20 ms in the analysis of [architecture.md](architecture.md#schedulability), puts
+them 120 ms apart. The heartbeat's PeriodCounter and the sample numbers count its passes, so
+they go on without a gap. The processing task, after a stall of its own, finds at most the 4
+samples the queue held and then one per pass of the sensor task, at most 18 in a cycle; it
+times out only while no sample comes. The failed tolerance is 2, so that one pass of an
+event-driven task that slips past the end of a cycle is not taken for a hang, and a task that
+stands still for up to two cycles and then goes on is not reset for it: the cycle in which it
+goes on is correct again, and the good cycles after it make the entity OK. Measured from the
+task's last alive indication before the stall to its first after it, a stall of less than
+300 ms leaves at most two examinations without an indication, wherever it falls against the
+health period, and one of more than 400 ms leaves three, which make it EXPIRED; the health
+task's response time moves an examination, and these figures, by up to its worst case. The
+expired tolerance is 0. The health task is not supervised: it is the task that
 kicks, so the hardware watchdog covers it. Neither is the idle task: it does nothing that could
 hang, and a task that keeps the CPU starves the health task as well. The hardware watchdog's
 timeout is `APP_WDG_TIMEOUT_MS`, 500 ms, five health periods, so that a late health job does not
@@ -429,6 +489,10 @@ still counts it):
 3. j1 + 700 ms, 500 ms after the last kick: the hardware watchdog resets the node, 400 ms after
    the frame that reported the expiry and 700 to 800 ms after the last indication. The exit
    status is 11 and the retained cell records WATCHDOG.
+
+A task that goes on again before step 2 is not reset: its next indication makes the cycle
+correct, and SAMPLE_TIMEOUT, active while the sensor task's samples did not come, heals with
+the first sample. One that goes on after step 2 is reset all the same: STOPPED is final.
 
 A task that keeps the CPU (`sensor.hang spin`) starves every task below it, the health task with
 its kicks and its BMS_Fault: nothing in the node can record the fault, and the hardware watchdog
@@ -604,16 +668,16 @@ The size of the DTC state, with `sizeof` on the host and `arm-none-eabi-gcc -mcp
 |---|---|
 | [tests/unit/test_dtc.c](../tests/unit/test_dtc.c) | every set, reset and kept rule of every status bit; the counter at its thresholds and at the extremes of its types; the count of failing cycles saturating at 255; the operation cycle, the clear, the records, counting and listing by mask; refused input; and random runs (300 random tables of 1 to 32 events, 1000 random steps each) compared after every step with a reference model written in the test from the bit definitions |
 | [tests/unit/test_wdgm.c](../tests/unit/test_wdgm.c) | every local and global transition with its requirement number, the bounds of a correct count, the kick in every global status, every kind of damaged state making it STOPPED, 300 random configurations of 300 supervision cycles against a reference model written from the SWS's requirement tables, and 4 threads reporting 200,000 checkpoints each during supervision, every one counted once (also under ThreadSanitizer) |
-| [tests/unit/test_fault.c](../tests/unit/test_fault.c) | the table of faults; every limit at the limit, just beyond, in the band and at its release value; invalid and unanswered readings; the debounce count of every sample fault; the health task's monitors; every global supervision status; every reset cause; the clear; the summary |
-| [tests/unit/test_telemetry.c](../tests/unit/test_telemetry.c), [test_command.c](../tests/unit/test_command.c) | BMS_Fault byte by byte and through the E2E check, PackState and PackFaultActive, ResetCause for every cause, the clear requests |
+| [tests/unit/test_fault.c](../tests/unit/test_fault.c) | the table of faults; every limit at the limit, just beyond, in the band and at its release value; invalid and unanswered readings; the debounce count of every sample fault; the health task's monitors; every global supervision status; every reset cause; the clear, its count compared across 2^32, and its order against the verdicts that carry the count of requests; the summary, with a fault that came and went within one period and the rises before and after a clear |
+| [tests/unit/test_telemetry.c](../tests/unit/test_telemetry.c), [test_command.c](../tests/unit/test_command.c) | BMS_Fault byte by byte and through the E2E check, PackState and PackFaultActive, ResetCause for every cause, the clear requests, none by a tester that starts after another went away or comes back with a changed value |
 | [tests/platform/test_posix_retained.c](../tests/platform/test_posix_retained.c), [wdg_selftest.c](../tests/platform/wdg_selftest.c) | every verdict of the cell at start, what a reset writes; the watchdog model in FreeRTOS programs run as children: expiry never before the timeout, a kicked watchdog that never resets, the start rules, the cell across real resets, `hang on` and `hang spin` |
 | [tests/system/test_retained.py](../tests/system/test_retained.py) | the node with `--retained-file`: every verdict, every reason reported by name and value, a killed node, two nodes on one cell, an unusable path, and a watchdog reset of `wdg_selftest expire` that the node then reports |
-| [tests/system/test_faults.py](../tests/system/test_faults.py) | every fault of the table applied from outside: the right DTC in BMS_Fault, and only it, while it lasts, PackFaultActive and FAULT meanwhile, testFailed cleared and confirmedDTC kept after it, and the status byte, counter and fault detection counter in the statistics, both while the fault is active and after it; the clear while a fault is there and after it; a shorted bus until bus off and the 5 s until its DTC heals; every reset cause a cell can record; `sensor.hang on` ending in a reset with status 11 and nothing else, then the start on the same cell (WATCHDOG, RESET_WATCHDOG until a clear) and after a power loss (POWER_ON); one BMS_Fault per health period and every change of the DTCs in the frame of the period that made it, the frames counted exactly against the statistics and every one checked with the independent Profile 11 implementation; and, as timing tolerances, the time from a fault to its frame, from a hang to the reset, and from a change's log line to the frame that shows it |
-| every system test | the test harness fails any test whose node was reset without the test waiting for that reset with `wait_for_reset()` ([tests/conftest.py](../tests/conftest.py), for the nodes started through its fixtures; the few tests that start the node themselves assert its exit status): every test that expects no reset also shows that the hardware watchdog was kicked for the whole run |
+| [tests/system/test_faults.py](../tests/system/test_faults.py) | every fault of the table applied from outside: the right DTC in BMS_Fault, and only it, while it lasts, PackFaultActive and FAULT meanwhile, testFailed cleared and confirmedDTC kept after it, and the status byte, counter and fault detection counter in the statistics, both while the fault is active and after it, with two exceptions: SAMPLE_TIMEOUT, during which no sample and so no BMS_PackStatus comes, in BMS_PackStatus and in the statistics only once a stall the node survived has ended, and SUPERVISION_EXPIRED, which ends in a reset, which writes no statistics and leaves no after; a fault that comes and goes within one health period, active in its frame and logged; the clear while a fault is there and after it, a failure detected after the request surviving it and nothing from before the request in its frame; a shorted bus until bus off and the 5 s until its DTC heals; every reset cause a cell can record; `sensor.hang on` ending in a reset with status 11 and nothing else, then the start on the same cell (WATCHDOG, RESET_WATCHDOG until a clear) and after a power loss (POWER_ON); the supervision configuration of the design; one BMS_Fault per health period and every change of the DTCs in the frame of the period that made it, the frames counted exactly against the statistics and every one checked with the independent Profile 11 implementation; and, as timing tolerances, the time from a fault to its frame, from a hang to the reset, and from a change's log line to the frame that shows it, a stall of the sensor task that leaves two examinations without an alive indication survived (SAMPLE_TIMEOUT healed), and one that leaves three ending in a reset |
+| every system test | the test harness fails any test whose node was reset without the test waiting for that reset with `wait_for_reset()`, and any test with a run that ended in order whose statistics show a kick missing: the hardware watchdog not started, kicks and withheld kicks that do not add up to the supervision cycles, or kicks the health task decided on that the watchdog did not count (`NodeProcess.lost_kicks()`); at the end of a test it stops the nodes that still run in order (SIGTERM), so that their kicks are checked too ([tests/conftest.py](../tests/conftest.py), for the nodes started through its fixtures; the few tests that start the node themselves assert its exit status and, after an orderly end, its kicks). So no node was reset without the test waiting for it, and in every run that ended in order every kick the health task decided on reached the hardware watchdog; neither shows that the kicks came often enough in a run shorter than the watchdog's 500 ms timeout or in the last 500 ms before an orderly stop, which switches the watchdog off |
 
 Each module was challenged with planted defects when it was written: realistic mistakes in a
 scratch copy, each of which a test must catch. The system tests of this page were challenged in
-the same way. 14 defects, each planted alone in a scratch copy, and every one caught:
+the same way. 22 defects, each planted alone in a scratch copy, and every one caught:
 
 | Planted defect | Caught by |
 |---|---|
@@ -627,8 +691,16 @@ the same way. 14 defects, each planted alone in a scratch copy, and every one ca
 | the watchdog model resets with the reason of an assertion | the hang's exit status |
 | RESET_WATCHDOG requests the warning indicator | the first BMS_Fault after a watchdog reset |
 | the reset faults of the other causes are not passed at the start | their status bytes in the statistics |
-| the clear carried out before the period's verdicts | the frame of the clear shows the fault active |
+| the clear carried out before the period's verdicts | the frame of the clear shows the channel fault from before the request (`test_a_failure_detected_after_a_clear_request_survives_the_clear`) |
+| the clear carried out after the period's verdicts, whatever count of requests they carry | the failure after the request is erased (the same test; tests/unit/test_fault.c) |
+| a fault that rose and fell within one period not kept for the summary | no BMS_Fault frame has the fault active (`test_a_fault_that_comes_and_goes_within_a_health_period_is_reported_all_the_same`; test_fault.c) |
+| a clear that keeps the rises of its period before it for the summary | the frame of the clear has the channel fault from before the request active (`test_a_failure_detected_after_a_clear_request_survives_the_clear`; test_fault.c) |
+| the log lines of a period only for a fault whose testFailed differs at its end | no line for a fault that came and went within the period, and none for the clear of a fault that the first piece of evidence after it decides again (the clear test of FRONT_END_NO_ANSWER and SENSOR_CHANNEL_INVALID) |
+| the sensor task makes up the periods it missed after a stall | a stall of 241 ms, two examinations without an alive indication, resets the node ("30 alive in its last cycle"; the timing test of a stall within the failed tolerance, which reports it as a failure, not a timing miss) |
+| the upper bound of the sensor entity widened to 65535 | the supervision configuration of a run without faults |
+| a command carried out before the stream was lost kept as the reference for a clear request | tests/unit/test_command.c (a tester that starts after another, one back with a changed value) and the stream that stops in tests/system/test_telemetry.py (`clear_requests` 1) |
 | the harness does not report a reset nobody waited for (three ways: in `unexpected_reset()`, in the fixture, in `wait_for_reset()`) | tests/python/test_node.py and test_harness.py |
+| the health task never kicks the hardware watchdog | the harness's kick check (`NodeProcess.lost_kicks()`): of the 91 tests of test_smoke.py, test_retained.py, test_can_link.py, test_application.py and test_sensor_control.py outside the timing run, 66 pass against it with the harness of before this check, and 40 of those 66 now fail, each on its lost kicks |
 
 ## What phase 3 does not do, and what phases 4 and 5 add
 

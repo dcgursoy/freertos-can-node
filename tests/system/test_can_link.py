@@ -57,11 +57,14 @@ def test_every_status_value_is_on_the_bus_or_accounted_for(open_link):
     # up to the host.
     assert status_missing_since_start(frames, max_step=None) == queue["superseded"]
 
-    # One value per 10 ms of the node's own time, and every value accounted for. The queue was
+    # One value per 10 ms of the node's own time, but for the periods the sensor task skipped
+    # after an overrun (app/app.c, sensor_task()), and every value accounted for. The queue was
     # sampled just before the controller stopped: a value it still counts as pending may
     # already have reached the tester.
     last_counter = status_fields(frames[-1])[0]
-    assert abs(queue["produced"] - stats["tick"]["count"] / 10) <= 2, (queue, stats["tick"])
+    skipped = stats["sensor"]["skipped_periods"]
+    assert abs(queue["produced"] + skipped - stats["tick"]["count"] / 10) <= 2, (
+        queue, skipped, stats["tick"])
     assert last_counter <= queue["produced"] <= last_counter + queue["pending"]
 
 
@@ -346,6 +349,7 @@ def test_simulation_control_is_off_unless_asked_for(node_binary, workdir, ports)
             with pytest.raises(SimError, match="no reply"):
                 sim.request("ping", retries=1)
         assert node.wait(timeout=20) == EXIT_OK
+        assert node.lost_kicks() is None, node.lost_kicks()  # as tests/conftest.py checks its nodes
 
 
 # --------------------------------------------------------------------------- start-up errors
@@ -393,6 +397,7 @@ def test_the_highest_port_number_is_accepted_for_simulation_control(node_binary,
         with SimControl(65535) as sim:
             assert sim.ping() == node.pid
         assert node.stop() == EXIT_OK
+        assert node.lost_kicks() is None, node.lost_kicks()  # as tests/conftest.py checks its nodes
 
 
 def test_a_full_udp_bus_refuses_another_participant(node_binary, ports):

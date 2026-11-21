@@ -23,7 +23,7 @@ import can
 import pytest
 
 from fcn_tools.bus import ID_PING, open_bus
-from fcn_tools.node import EXIT_OK
+from fcn_tools.node import EXIT_OK, lost_kicks_in
 from fcn_tools.timing import check_timing
 
 # platform/posix/posix_platform.h: the node's exit status when its CAN transport went away.
@@ -474,7 +474,10 @@ def test_an_interface_that_goes_down_and_up_again_does_not_stop_the_node(node_bi
     assert "is gone" not in log
     assert (workdir / "node.stderr.txt").read_text() == ""
 
-    stats = json.loads((workdir / "node.stats.json").read_text())["can"]
+    everything = json.loads((workdir / "node.stats.json").read_text())
+    # An orderly end: its kicks are checked as tests/conftest.py checks those of its nodes.
+    assert lost_kicks_in(everything, "the node") is None, lost_kicks_in(everything, "the node")
+    stats = everything["can"]
     assert stats["transport_error"] is None
     counters = stats["transport_counters"]
     assert counters["tx_failed"] + counters["rx_failed"] >= 1

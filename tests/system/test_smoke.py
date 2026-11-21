@@ -203,8 +203,10 @@ def test_the_alternative_platform_modes_still_run(start_node, option, value):
         assert irq["serviced_by_tick"] > 0
     else:
         assert irq["signals_sent"] > 0 and irq["serviced_by_signal"] > 0
-    # The CAN path works in every mode: one status frame per 10 ticks of the node's time.
-    assert abs(status_queue_counts(stats)["sent"] - tick["count"] / 10) <= 3
+    # The CAN path works in every mode: one status frame per 10 ticks of the node's time, but
+    # for the periods the sensor task skipped after an overrun (app/app.c, sensor_task()).
+    skipped = stats["sensor"]["skipped_periods"]
+    assert abs(status_queue_counts(stats)["sent"] + skipped - tick["count"] / 10) <= 3
     # Simulated interrupt handlers never run on top of each other (docs/bug-log.md, 002).
     assert irq["max_nesting"] == (1 if value != "poll" else 0)
 

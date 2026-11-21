@@ -447,6 +447,7 @@ static void write_measurement_stats(FILE *file, const node_stats_t *stats)
     (void)fprintf(file, "  \"sensor\": {");
     put_u64(file, "periods", sensor->periods, ", ");
     put_u64(file, "overruns", sensor->overruns, ", ");
+    put_u64(file, "skipped_periods", sensor->skipped_periods, ", ");
     (void)fprintf(file, "\"reads\": {");
     put_u64(file, "current", sensor->current_reads, ", ");
     put_u64(file, "cells", sensor->cell_reads, ", ");
@@ -465,6 +466,7 @@ static void write_measurement_stats(FILE *file, const node_stats_t *stats)
     (void)fprintf(file, "  \"process\": {");
     put_u64(file, "samples", process->samples, ", ");
     put_u64(file, "timeouts", process->timeouts, ", ");
+    put_u64(file, "recoveries", process->recoveries, ", ");
     put_u64(file, "backlog", process->backlog, ", ");
     put_u64(file, "verdicts_posted", process->verdicts_posted, ", ");
     put_u64(file, "verdicts_lost", process->verdicts_lost, "},\n");
