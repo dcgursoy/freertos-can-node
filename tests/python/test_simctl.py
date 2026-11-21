@@ -11,7 +11,8 @@ import time
 
 import pytest
 
-from fcn_tools.simctl import HANG_MODES, REPEATABLE, SENSOR_CHANNELS, SimControl, SimError
+from fcn_tools.simctl import (FLASH_CUT_MAX, FLASH_SEED_MAX, HANG_MODES, REPEATABLE,
+                              SENSOR_CHANNELS, SimControl, SimError)
 
 LOOPBACK = "127.0.0.1"
 
@@ -170,7 +171,9 @@ def test_a_late_answer_to_a_command_that_must_not_run_twice_is_still_taken(fake_
 
 def test_repeatable_commands_are_the_ones_that_read_or_set_a_state():
     assert REPEATABLE == {"ping", "can.status", "can.fault", "sensor.status", "sensor.set",
-                          "sensor.open", "sensor.offline", "sensor.hang", "sensor.clear"}
+                          "sensor.open", "sensor.offline", "sensor.hang", "sensor.clear",
+                          "flash.status"}
+    assert "flash.cut" not in REPEATABLE      # it counts from the moment it is served
 
 
 # ------------------------------------------------------------------- sensor front-end model
@@ -280,6 +283,94 @@ def test_a_sensor_command_is_asked_again_when_the_first_attempt_goes_unanswered(
     with SimControl(node.port, timeout=0.1) as sim:
         call(sim)
     assert node.requests == [command, command]
+
+
+# ----------------------------------------------------------------------- the simulated flash
+
+FLASH_STATUS = ("ok flash=on size=2105344 reads=12 bytes_read=3072 programs=7 units_programmed=40 "
+                "erases=3 refused=1 busy_ns=137800000 erases_meta=1 erases_slot_a=2 "
+                "erases_slot_b=0 max_sector_erases=2 cut=armed cut_in=4 cut_seed=4242")
+
+
+def test_flash_status_converts_numbers_and_keeps_words(fake_node):
+    node = fake_node({"flash.status": FLASH_STATUS})
+    with SimControl(node.port) as sim:
+        assert sim.flash_status() == {
+            "flash": "on", "size": 2105344, "reads": 12, "bytes_read": 3072, "programs": 7,
+            "units_programmed": 40, "erases": 3, "refused": 1, "busy_ns": 137800000,
+            "erases_meta": 1, "erases_slot_a": 2, "erases_slot_b": 0, "max_sector_erases": 2,
+            "cut": "armed", "cut_in": 4, "cut_seed": 4242}
+    assert node.requests == ["flash.status"]
+
+
+def test_flash_status_of_a_node_without_a_flash_is_just_off(fake_node):
+    node = fake_node({"flash.status": "ok flash=off"})
+    with SimControl(node.port) as sim:
+        assert sim.flash_status() == {"flash": "off"}
+
+
+def test_flash_cut_sends_n_colon_seed_and_off_disarms(fake_node):
+    node = fake_node({"flash.cut": lambda token, command:
+                      "ok cut=none t_ns=3" if command.endswith(" off") else
+                      f"ok cut=armed cut_in={command.split(' ')[1].split(':')[0]} "
+                      f"cut_seed={command.split(':')[1]} t_ns=2"})
+    with SimControl(node.port) as sim:
+        assert sim.flash_cut(3, 42) == {"cut": "armed", "cut_in": "3", "cut_seed": "42",
+                                        "t_ns": "2"}
+        assert sim.flash_cut(1) == {"cut": "armed", "cut_in": "1", "cut_seed": "0", "t_ns": "2"}
+        sim.flash_cut(FLASH_CUT_MAX, FLASH_SEED_MAX)
+        assert sim.flash_cut_off() == {"cut": "none", "t_ns": "3"}
+    assert node.requests == ["flash.cut 3:42", "flash.cut 1:0",
+                             "flash.cut 2147483647:4294967295", "flash.cut off"]
+    assert (FLASH_CUT_MAX, FLASH_SEED_MAX) == (2**31 - 1, 2**32 - 1)
+
+
+@pytest.mark.parametrize("operation, seed, error", [
+    (0, 0, ValueError), (-1, 0, ValueError), (FLASH_CUT_MAX + 1, 0, ValueError),
+    (1, -1, ValueError), (1, FLASH_SEED_MAX + 1, ValueError),
+    (1.0, 0, TypeError), ("1", 0, TypeError), (True, 0, TypeError), (None, 0, TypeError),
+    (1, 2.5, TypeError), (1, "7", TypeError), (1, False, TypeError),
+])
+def test_flash_cut_takes_only_whole_numbers_in_range_and_sends_nothing_otherwise(
+        fake_node, operation, seed, error):
+    node = fake_node({"flash.cut": "ok cut=armed cut_in=1 cut_seed=0 t_ns=1"})
+    with SimControl(node.port) as sim:
+        with pytest.raises(error, match="a flash cut's"):
+            sim.flash_cut(operation, seed)
+    assert node.requests == []
+
+
+def test_a_flash_cut_is_sent_once_and_waited_for_even_without_an_answer(fake_node):
+    # Delivered a second time after an operation, the cut would count from a later moment.
+    node = fake_node({"flash.cut": lambda token, command: None})
+    started = time.monotonic()
+    with SimControl(node.port, timeout=0.1) as sim:
+        with pytest.raises(SimError, match="no reply to 'flash.cut 5:1'"):
+            sim.request("flash.cut 5:1", retries=2)
+    assert time.monotonic() - started >= 0.3
+    assert node.requests == ["flash.cut 5:1"]
+
+
+def test_a_flash_status_is_asked_again_when_the_first_attempt_goes_unanswered(fake_node):
+    attempts = []
+
+    def second_time(token, request):
+        attempts.append(token)
+        return "ok flash=off" if len(attempts) >= 2 else None
+
+    node = fake_node({"flash.status": second_time})
+    with SimControl(node.port, timeout=0.1) as sim:
+        assert sim.flash_status() == {"flash": "off"}
+    assert node.requests == ["flash.status", "flash.status"]
+
+
+def test_a_refused_flash_cut_raises_with_the_nodes_message(fake_node):
+    node = fake_node({"flash.cut": "err no flash in this run (started without --flash-file)"})
+    with SimControl(node.port) as sim:
+        with pytest.raises(SimError, match=r"no flash in this run \(started without "
+                                           r"--flash-file\)"):
+            sim.flash_cut(1)
+    assert node.requests == ["flash.cut 1:0"]
 
 
 def test_a_node_that_is_still_starting_is_asked_until_its_socket_is_open(fake_node):

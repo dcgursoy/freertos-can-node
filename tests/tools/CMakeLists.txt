@@ -21,3 +21,21 @@ add_executable(e2e_cli e2e_cli.c)
 target_link_libraries(e2e_cli PRIVATE fcn_e2e)
 set_target_properties(e2e_cli PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 fcn_target_defaults(e2e_cli NO_COVERAGE)
+
+# lib/image: packs images and validates files, for tests/python/test_image.py.
+add_executable(image_cli image_cli.c)
+target_link_libraries(image_cli PRIVATE fcn_image)
+set_target_properties(image_cli PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+fcn_target_defaults(image_cli NO_COVERAGE)
+
+# The test payloads (payload.c): stand-ins for broken firmware that fcn_boot starts from an
+# image, one that crashes at once (13) and one that ends as a watchdog reset (11).
+foreach(kind crash watchdog)
+    add_executable(fcn_payload_${kind} payload.c)
+    target_link_libraries(fcn_payload_${kind} PRIVATE fcn_boot_host)
+    set_target_properties(fcn_payload_${kind} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    fcn_target_defaults(fcn_payload_${kind} NO_COVERAGE)
+endforeach()
+target_compile_definitions(fcn_payload_crash PRIVATE PAYLOAD_KIND=1 _POSIX_C_SOURCE=200809L)
+target_compile_definitions(fcn_payload_watchdog PRIVATE PAYLOAD_KIND=2 _POSIX_C_SOURCE=200809L)

@@ -39,10 +39,10 @@ BU_: BMS TESTER
 BO_ 16 BMS_Fault: 8 BMS
  SG_ E2E_Crc : 0|8@1+ (1,0) [0|255] "" TESTER
  SG_ E2E_Counter : 8|4@1+ (1,0) [0|14] "" TESTER
- SG_ FaultActive : 16|16@1+ (1,0) [0|65535] "" TESTER
- SG_ FaultConfirmed : 32|16@1+ (1,0) [0|65535] "" TESTER
- SG_ FaultMostRecent : 48|5@1+ (1,0) [0|15] "" TESTER
- SG_ FaultWarning : 53|1@1+ (1,0) [0|1] "" TESTER
+ SG_ FaultActive : 16|17@1+ (1,0) [0|131071] "" TESTER
+ SG_ FaultConfirmed : 33|17@1+ (1,0) [0|131071] "" TESTER
+ SG_ FaultMostRecent : 50|5@1+ (1,0) [0|16] "" TESTER
+ SG_ FaultWarning : 55|1@1+ (1,0) [0|1] "" TESTER
  SG_ FaultClearCount : 56|8@1+ (1,0) [0|255] "" TESTER
 
 BO_ 32 BMS_PackStatus: 8 BMS
@@ -103,6 +103,17 @@ BO_ 1552 BMS_NodeInfo: 8 BMS
  SG_ ActiveSlot : 24|2@1+ (1,0) [0|1] "" TESTER
  SG_ ResetCause : 26|6@1+ (1,0) [0|62] "" TESTER
  SG_ UptimeSeconds : 32|32@1+ (1,0) [0|4294967295] "s" TESTER
+
+BO_ 1553 BMS_BootInfo: 8 BMS
+ SG_ BootMode : 0|2@1+ (1,0) [0|2] "" TESTER
+ SG_ BootAttempt : 2|2@1+ (1,0) [0|3] "" TESTER
+ SG_ BootEvent : 4|3@1+ (1,0) [0|7] "" TESTER
+ SG_ ConfirmState : 8|3@1+ (1,0) [0|4] "" TESTER
+ SG_ BootEventSlot : 11|2@1+ (1,0) [0|1] "" TESTER
+ SG_ ImageVersionMajor : 16|8@1+ (1,0) [0|255] "" TESTER
+ SG_ ImageVersionMinor : 24|8@1+ (1,0) [0|255] "" TESTER
+ SG_ ImageVersionPatch : 32|16@1+ (1,0) [0|65535] "" TESTER
+ SG_ ConfirmSeconds : 48|8@1+ (1,0) [0|255] "s" TESTER
 
 BO_ 1776 TESTER_Ping: 8 TESTER
 
@@ -172,9 +183,19 @@ CM_ BO_ 1552 "Identity and status of the node, once per second. Not protected en
 CM_ SG_ 1552 SwMajor "Software version, major number.";
 CM_ SG_ 1552 SwMinor "Software version, minor number.";
 CM_ SG_ 1552 SwPatch "Software version, patch number.";
-CM_ SG_ 1552 ActiveSlot "The firmware slot the node runs from (phase 4); SNA until the node has A/B slots.";
+CM_ SG_ 1552 ActiveSlot "The firmware slot the node runs from, as the bootloader's hand-off names it; SNA for a node started without the bootloader. BMS_BootInfo says whether the image runs as a trial.";
 CM_ SG_ 1552 ResetCause "Why the node was last reset: the values of plat_reset_reason_t; POWER_ON for a start without a reset before it; SNA while the node does not know.";
 CM_ SG_ 1552 UptimeSeconds "Seconds since the node started.";
+CM_ BO_ 1553 "The image the node runs and its update state, once per second: the companion of BMS_NodeInfo, whose 64 bits are all in use. Taken from the bootloader's hand-off at start, except ConfirmState and ConfirmSeconds, which follow the confirm of a trial. Not protected end to end.";
+CM_ SG_ 1553 BootMode "How the bootloader started the image: as the CONFIRMED image, as a TRIAL that confirms itself once it has run in good health, or NONE: the node was started without the bootloader (no hand-off), and every other signal of this message but ConfirmState is 0.";
+CM_ SG_ 1553 BootAttempt "For a TRIAL, the attempt this start is: 1 to 3 (a trial is rolled back when its third start does not confirm it); 0 otherwise.";
+CM_ SG_ 1553 BootEvent "The state change the bootloader made before this start: ADOPT (the factory image became the confirmed one), ROLLBACK (a trial used its 3 attempts), REJECT (a trial did not validate), FALLBACK (the confirmed image did not validate; the one before it runs again), or NONE. ROLLBACK, REJECT and FALLBACK set the DTC UPDATE_ROLLBACK (BMS_Fault).";
+CM_ SG_ 1553 ConfirmState "NOT_NEEDED: the image is not a trial. WAITING: a trial counting its time in good health (ConfirmSeconds). CONFIRMING: the confirm is being written. CONFIRMED: this trial confirmed itself and is the active image. FAILED: the confirm could not be written; the trial will be rolled back after its attempts.";
+CM_ SG_ 1553 BootEventSlot "The slot BootEvent acted on: the adopted slot (ADOPT), the rejected trial's (ROLLBACK, REJECT), or the slot fallen back to, whose image is the confirmed one again (FALLBACK); SNA for none.";
+CM_ SG_ 1553 ImageVersionMajor "The version of the running image as its header gives it (major.minor.patch); 0 without the bootloader.";
+CM_ SG_ 1553 ImageVersionMinor "As ImageVersionMajor.";
+CM_ SG_ 1553 ImageVersionPatch "As ImageVersionMajor.";
+CM_ SG_ 1553 ConfirmSeconds "For a trial: the seconds of good health counted towards its confirm (the watchdog manager OK and the controller never bus off, without a break), saturated at 255; the confirm is made at 5.";
 CM_ BO_ 1776 "Echo request: any payload of 0 to 8 bytes. No signals; used for link tests and latency measurements.";
 CM_ BO_ 1777 "Echo reply: the payload of the request, 0 to 8 bytes.";
 CM_ BO_ 2016 "Diagnostic requests, ISO 15765-2 frames (phase 5). No signals.";
@@ -199,6 +220,7 @@ BA_ "GenMsgCycleTime" BO_ 80 100;
 BA_ "GenMsgCycleTime" BO_ 256 100;
 BA_ "GenMsgCycleTime" BO_ 1536 200;
 BA_ "GenMsgCycleTime" BO_ 1552 1000;
+BA_ "GenMsgCycleTime" BO_ 1553 1000;
 BA_ "FcnE2eDataId" BO_ 16 272;
 BA_ "FcnE2eDataId" BO_ 32 288;
 BA_ "FcnE2eDataId" BO_ 64 320;
@@ -206,7 +228,7 @@ BA_ "FcnE2eDataId" BO_ 65 321;
 BA_ "FcnE2eDataId" BO_ 80 336;
 BA_ "FcnE2eDataId" BO_ 256 512;
 
-VAL_ 16 FaultMostRecent 0 "CELL_OVERVOLTAGE" 1 "CELL_UNDERVOLTAGE" 2 "OVERTEMPERATURE" 3 "UNDERTEMPERATURE" 4 "OVERCURRENT_DISCHARGE" 5 "OVERCURRENT_CHARGE" 6 "SENSOR_CHANNEL_INVALID" 7 "FRONT_END_NO_ANSWER" 8 "SAMPLE_TIMEOUT" 9 "CAN_BUS_OFF" 10 "CAN_ERROR_PASSIVE" 11 "SUPERVISION_EXPIRED" 12 "RESET_WATCHDOG" 13 "RESET_ASSERT" 14 "RESET_STACK_OVERFLOW" 15 "RESET_MALLOC_FAILED" 31 "NONE" ;
+VAL_ 16 FaultMostRecent 0 "CELL_OVERVOLTAGE" 1 "CELL_UNDERVOLTAGE" 2 "OVERTEMPERATURE" 3 "UNDERTEMPERATURE" 4 "OVERCURRENT_DISCHARGE" 5 "OVERCURRENT_CHARGE" 6 "SENSOR_CHANNEL_INVALID" 7 "FRONT_END_NO_ANSWER" 8 "SAMPLE_TIMEOUT" 9 "CAN_BUS_OFF" 10 "CAN_ERROR_PASSIVE" 11 "SUPERVISION_EXPIRED" 12 "RESET_WATCHDOG" 13 "RESET_ASSERT" 14 "RESET_STACK_OVERFLOW" 15 "RESET_MALLOC_FAILED" 16 "UPDATE_ROLLBACK" 31 "NONE" ;
 VAL_ 32 PackState 0 "STARTUP" 1 "NORMAL" 2 "FAULT" ;
 VAL_ 64 Cell1Voltage 4095 "SNA" ;
 VAL_ 64 Cell2Voltage 4095 "SNA" ;
@@ -221,4 +243,8 @@ VAL_ 80 Temp2 255 "SNA" ;
 VAL_ 80 Temp3 255 "SNA" ;
 VAL_ 80 Temp4 255 "SNA" ;
 VAL_ 1552 ActiveSlot 0 "A" 1 "B" 3 "SNA" ;
+VAL_ 1553 BootMode 0 "NONE" 1 "CONFIRMED" 2 "TRIAL" ;
+VAL_ 1553 BootEvent 0 "NONE" 1 "ADOPT" 5 "ROLLBACK" 6 "REJECT" 7 "FALLBACK" ;
+VAL_ 1553 ConfirmState 0 "NOT_NEEDED" 1 "WAITING" 2 "CONFIRMING" 3 "CONFIRMED" 4 "FAILED" ;
+VAL_ 1553 BootEventSlot 0 "A" 1 "B" 3 "SNA" ;
 VAL_ 1552 ResetCause 0 "POWER_ON" 10 "REQUESTED" 11 "WATCHDOG" 12 "POWER_LOSS" 13 "IMAGE_FAULT" 20 "ASSERT" 21 "STACK_OVERFLOW" 22 "MALLOC_FAILED" 63 "SNA" ;

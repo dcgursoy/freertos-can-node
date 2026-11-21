@@ -12,7 +12,7 @@
  * IWDGRSTF, SFTRSTF, PORRSTF, PINRSTF and others) it answers why the device started.
  *
  * WHAT IT HOLDS. The reason given to the last plat_reset(), the number of resets since
- * power-on, and words kept for phase 4 (the bootloader's count of boot attempts). The platform
+ * power-on, and four reserved words that carry the bootloader's HAND-OFF (below). The platform
  * reads it once, at start, before the application runs: plat_reset_cause() then returns the
  * reason, or PLAT_RESET_POWER_ON if the cell was not valid or recorded no reset. Right after
  * reading, the platform sets the recorded reason back to PLAT_RESET_POWER_ON, so that a run
@@ -20,6 +20,35 @@
  * a power-on at the next start, with every word reset to 0. plat_reset() writes its reason and
  * counts the reset; plat_reset(PLAT_RESET_POWER_LOSS) destroys the cell instead, as a loss of
  * supply would.
+ *
+ * THE HAND-OFF. The bootloader (on the host fcn_boot, platform/posix/boot_main.c) reads the
+ * cell before the image, decides which slot to start (lib/boot, boot_select()) and writes
+ * what it decided into the reserved words, sealed with the cell's CRC, before it starts the
+ * image: the slot, whether the image runs as a TRIAL or as the CONFIRMED image, which attempt
+ * of the trial this is, the image's version from its header, and the state change the
+ * bootloader made on the way (a rollback, a rejected trial, a fallback, the adoption of the
+ * factory image). It leaves the recorded reset reason in the cell for the image. The image's
+ * platform reads the hand-off together with the reason (plat_boot_handoff()) and then zeroes
+ * the four words, so that a later start without the bootloader finds none: no hand-off means
+ * that the image was started without a bootloader. The words:
+ *
+ *     word  bits    content
+ *     0     0-31    PLAT_HANDOFF_MAGIC ("FCNH"): a hand-off is present; anything else: none
+ *     1     0-7     slot started: 0 (A) or 1 (B)
+ *           8-15    plat_boot_mode_t: 1 CONFIRMED, 2 TRIAL
+ *           16-23   attempt: 1 to 3 for a TRIAL, 0 for the CONFIRMED image
+ *           24-31   plat_boot_event_t: what the bootloader's select wrote on the way
+ *     2     0-31    the image version of the slot's header (lib/image: major.minor.patch)
+ *     3     0-7     the slot the event acted on (lib/boot: the slot adopted, the trial's for a
+ *                   rollback or a rejection, the slot fallen back to), or 0xFF for none
+ *           8-15    0, or the lib/boot status (boot_status_t) of a write of the select that
+ *                   failed (the image then runs as the CONFIRMED one, lib/boot)
+ *           16-31   0
+ *
+ * A hand-off whose words break any of these rules is no hand-off. The boot attempts are not
+ * kept here: RAM does not survive a loss of supply, and a trial that cuts its own supply must
+ * still run out of attempts. lib/boot counts them in the flash (one program unit per attempt,
+ * written before the trial is started).
  *
  * ON A TARGET. A software reset (assert, stack overflow, a requested reset) writes its reason
  * into the cell, then triggers the reset (SCB AIRCR SYSRESETREQ). A watchdog reset writes
@@ -43,6 +72,7 @@
 #ifndef FCN_PLAT_RETAINED_H
 #define FCN_PLAT_RETAINED_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -54,11 +84,17 @@
 /** The layout below; a cell of another version is taken as a power-on. */
 #define PLAT_RETAINED_VERSION 1U
 
-/** Words kept for later phases; 0 after power-on, unchanged by a reset. */
+/** The reserved words: the bootloader's hand-off (THE HAND-OFF above); 0 after power-on. */
 #define PLAT_RETAINED_RESERVED_WORDS 4U
 
-/** Index of the reserved word that phase 4's bootloader will use for its boot attempts. */
-#define PLAT_RETAINED_BOOT_ATTEMPTS_WORD 0U
+/** "FCNH" in a little-endian word, the bytes 'F', 'C', 'N', 'H': reserved[0] of a hand-off. */
+#define PLAT_HANDOFF_MAGIC 0x484E4346U
+
+/** The largest attempt of a trial in a hand-off: lib/boot's BOOT_MAX_ATTEMPTS. */
+#define PLAT_HANDOFF_MAX_ATTEMPT 3U
+
+/** "No slot" in a hand-off's event slot. */
+#define PLAT_HANDOFF_NO_SLOT 0xFFU
 
 typedef struct {
     uint32_t magic;        /**< PLAT_RETAINED_MAGIC */
@@ -66,7 +102,7 @@ typedef struct {
     uint16_t size;         /**< sizeof(plat_retained_cell_t) */
     uint32_t reset_reason; /**< what the next start reports: a plat_reset_reason_t */
     uint32_t resets;       /**< plat_reset() calls since power-on */
-    uint32_t reserved[PLAT_RETAINED_RESERVED_WORDS]; /**< for phase 4, see above */
+    uint32_t reserved[PLAT_RETAINED_RESERVED_WORDS]; /**< the hand-off, see above */
     uint32_t crc; /**< CRC-32/ISO-HDLC of the bytes before this member */
 } plat_retained_cell_t;
 
@@ -75,6 +111,36 @@ _Static_assert((size_t)offsetof(plat_retained_cell_t, reset_reason) == 8U, "layo
 _Static_assert((size_t)offsetof(plat_retained_cell_t, reserved) == 16U, "layout version 1");
 _Static_assert((size_t)offsetof(plat_retained_cell_t, crc) == 32U, "the CRC is the last word");
 
+/** How the bootloader started the image: the values of word 1, bits 8-15. */
+typedef enum {
+    PLAT_BOOT_CONFIRMED = 1, /**< the CONFIRMED image: nothing to confirm */
+    PLAT_BOOT_TRIAL = 2      /**< a TRIAL: it confirms itself once it has run in good health */
+} plat_boot_mode_t;
+
+/** What the bootloader's select wrote before it started the image: the values of word 1,
+ *  bits 24-31, which are those of lib/boot's boot_event_t for the events a select writes. */
+typedef enum {
+    PLAT_BOOT_EVENT_NONE = 0,     /**< nothing */
+    PLAT_BOOT_EVENT_ADOPT = 1,    /**< the factory image was adopted as the CONFIRMED one */
+    PLAT_BOOT_EVENT_ROLLBACK = 5, /**< a trial used all its attempts and was rejected */
+    PLAT_BOOT_EVENT_REJECT = 6,   /**< a trial did not validate and was rejected */
+    PLAT_BOOT_EVENT_FALLBACK = 7  /**< the CONFIRMED image did not validate: the one before it
+                                       is CONFIRMED again */
+} plat_boot_event_t;
+
+/** The hand-off, decoded. */
+typedef struct {
+    uint8_t slot;               /**< 0 (A) or 1 (B) */
+    plat_boot_mode_t mode;      /**< TRIAL or CONFIRMED */
+    uint8_t attempt;            /**< 1..PLAT_HANDOFF_MAX_ATTEMPT for a TRIAL, 0 otherwise */
+    uint32_t image_version;     /**< from the image header: major << 24 | minor << 16 | patch */
+    plat_boot_event_t event;    /**< the state change the bootloader made */
+    uint8_t event_slot;         /**< the slot it acted on (word 3 above), PLAT_HANDOFF_NO_SLOT
+                                     for none */
+    uint8_t select_write_error; /**< 0, or the boot_status_t of a write of the select that
+                                     failed */
+} plat_boot_handoff_t;
+
 /**
  * The reset cause of this start: the reason given to the plat_reset() that ended the previous
  * run, or PLAT_RESET_POWER_ON if there was none (no cell, a cell that was not valid, or a
@@ -82,5 +148,13 @@ _Static_assert((size_t)offsetof(plat_retained_cell_t, crc) == 32U, "the CRC is t
  * time after the platform has started.
  */
 plat_reset_reason_t plat_reset_cause(void);
+
+/**
+ * The bootloader's hand-off to this start: true with `*out` filled if the bootloader started
+ * the image, false (nothing written) if the image was started without one (no cell, no
+ * hand-off in it, or one that breaks the rules of THE HAND-OFF). Constant while the image runs.
+ * Any task, any time after the platform has started; NULL `out` returns false.
+ */
+bool plat_boot_handoff(plat_boot_handoff_t *out);
 
 #endif /* FCN_PLAT_RETAINED_H */

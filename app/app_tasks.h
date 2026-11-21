@@ -15,7 +15,17 @@
  *   health   2         every 100 ms (xTaskDelayUntil)              supervision and the hardware
  *                                                                  watchdog, the DTCs and
  *                                                                  BMS_Fault, task statistics,
- *                                                                  node info, ends the run
+ *                                                                  node and boot info, the
+ *                                                                  confirm of a trial, ends the
+ *                                                                  run
+ *   flash    1         the health task's request (notification)    every write to the flash:
+ *                                                                  the confirm (lib/boot); in
+ *                                                                  phase 5 the slot writer
+ *
+ * The flash task is the lowest-priority task on purpose: a flash operation blocks its caller
+ * for the time the part takes (plat_flash.h: 0.4 ms a page program, 45 ms a sector erase), and
+ * below every other task that wait delays no deadline and no alive indication (app.c, THE
+ * UPDATE).
  *
  * Rate-monotonic order holds for the tasks with a period of their own (sensor above health)
  * and for the receive task, modelled by its demand per tick (task_table.c): a period of 1 ms,
@@ -38,6 +48,7 @@
 #define APP_SENSOR_PRIORITY  5U
 #define APP_PROCESS_PRIORITY 4U
 #define APP_HEALTH_PRIORITY  2U
+#define APP_FLASH_PRIORITY   1U
 
 /* Periods. The sensor task's period is the cycle of BMS_PackStatus and of the heartbeat; the
  * cells are read every APP_CELLS_EVERY-th period, the temperatures every APP_TEMPS_EVERY-th
@@ -52,6 +63,11 @@
  * (1 s; periods 10, 20, ...): never more than two frames in one period (task_table.c). */
 #define APP_TASK_STATS_EVERY 2U
 #define APP_NODE_INFO_EVERY  10U
+
+/* BMS_BootInfo goes in the periods APP_BOOT_INFO_PHASE past those of BMS_NodeInfo (2, 12, 22,
+ * ...): once a second, in even periods that send no other frame of the health task but
+ * BMS_Fault, so that a period still sends at most two. */
+#define APP_BOOT_INFO_PHASE 2U
 
 /* Sensor supervision: the processing task waits this long for a sample, three periods of the
  * sensor task, before it counts a timeout. */

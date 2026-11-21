@@ -58,7 +58,7 @@ static void healthy(void)
 void setUp(void)
 {
     (void)memset(&s_monitor, 0xA5, sizeof(s_monitor));
-    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON));
+    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON, false));
     healthy();
 }
 
@@ -171,18 +171,19 @@ static void test_every_fault_has_its_documented_dtc_and_name(void)
     static const struct {
         uint32_t dtc;
         const char *name;
-    } expected[16] = {{0x1A0100U, "CELL_OVERVOLTAGE"},       {0x1A0200U, "CELL_UNDERVOLTAGE"},
+    } expected[17] = {{0x1A0100U, "CELL_OVERVOLTAGE"},       {0x1A0200U, "CELL_UNDERVOLTAGE"},
                       {0x1A0300U, "OVERTEMPERATURE"},        {0x1A0400U, "UNDERTEMPERATURE"},
                       {0x1A0500U, "OVERCURRENT_DISCHARGE"},  {0x1A0600U, "OVERCURRENT_CHARGE"},
                       {0x1A1000U, "SENSOR_CHANNEL_INVALID"}, {0x1A1100U, "FRONT_END_NO_ANSWER"},
                       {0x1A1200U, "SAMPLE_TIMEOUT"},         {0xD00100U, "CAN_BUS_OFF"},
                       {0xD00200U, "CAN_ERROR_PASSIVE"},      {0x1B0100U, "SUPERVISION_EXPIRED"},
                       {0x1B0200U, "RESET_WATCHDOG"},         {0x1B0300U, "RESET_ASSERT"},
-                      {0x1B0400U, "RESET_STACK_OVERFLOW"},   {0x1B0500U, "RESET_MALLOC_FAILED"}};
+                      {0x1B0400U, "RESET_STACK_OVERFLOW"},   {0x1B0500U, "RESET_MALLOC_FAILED"},
+                      {0x1B0600U, "UPDATE_ROLLBACK"}};
 
-    TEST_ASSERT_EQUAL_UINT32(16U, (uint32_t)FAULT_EVENTS);
+    TEST_ASSERT_EQUAL_UINT32(17U, (uint32_t)FAULT_EVENTS);
 
-    for (uint32_t i = 0U; i < 16U; i++) {
+    for (uint32_t i = 0U; i < 17U; i++) {
         dtc_entry_t entry;
 
         TEST_ASSERT_EQUAL_HEX32(expected[i].dtc, fault_dtc_number(i));
@@ -191,26 +192,27 @@ static void test_every_fault_has_its_documented_dtc_and_name(void)
         TEST_ASSERT_EQUAL_HEX32(expected[i].dtc, entry.dtc);
     }
 
-    TEST_ASSERT_EQUAL_HEX32(0U, fault_dtc_number(16U));
-    TEST_ASSERT_EQUAL_STRING("unknown", fault_name(16U));
+    TEST_ASSERT_EQUAL_HEX32(0U, fault_dtc_number(17U));
+    TEST_ASSERT_EQUAL_STRING("unknown", fault_name(17U));
     TEST_ASSERT_EQUAL_STRING("unknown", fault_name(UINT32_MAX));
 }
 
-/* After a power-on: the four reset faults judged (passed), every other one untested, nothing
- * in the summary. */
+/* After a power-on: the four reset faults and the rollback judged (passed), every other one
+ * untested, nothing in the summary. */
 static void test_after_a_power_on_nothing_is_active_and_the_reset_faults_have_passed(void)
 {
     const fault_summary_t picture = summary();
 
     for (uint32_t i = 0U; i < (uint32_t)FAULT_EVENTS; i++) {
+        /* The reset faults and UPDATE_ROLLBACK, the last five, are judged at once. */
         const bool reset = i >= (uint32_t)FAULT_RESET_WATCHDOG;
 
         TEST_ASSERT_EQUAL_HEX8_MESSAGE(reset ? PASSED_FIRST : UNTESTED, status_of((fault_event_t)i),
                                        fault_name(i));
     }
 
-    TEST_ASSERT_EQUAL_HEX16(0U, picture.active);
-    TEST_ASSERT_EQUAL_HEX16(0U, picture.confirmed);
+    TEST_ASSERT_EQUAL_HEX32(0U, picture.active);
+    TEST_ASSERT_EQUAL_HEX32(0U, picture.confirmed);
     TEST_ASSERT_EQUAL_UINT8(31U, picture.most_recent);
     TEST_ASSERT_EQUAL_UINT8(0U, picture.clears);
     TEST_ASSERT_FALSE(picture.warning);
@@ -235,7 +237,7 @@ static void test_a_faulty_reset_is_an_active_fault_from_the_start(void)
                  {PLAT_RESET_POWER_ON, -1}};
 
     for (size_t c = 0U; c < (sizeof(cases) / sizeof(cases[0])); c++) {
-        TEST_ASSERT_TRUE(fault_init(&s_monitor, cases[c].cause));
+        TEST_ASSERT_TRUE(fault_init(&s_monitor, cases[c].cause, false));
         const fault_summary_t picture = summary();
 
         for (int32_t e = (int32_t)FAULT_RESET_WATCHDOG; e <= (int32_t)FAULT_RESET_MALLOC_FAILED;
@@ -245,17 +247,62 @@ static void test_a_faulty_reset_is_an_active_fault_from_the_start(void)
         }
 
         if (cases[c].event >= 0) {
-            TEST_ASSERT_EQUAL_HEX16(BIT(cases[c].event), picture.active);
-            TEST_ASSERT_EQUAL_HEX16(BIT(cases[c].event), picture.confirmed);
+            TEST_ASSERT_EQUAL_HEX32(BIT(cases[c].event), picture.active);
+            TEST_ASSERT_EQUAL_HEX32(BIT(cases[c].event), picture.confirmed);
             TEST_ASSERT_EQUAL_UINT8((uint8_t)cases[c].event, picture.most_recent);
         } else {
-            TEST_ASSERT_EQUAL_HEX16(0U, picture.active);
+            TEST_ASSERT_EQUAL_HEX32(0U, picture.active);
             TEST_ASSERT_EQUAL_UINT8(31U, picture.most_recent);
         }
 
         TEST_ASSERT_FALSE(picture.warning); /* the reset faults request no indicator */
         TEST_ASSERT_EQUAL(cases[c].cause, s_monitor.reset_cause);
+        TEST_ASSERT_EQUAL_HEX8(PASSED_FIRST, status_of(FAULT_UPDATE_ROLLBACK));
     }
+}
+
+/* A rollback in the bootloader's hand-off is UPDATE_ROLLBACK, confirmed and active from the
+ * start and the most recent, with no warning indicator, whatever the reset cause says; beside a
+ * faulty reset both are active. It is judged once: a clear removes it for the run, and nothing
+ * the monitors see brings it back. Without a rollback it has passed. */
+static void test_a_rollback_in_the_hand_off_is_an_active_fault_from_the_start(void)
+{
+    const uint32_t rollback = (uint32_t)(1UL << (uint32_t)FAULT_UPDATE_ROLLBACK);
+    const uint32_t watchdog = (uint32_t)(1UL << (uint32_t)FAULT_RESET_WATCHDOG);
+
+    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON, true));
+    fault_summary_t picture = summary();
+
+    TEST_ASSERT_EQUAL_HEX8(FAILED_NO_WIR, status_of(FAULT_UPDATE_ROLLBACK));
+    TEST_ASSERT_EQUAL_HEX32(rollback, picture.active);
+    TEST_ASSERT_EQUAL_HEX32(rollback, picture.confirmed);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)FAULT_UPDATE_ROLLBACK, picture.most_recent);
+    TEST_ASSERT_FALSE(picture.warning);
+    TEST_ASSERT_TRUE(s_monitor.rolled_back);
+
+    for (int32_t e = (int32_t)FAULT_RESET_WATCHDOG; e <= (int32_t)FAULT_RESET_MALLOC_FAILED; e++) {
+        TEST_ASSERT_EQUAL_HEX8(PASSED_FIRST, status_of((fault_event_t)e));
+    }
+
+    /* A start after a watchdog reset that the bootloader answered with a rollback: both. */
+    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_WATCHDOG, true));
+    picture = summary();
+    TEST_ASSERT_EQUAL_HEX32(rollback | watchdog, picture.active);
+    TEST_ASSERT_EQUAL_HEX32(rollback | watchdog, picture.confirmed);
+
+    /* A clear ends it, and the run's monitors never judge it again. */
+    TEST_ASSERT_TRUE(fault_clear_if_requested(&s_monitor, 1U));
+    health(0U, 0U, CAN_FC_ERROR_ACTIVE, WDGM_GLOBAL_STATUS_OK, 60U);
+    picture = summary();
+    TEST_ASSERT_EQUAL_HEX32(0U, picture.active & rollback);
+    TEST_ASSERT_EQUAL_HEX32(0U, picture.confirmed & rollback);
+
+    /* No rollback: passed, nothing active. */
+    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON, false));
+    picture = summary();
+    TEST_ASSERT_EQUAL_HEX8(PASSED_FIRST, status_of(FAULT_UPDATE_ROLLBACK));
+    TEST_ASSERT_EQUAL_HEX32(0U, picture.active);
+    TEST_ASSERT_FALSE(s_monitor.rolled_back);
 }
 
 /* ---------------------------------------------------------------- verdicts: the limits */
@@ -391,8 +438,8 @@ static void test_a_monitor_that_was_never_set_up_reports_and_clears_nothing(void
     apply(FAULT_SAMPLE_TIMEOUT, true, 1U);
 
     const fault_summary_t picture = summary();
-    TEST_ASSERT_EQUAL_HEX16(0U, picture.active);
-    TEST_ASSERT_EQUAL_HEX16(0U, picture.confirmed);
+    TEST_ASSERT_EQUAL_HEX32(0U, picture.active);
+    TEST_ASSERT_EQUAL_HEX32(0U, picture.confirmed);
     TEST_ASSERT_EQUAL_UINT8(31U, picture.most_recent);
     TEST_ASSERT_FALSE(fault_clear_if_requested(&s_monitor, 1U));
     TEST_ASSERT_EQUAL_UINT32(0U, s_monitor.clears);
@@ -417,8 +464,8 @@ static void test_an_invalid_channel_of_an_answered_group_fails_and_all_valid_pas
     /* The same group not answered: that is the front end's fault, not a channel's; and the
      * pack is not all valid, so nothing passes either. */
     fault_verdict_t verdict = judge((uint8_t)BMS_SAMPLE_CURRENT);
-    TEST_ASSERT_EQUAL_HEX16(0U, verdict.failing & BIT(FAULT_SENSOR_CHANNEL_INVALID));
-    TEST_ASSERT_EQUAL_HEX16(0U, verdict.passing & BIT(FAULT_SENSOR_CHANNEL_INVALID));
+    TEST_ASSERT_EQUAL_HEX32(0U, verdict.failing & BIT(FAULT_SENSOR_CHANNEL_INVALID));
+    TEST_ASSERT_EQUAL_HEX32(0U, verdict.passing & BIT(FAULT_SENSOR_CHANNEL_INVALID));
 
     /* A group still invalid from an earlier sample, not in this one: neither. */
     healthy();
@@ -436,7 +483,7 @@ static void test_a_group_without_an_answer_fails_the_front_end_and_answers_pass_
     for (size_t i = 0U; i < (sizeof(groups) / sizeof(groups[0])); i++) {
         const fault_verdict_t verdict = judge(groups[i]);
 
-        TEST_ASSERT_EQUAL_HEX16(BIT(FAULT_FRONT_END_NO_ANSWER),
+        TEST_ASSERT_EQUAL_HEX32(BIT(FAULT_FRONT_END_NO_ANSWER),
                                 verdict.failing & BIT(FAULT_FRONT_END_NO_ANSWER));
     }
 
@@ -444,7 +491,7 @@ static void test_a_group_without_an_answer_fails_the_front_end_and_answers_pass_
      * answered. */
     s_sample.groups = (uint8_t)BMS_SAMPLE_CURRENT;
     const fault_verdict_t verdict = judge((uint8_t)BMS_SAMPLE_TEMPS);
-    TEST_ASSERT_EQUAL_HEX16(BIT(FAULT_FRONT_END_NO_ANSWER),
+    TEST_ASSERT_EQUAL_HEX32(BIT(FAULT_FRONT_END_NO_ANSWER),
                             verdict.passing & BIT(FAULT_FRONT_END_NO_ANSWER));
 }
 
@@ -456,13 +503,13 @@ static void test_a_sample_passes_the_timeout_and_a_timeout_fails_only_it(void)
 
     (void)memset(&verdict, 0xA5, sizeof(verdict));
     fault_judge_timeout(&verdict);
-    TEST_ASSERT_EQUAL_HEX16(BIT(FAULT_SAMPLE_TIMEOUT), verdict.failing);
-    TEST_ASSERT_EQUAL_HEX16(0U, verdict.passing);
+    TEST_ASSERT_EQUAL_HEX32(BIT(FAULT_SAMPLE_TIMEOUT), verdict.failing);
+    TEST_ASSERT_EQUAL_HEX32(0U, verdict.passing);
     TEST_ASSERT_EQUAL_UINT32(0U, verdict.clear_requests);
 
     /* A sample judges nothing of the health task's or the reset faults. */
     const fault_verdict_t sample = judge(0U);
-    TEST_ASSERT_EQUAL_HEX16(0U, (sample.failing | sample.passing) & 0xFE00U);
+    TEST_ASSERT_EQUAL_HEX32(0U, (sample.failing | sample.passing) & 0xFE00U);
 }
 
 /* -------------------------------------------------------------------------- debouncing */
@@ -482,7 +529,7 @@ static void test_an_over_voltage_matures_after_five_readings_and_heals_after_ten
     TEST_ASSERT_EQUAL_HEX8(FAILED_WIR, status_of(FAULT_CELL_OVERVOLTAGE));
 
     fault_summary_t picture = summary();
-    TEST_ASSERT_EQUAL_HEX16(BIT(FAULT_CELL_OVERVOLTAGE), picture.active);
+    TEST_ASSERT_EQUAL_HEX32(BIT(FAULT_CELL_OVERVOLTAGE), picture.active);
     TEST_ASSERT_TRUE(picture.warning);
     TEST_ASSERT_EQUAL_UINT8((uint8_t)FAULT_CELL_OVERVOLTAGE, picture.most_recent);
 
@@ -492,12 +539,12 @@ static void test_an_over_voltage_matures_after_five_readings_and_heals_after_ten
     TEST_ASSERT_EQUAL_HEX8(HEALED_WIR, status_of(FAULT_CELL_OVERVOLTAGE));
 
     picture = summary();
-    TEST_ASSERT_EQUAL_HEX16(0U, picture.active);
-    TEST_ASSERT_EQUAL_HEX16(BIT(FAULT_CELL_OVERVOLTAGE), picture.confirmed);
+    TEST_ASSERT_EQUAL_HEX32(0U, picture.active);
+    TEST_ASSERT_EQUAL_HEX32(BIT(FAULT_CELL_OVERVOLTAGE), picture.confirmed);
     TEST_ASSERT_TRUE(picture.warning);
 
     /* The interrupted excursion. */
-    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON));
+    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON, false));
     apply(FAULT_CELL_OVERVOLTAGE, true, 4U);
     apply(FAULT_CELL_OVERVOLTAGE, false, 1U);
     apply(FAULT_CELL_OVERVOLTAGE, true, 1U);
@@ -527,7 +574,7 @@ static void test_every_sample_fault_matures_and_heals_after_its_debounce_count(v
     for (size_t i = 0U; i < (sizeof(cases) / sizeof(cases[0])); i++) {
         const fault_event_t event = cases[i].event;
 
-        TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON));
+        TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON, false));
         apply(event, true, cases[i].to_fail - 1U);
         TEST_ASSERT_EQUAL_HEX8_MESSAGE(UNTESTED, status_of(event), fault_name(event));
         apply(event, true, 1U);
@@ -538,7 +585,7 @@ static void test_every_sample_fault_matures_and_heals_after_its_debounce_count(v
         TEST_ASSERT_EQUAL_HEX8_MESSAGE(HEALED_WIR, status_of(event), fault_name(event));
 
         /* From the start, passing evidence passes at the passed threshold. */
-        TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON));
+        TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON, false));
         apply(event, false, cases[i].to_heal / ((cases[i].to_fail == 1U) ? 1U : 2U));
         TEST_ASSERT_EQUAL_HEX8_MESSAGE(PASSED_FIRST, status_of(event), fault_name(event));
 
@@ -585,7 +632,7 @@ static void test_judged_samples_make_the_dtcs(void)
     }
 
     const fault_summary_t picture = summary();
-    TEST_ASSERT_EQUAL_HEX16(BIT(FAULT_CELL_OVERVOLTAGE), picture.active);
+    TEST_ASSERT_EQUAL_HEX32(BIT(FAULT_CELL_OVERVOLTAGE), picture.active);
     TEST_ASSERT_EQUAL_HEX8(PASSED_FIRST, status_of(FAULT_CELL_UNDERVOLTAGE));
     /* The current's passed threshold is -50: five readings are not yet a pass. */
     TEST_ASSERT_EQUAL_HEX8(UNTESTED, status_of(FAULT_OVERCURRENT_DISCHARGE));
@@ -636,7 +683,7 @@ static void test_error_passive_is_set_at_once_and_heals_after_ten_cycles_error_a
     /* Still error passive, no new entry: failing; bus off: failing too. */
     health(0U, 1U, CAN_FC_ERROR_PASSIVE, WDGM_GLOBAL_STATUS_OK, 1U);
     TEST_ASSERT_EQUAL_HEX8(0x01U, status_of(FAULT_CAN_ERROR_PASSIVE) & 0x01U);
-    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON));
+    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON, false));
     health(0U, 0U, CAN_FC_BUS_OFF, WDGM_GLOBAL_STATUS_OK, 1U);
     TEST_ASSERT_EQUAL_HEX8(FAILED_NO_WIR, status_of(FAULT_CAN_ERROR_PASSIVE));
     TEST_ASSERT_EQUAL_HEX8(FAILED_NO_WIR, status_of(FAULT_CAN_BUS_OFF));
@@ -654,12 +701,12 @@ static void test_the_supervision_fault_follows_the_global_status(void)
     health(0U, 0U, CAN_FC_ERROR_ACTIVE, WDGM_GLOBAL_STATUS_STOPPED, 1U);
     TEST_ASSERT_EQUAL_HEX8(FAILED_NO_WIR, status_of(FAULT_SUPERVISION_EXPIRED));
 
-    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON));
+    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON, false));
     health(0U, 0U, CAN_FC_ERROR_ACTIVE, WDGM_GLOBAL_STATUS_EXPIRED, 1U);
     TEST_ASSERT_EQUAL_HEX8(FAILED_NO_WIR, status_of(FAULT_SUPERVISION_EXPIRED));
 
     const fault_summary_t picture = summary();
-    TEST_ASSERT_EQUAL_HEX16(BIT(FAULT_SUPERVISION_EXPIRED), picture.active);
+    TEST_ASSERT_EQUAL_HEX32(BIT(FAULT_SUPERVISION_EXPIRED), picture.active);
     TEST_ASSERT_EQUAL_UINT8((uint8_t)FAULT_SUPERVISION_EXPIRED, picture.most_recent);
     TEST_ASSERT_FALSE(picture.warning);
 }
@@ -668,9 +715,9 @@ static void test_the_supervision_fault_follows_the_global_status(void)
 
 static void test_a_new_clear_request_clears_every_dtc_once(void)
 {
-    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_WATCHDOG));
+    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_WATCHDOG, false));
     apply(FAULT_SAMPLE_TIMEOUT, true, 1U);
-    TEST_ASSERT_EQUAL_HEX16(BIT(FAULT_SAMPLE_TIMEOUT) | BIT(FAULT_RESET_WATCHDOG),
+    TEST_ASSERT_EQUAL_HEX32(BIT(FAULT_SAMPLE_TIMEOUT) | BIT(FAULT_RESET_WATCHDOG),
                             summary().active);
 
     /* The count the receiver started with: nothing to do. */
@@ -687,15 +734,15 @@ static void test_a_new_clear_request_clears_every_dtc_once(void)
     }
 
     fault_summary_t picture = summary();
-    TEST_ASSERT_EQUAL_HEX16(0U, picture.active);
-    TEST_ASSERT_EQUAL_HEX16(0U, picture.confirmed);
+    TEST_ASSERT_EQUAL_HEX32(0U, picture.active);
+    TEST_ASSERT_EQUAL_HEX32(0U, picture.confirmed);
     TEST_ASSERT_EQUAL_UINT8(31U, picture.most_recent);
     TEST_ASSERT_EQUAL_UINT8(1U, picture.clears);
 
     /* A fault still present comes back with its monitor's next evidence. */
     apply(FAULT_SAMPLE_TIMEOUT, true, 1U);
     picture = summary();
-    TEST_ASSERT_EQUAL_HEX16(BIT(FAULT_SAMPLE_TIMEOUT), picture.active);
+    TEST_ASSERT_EQUAL_HEX32(BIT(FAULT_SAMPLE_TIMEOUT), picture.active);
     TEST_ASSERT_EQUAL_UINT8((uint8_t)FAULT_SAMPLE_TIMEOUT, picture.most_recent);
 
     /* A count behind the one carried out is no request: it comes from before the last clear. */
@@ -738,22 +785,22 @@ static void test_a_failure_detected_after_a_clear_request_survives_the_clear(voi
     /* The frame of the period: the failure after the request, active (it rose in the period)
      * and confirmed, the most recent; nothing from before the request. */
     const fault_summary_t picture = summary_with(&changes);
-    TEST_ASSERT_EQUAL_HEX16(no_answer, picture.active);
-    TEST_ASSERT_EQUAL_HEX16(no_answer, picture.confirmed);
+    TEST_ASSERT_EQUAL_HEX32(no_answer, picture.active);
+    TEST_ASSERT_EQUAL_HEX32(no_answer, picture.confirmed);
     TEST_ASSERT_EQUAL_UINT8((uint8_t)FAULT_FRONT_END_NO_ANSWER, picture.most_recent);
     TEST_ASSERT_EQUAL_UINT8(1U, picture.clears);
     /* For the log: both rose before the clear, the clear ended both, the front end rose after
      * it and passed again. */
-    TEST_ASSERT_EQUAL_HEX16(invalid | no_answer, changes.rose);
-    TEST_ASSERT_EQUAL_HEX16(invalid | no_answer, changes.fell);
-    TEST_ASSERT_EQUAL_HEX16(0U, changes.failed);
+    TEST_ASSERT_EQUAL_HEX32(invalid | no_answer, changes.rose);
+    TEST_ASSERT_EQUAL_HEX32(invalid | no_answer, changes.fell);
+    TEST_ASSERT_EQUAL_HEX32(0U, changes.failed);
 
     /* A request that no verdict carries is carried out when the health task gets to it, after
      * the verdicts that came before it. */
     apply_tagged(no_answer, 0U, 1U);
     TEST_ASSERT_TRUE(fault_clear_if_requested(&s_monitor, 2U));
     TEST_ASSERT_EQUAL_HEX8(UNTESTED, status_of(FAULT_FRONT_END_NO_ANSWER));
-    TEST_ASSERT_EQUAL_HEX16(0U, summary().active);
+    TEST_ASSERT_EQUAL_HEX32(0U, summary().active);
 }
 
 /* FaultClearCount is the count of clears modulo 256. */
@@ -785,35 +832,35 @@ static void test_a_fault_that_comes_and_goes_within_a_period_is_active_in_its_su
     TEST_ASSERT_EQUAL_HEX8(HEALED_WIR, status_of(FAULT_FRONT_END_NO_ANSWER));
 
     fault_summary_t picture = summary_with(&changes);
-    TEST_ASSERT_EQUAL_HEX16(mask, picture.active);
-    TEST_ASSERT_EQUAL_HEX16(mask, picture.confirmed);
+    TEST_ASSERT_EQUAL_HEX32(mask, picture.active);
+    TEST_ASSERT_EQUAL_HEX32(mask, picture.confirmed);
     TEST_ASSERT_EQUAL_UINT8((uint8_t)FAULT_FRONT_END_NO_ANSWER, picture.most_recent);
-    TEST_ASSERT_EQUAL_HEX16(mask, changes.rose);
-    TEST_ASSERT_EQUAL_HEX16(mask, changes.fell);
-    TEST_ASSERT_EQUAL_HEX16(0U, changes.failed);
+    TEST_ASSERT_EQUAL_HEX32(mask, changes.rose);
+    TEST_ASSERT_EQUAL_HEX32(mask, changes.fell);
+    TEST_ASSERT_EQUAL_HEX32(0U, changes.failed);
 
     picture = summary_with(&changes);
-    TEST_ASSERT_EQUAL_HEX16(0U, picture.active);
-    TEST_ASSERT_EQUAL_HEX16(mask, picture.confirmed);
-    TEST_ASSERT_EQUAL_HEX16(0U, changes.rose | changes.fell | changes.failed);
+    TEST_ASSERT_EQUAL_HEX32(0U, picture.active);
+    TEST_ASSERT_EQUAL_HEX32(mask, picture.confirmed);
+    TEST_ASSERT_EQUAL_HEX32(0U, changes.rose | changes.fell | changes.failed);
 
     /* Active at the start of the period, passed and failed again within it. */
     apply(FAULT_FRONT_END_NO_ANSWER, true, 1U);
     picture = summary_with(&changes);
-    TEST_ASSERT_EQUAL_HEX16(mask, picture.active);
-    TEST_ASSERT_EQUAL_HEX16(mask, changes.rose);
-    TEST_ASSERT_EQUAL_HEX16(0U, changes.fell);
+    TEST_ASSERT_EQUAL_HEX32(mask, picture.active);
+    TEST_ASSERT_EQUAL_HEX32(mask, changes.rose);
+    TEST_ASSERT_EQUAL_HEX32(0U, changes.fell);
     apply(FAULT_FRONT_END_NO_ANSWER, false, 1U);
     apply(FAULT_FRONT_END_NO_ANSWER, true, 1U);
     picture = summary_with(&changes);
-    TEST_ASSERT_EQUAL_HEX16(mask, picture.active);
-    TEST_ASSERT_EQUAL_HEX16(mask, changes.rose & changes.fell);
-    TEST_ASSERT_EQUAL_HEX16(mask, changes.failed);
+    TEST_ASSERT_EQUAL_HEX32(mask, picture.active);
+    TEST_ASSERT_EQUAL_HEX32(mask, changes.rose & changes.fell);
+    TEST_ASSERT_EQUAL_HEX32(mask, changes.failed);
 
     /* A pre-report that leaves testFailed alone is no change. */
     apply(FAULT_CELL_OVERVOLTAGE, true, 4U);
     (void)summary_with(&changes);
-    TEST_ASSERT_EQUAL_HEX16(0U, (changes.rose | changes.fell) & BIT(FAULT_CELL_OVERVOLTAGE));
+    TEST_ASSERT_EQUAL_HEX32(0U, (changes.rose | changes.fell) & BIT(FAULT_CELL_OVERVOLTAGE));
 }
 
 /*
@@ -828,7 +875,7 @@ static void test_a_clear_forgets_the_rises_before_it_and_keeps_those_after_it(vo
     const uint16_t invalid = BIT(FAULT_SENSOR_CHANNEL_INVALID);
     fault_changes_t changes;
 
-    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_WATCHDOG));
+    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_WATCHDOG, false));
     (void)summary(); /* the start: the reset fault is active, not a change of the run */
     apply(FAULT_SAMPLE_TIMEOUT, true, 1U);
     apply(FAULT_FRONT_END_NO_ANSWER, true, 1U);
@@ -838,14 +885,14 @@ static void test_a_clear_forgets_the_rises_before_it_and_keeps_those_after_it(vo
     apply(FAULT_SENSOR_CHANNEL_INVALID, false, 1U);
 
     const fault_summary_t picture = summary_with(&changes);
-    TEST_ASSERT_EQUAL_HEX16(invalid, picture.active);
-    TEST_ASSERT_EQUAL_HEX16(invalid, picture.confirmed);
+    TEST_ASSERT_EQUAL_HEX32(invalid, picture.active);
+    TEST_ASSERT_EQUAL_HEX32(invalid, picture.confirmed);
     TEST_ASSERT_EQUAL_UINT8((uint8_t)FAULT_SENSOR_CHANNEL_INVALID, picture.most_recent);
-    TEST_ASSERT_EQUAL_HEX16(timeout | no_answer | invalid, changes.rose);
-    TEST_ASSERT_EQUAL_HEX16(timeout | no_answer | invalid | BIT(FAULT_RESET_WATCHDOG),
+    TEST_ASSERT_EQUAL_HEX32(timeout | no_answer | invalid, changes.rose);
+    TEST_ASSERT_EQUAL_HEX32(timeout | no_answer | invalid | BIT(FAULT_RESET_WATCHDOG),
                             changes.fell);
-    TEST_ASSERT_EQUAL_HEX16(0U, changes.failed);
-    TEST_ASSERT_EQUAL_HEX16(0U, summary().active);
+    TEST_ASSERT_EQUAL_HEX32(0U, changes.failed);
+    TEST_ASSERT_EQUAL_HEX32(0U, summary().active);
 }
 
 /* The masks hold every fault at its bit, the most recent is the last whose testFailed rose, and
@@ -856,8 +903,8 @@ static void test_the_summary_has_a_bit_per_fault_and_the_most_recent_one(void)
     health(1U, 1U, CAN_FC_ERROR_ACTIVE, WDGM_GLOBAL_STATUS_OK, 1U);
 
     fault_summary_t picture = summary();
-    TEST_ASSERT_EQUAL_HEX16(BIT(7) | BIT(9) | BIT(10), picture.active);
-    TEST_ASSERT_EQUAL_HEX16(BIT(7) | BIT(9) | BIT(10), picture.confirmed);
+    TEST_ASSERT_EQUAL_HEX32(BIT(7) | BIT(9) | BIT(10), picture.active);
+    TEST_ASSERT_EQUAL_HEX32(BIT(7) | BIT(9) | BIT(10), picture.confirmed);
     /* Bus off and error passive rose in the same call after the front end: the later of the
      * two in the order of the faults is the most recent. */
     TEST_ASSERT_EQUAL_UINT8(10U, picture.most_recent);
@@ -866,12 +913,12 @@ static void test_the_summary_has_a_bit_per_fault_and_the_most_recent_one(void)
     apply(FAULT_FRONT_END_NO_ANSWER, false, 1U);
     apply(FAULT_UNDERTEMPERATURE, true, 3U);
     picture = summary();
-    TEST_ASSERT_EQUAL_HEX16(BIT(3) | BIT(9) | BIT(10), picture.active);
-    TEST_ASSERT_EQUAL_HEX16(BIT(3) | BIT(7) | BIT(9) | BIT(10), picture.confirmed);
+    TEST_ASSERT_EQUAL_HEX32(BIT(3) | BIT(9) | BIT(10), picture.active);
+    TEST_ASSERT_EQUAL_HEX32(BIT(3) | BIT(7) | BIT(9) | BIT(10), picture.confirmed);
     TEST_ASSERT_EQUAL_UINT8(3U, picture.most_recent);
 
     /* Only the CAN faults: no indicator. */
-    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON));
+    TEST_ASSERT_TRUE(fault_init(&s_monitor, PLAT_RESET_POWER_ON, false));
     health(1U, 1U, CAN_FC_ERROR_ACTIVE, WDGM_GLOBAL_STATUS_OK, 1U);
     TEST_ASSERT_FALSE(summary().warning);
 }
@@ -882,6 +929,7 @@ int main(void)
     RUN_TEST(test_every_fault_has_its_documented_dtc_and_name);
     RUN_TEST(test_after_a_power_on_nothing_is_active_and_the_reset_faults_have_passed);
     RUN_TEST(test_a_faulty_reset_is_an_active_fault_from_the_start);
+    RUN_TEST(test_a_rollback_in_the_hand_off_is_an_active_fault_from_the_start);
     RUN_TEST(test_the_cell_limits_and_their_release_values);
     RUN_TEST(test_the_temperature_limits_and_their_release_values);
     RUN_TEST(test_the_current_limits_and_their_release_values);

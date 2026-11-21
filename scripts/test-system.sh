@@ -9,8 +9,9 @@
 # Three runs:
 #  1. everything not marked "timing", against the release build of the node;
 #  2. the same again against the asan build (AddressSanitizer and UndefinedBehaviorSanitizer),
-#     so that the application and node_main.c run under the sanitizers too; a sanitizer report
-#     ends the node with a non-zero status or writes to stderr, and either fails the test;
+#     so that the application and node_main.c run under the sanitizers too, and the bootloader
+#     and the flash tool; a sanitizer report ends the node with a non-zero status or writes to
+#     stderr, and either fails the test;
 #  3. the tests marked "timing", which assert on the host's wall clock. If they fail, they are
 #     repeated once, but only when every failure was a missed timing tolerance
 #     (fcn_tools.timing); any other failure, a crash or a wrong value, fails at once.
@@ -58,7 +59,11 @@ run_pytest() {
 status=0
 run_pytest functional -m "not timing" "$@" || status=1
 
+# The bootloader and the flash tool of the asan build too; the images they start are packed
+# from the release build of the node (the asan node is larger than a slot, docs/update.md).
 FCN_NODE="$FCN_BUILD_ROOT/asan/bin/fcn_node" \
+    FCN_BOOT="$FCN_BUILD_ROOT/asan/bin/fcn_boot" \
+    FCN_FLASH_TOOL="$FCN_BUILD_ROOT/asan/bin/fcn_flash" \
     ASAN_OPTIONS="detect_stack_use_after_return=1:strict_string_checks=1:detect_leaks=1" \
     UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" \
     run_pytest functional-asan -m "not timing" "$@" || status=1

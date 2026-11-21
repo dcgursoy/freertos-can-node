@@ -322,15 +322,18 @@ static void test_the_node_info_carries_the_version_the_reset_cause_and_the_uptim
     can_frame_t frame;
     can_db_bms_node_info_t msg;
 
-    TEST_ASSERT_TRUE(telemetry_node_info(0U, 1U, 0U, PLAT_RESET_POWER_ON, 3600U, &frame));
+    TEST_ASSERT_TRUE(
+        telemetry_node_info(0U, 1U, 0U, PLAT_HANDOFF_NO_SLOT, PLAT_RESET_POWER_ON, 3600U, &frame));
     expect_header(&frame, 0x610U);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(power_on, frame.data, 8);
 
-    TEST_ASSERT_TRUE(telemetry_node_info(0U, 1U, 0U, PLAT_RESET_WATCHDOG, 3600U, &frame));
+    TEST_ASSERT_TRUE(
+        telemetry_node_info(0U, 1U, 0U, PLAT_HANDOFF_NO_SLOT, PLAT_RESET_WATCHDOG, 3600U, &frame));
     TEST_ASSERT_EQUAL_HEX8(0x2FU, frame.data[3]);
 
     /* NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange): no cause, on purpose */
-    TEST_ASSERT_TRUE(telemetry_node_info(0U, 1U, 0U, (plat_reset_reason_t)99, 3600U, &frame));
+    TEST_ASSERT_TRUE(telemetry_node_info(0U, 1U, 0U, PLAT_HANDOFF_NO_SLOT, (plat_reset_reason_t)99,
+                                         3600U, &frame));
     TEST_ASSERT_EQUAL_HEX8(0xFFU, frame.data[3]);
 
     /* Every cause the platform knows goes out as its own value. */
@@ -340,7 +343,8 @@ static void test_the_node_info_carries_the_version_the_reset_cause_and_the_uptim
         PLAT_RESET_STACK_OVERFLOW, PLAT_RESET_MALLOC_FAILED};
 
     for (size_t i = 0U; i < (sizeof(causes) / sizeof(causes[0])); i++) {
-        TEST_ASSERT_TRUE(telemetry_node_info(1U, 2U, 3U, causes[i], 0U, &frame));
+        TEST_ASSERT_TRUE(
+            telemetry_node_info(1U, 2U, 3U, PLAT_HANDOFF_NO_SLOT, causes[i], 0U, &frame));
         TEST_ASSERT_TRUE(can_db_bms_node_info_unpack(&msg, frame.data, 8U));
         TEST_ASSERT_EQUAL_UINT8((uint8_t)causes[i], msg.reset_cause);
         TEST_ASSERT_EQUAL_UINT8(3U, msg.active_slot);
@@ -350,16 +354,18 @@ static void test_the_node_info_carries_the_version_the_reset_cause_and_the_uptim
 /* ------------------------------------------------------------------------------- BMS_Fault */
 
 /*
- *   faults 0 and 8 active: 0x0101, bytes 2..3: 01 01; confirmed also 15: 0x8101, bytes 4..5:
- *   01 81; byte 6: FaultMostRecent 8 in bits 0..4, FaultWarning 1 in bit 5: 0x28; byte 7:
- *   FaultClearCount 3; byte 1: counter 0, the high nibble unused
+ *   faults 0, 8 and 16 (UPDATE_ROLLBACK) active: 0x10101 in bits 16..32: bytes 2..3 01 01 and
+ *   bit 0 of byte 4; confirmed also 15: 0x18101 in bits 33..49: bit 0 (1) in bit 1 of byte 4,
+ *   which is 0x03 with FaultActive's bit 16, bits 7..14 (0x02) in byte 5, bits 15..16 (0b11) in
+ *   bits 0..1 of byte 6; FaultMostRecent 16 (0b10000) in bits 2..6 of byte 6 and FaultWarning 1
+ *   in bit 7: 0xC3; byte 7: FaultClearCount 3; byte 1: counter 0, the high nibble unused
  */
 static void test_the_fault_frame_carries_the_summary_and_passes_the_e2e_check(void)
 {
-    static const uint8_t payload[6] = {0x01U, 0x01U, 0x01U, 0x81U, 0x28U, 0x03U};
-    const fault_summary_t summary = {.active = 0x0101U,
-                                     .confirmed = 0x8101U,
-                                     .most_recent = (uint8_t)FAULT_SAMPLE_TIMEOUT,
+    static const uint8_t payload[6] = {0x01U, 0x01U, 0x03U, 0x02U, 0xC3U, 0x03U};
+    const fault_summary_t summary = {.active = 0x10101U,
+                                     .confirmed = 0x18101U,
+                                     .most_recent = (uint8_t)FAULT_UPDATE_ROLLBACK,
                                      .clears = 3U,
                                      .warning = true};
     e2e_p11_protect_state_t counter;
@@ -373,9 +379,9 @@ static void test_the_fault_frame_carries_the_summary_and_passes_the_e2e_check(vo
     TEST_ASSERT_EQUAL_HEX8_ARRAY(payload, &frames[0].data[2], 6);
 
     TEST_ASSERT_TRUE(can_db_bms_fault_unpack(&msg, frames[0].data, 8U));
-    TEST_ASSERT_EQUAL_HEX16(0x0101U, msg.fault_active);
-    TEST_ASSERT_EQUAL_HEX16(0x8101U, msg.fault_confirmed);
-    TEST_ASSERT_EQUAL_UINT8(8U, msg.fault_most_recent);
+    TEST_ASSERT_EQUAL_HEX32(0x10101U, msg.fault_active);
+    TEST_ASSERT_EQUAL_HEX32(0x18101U, msg.fault_confirmed);
+    TEST_ASSERT_EQUAL_UINT8(16U, msg.fault_most_recent);
     TEST_ASSERT_EQUAL_UINT8(1U, msg.fault_warning);
     TEST_ASSERT_EQUAL_UINT8(3U, msg.fault_clear_count);
 
@@ -386,6 +392,114 @@ static void test_the_fault_frame_carries_the_summary_and_passes_the_e2e_check(vo
         TEST_ASSERT_EQUAL_UINT8(i % 15U, frames[i].data[1] & 0x0FU);
     }
     expect_e2e(frames, 16U, 0x0110U, E2E_P11STATUS_OK, E2E_P11STATUS_OK);
+}
+
+/* ActiveSlot is the hand-off's slot, 0 for A and 1 for B; any other value, the "no slot" of a
+ * start without the bootloader among them, is SNA (3). Byte 3: ActiveSlot in bits 0..1. */
+static void test_the_node_info_names_the_slot_of_the_hand_off(void)
+{
+    can_frame_t frame;
+    can_db_bms_node_info_t msg;
+    static const struct {
+        uint8_t slot;
+        uint8_t raw;
+    } cases[] = {{0U, 0U}, {1U, 1U}, {PLAT_HANDOFF_NO_SLOT, 3U}, {2U, 3U}};
+
+    for (size_t i = 0U; i < (sizeof(cases) / sizeof(cases[0])); i++) {
+        TEST_ASSERT_TRUE(
+            telemetry_node_info(1U, 2U, 3U, cases[i].slot, PLAT_RESET_POWER_ON, 7U, &frame));
+        TEST_ASSERT_TRUE(can_db_bms_node_info_unpack(&msg, frame.data, 8U));
+        TEST_ASSERT_EQUAL_UINT8(cases[i].raw, msg.active_slot);
+        TEST_ASSERT_EQUAL_UINT8(cases[i].raw, frame.data[3] & 0x03U);
+        TEST_ASSERT_EQUAL_UINT8(1U, msg.sw_major);
+        TEST_ASSERT_EQUAL_UINT32(7U, msg.uptime_seconds);
+    }
+}
+
+/*
+ * BMS_BootInfo of a trial in slot B, attempt 2, image 1.2.3, after a REJECT of slot A, waiting
+ * with 4 healthy seconds:
+ *   byte 0: BootMode TRIAL (2) in bits 0..1, BootAttempt 2 in bits 2..3, BootEvent REJECT (6) in
+ *           bits 4..6: 0b0110_1010, 0x6A
+ *   byte 1: ConfirmState WAITING (1) in bits 0..2, BootEventSlot A (0) in bits 3..4: 0x01
+ *   byte 2: ImageVersionMajor 1; byte 3: ImageVersionMinor 2; bytes 4..5: ImageVersionPatch 3
+ *   byte 6: ConfirmSeconds 4; byte 7: unused, 0
+ */
+static void test_the_boot_info_carries_the_hand_off_and_the_confirm(void)
+{
+    static const uint8_t expected[8] = {0x6AU, 0x01U, 0x01U, 0x02U, 0x03U, 0x00U, 0x04U, 0x00U};
+    const plat_boot_handoff_t handoff = {.slot = 1U,
+                                         .mode = PLAT_BOOT_TRIAL,
+                                         .attempt = 2U,
+                                         .image_version = 0x01020003U,
+                                         .event = PLAT_BOOT_EVENT_REJECT,
+                                         .event_slot = 0U,
+                                         .select_write_error = 0U};
+    can_frame_t frame;
+    can_db_bms_boot_info_t msg;
+
+    TEST_ASSERT_TRUE(telemetry_boot_info(&handoff, UPDATE_CONFIRM_WAITING, 4U, &frame));
+    expect_header(&frame, 0x611U);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, frame.data, 8);
+
+    /* The patch takes all 16 bits, the seconds saturate at 255. */
+    plat_boot_handoff_t wide = handoff;
+
+    wide.image_version = 0xFFFEABCDU;
+    wide.mode = PLAT_BOOT_CONFIRMED;
+    wide.attempt = 0U;
+    wide.event = PLAT_BOOT_EVENT_NONE;
+    wide.event_slot = PLAT_HANDOFF_NO_SLOT;
+    TEST_ASSERT_TRUE(telemetry_boot_info(&wide, UPDATE_CONFIRM_CONFIRMED, 1000U, &frame));
+    TEST_ASSERT_TRUE(can_db_bms_boot_info_unpack(&msg, frame.data, 8U));
+    TEST_ASSERT_EQUAL_UINT8(1U, msg.boot_mode);
+    TEST_ASSERT_EQUAL_UINT8(0U, msg.boot_attempt);
+    TEST_ASSERT_EQUAL_UINT8(0U, msg.boot_event);
+    TEST_ASSERT_EQUAL_UINT8(3U, msg.boot_event_slot);
+    TEST_ASSERT_EQUAL_UINT8(3U, msg.confirm_state);
+    TEST_ASSERT_EQUAL_UINT8(0xFFU, msg.image_version_major);
+    TEST_ASSERT_EQUAL_UINT8(0xFEU, msg.image_version_minor);
+    TEST_ASSERT_EQUAL_HEX16(0xABCDU, msg.image_version_patch);
+    TEST_ASSERT_EQUAL_UINT8(255U, msg.confirm_seconds);
+}
+
+/* Without a hand-off: BootMode NONE, every other signal 0 but ConfirmState and BootEventSlot
+ * SNA. A hand-off or a state the DBC has no value for builds nothing. */
+static void test_the_boot_info_without_a_hand_off_and_what_it_refuses(void)
+{
+    static const uint8_t none[8] = {0x00U, 0x18U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U};
+    const plat_boot_handoff_t good = {.slot = 0U,
+                                      .mode = PLAT_BOOT_CONFIRMED,
+                                      .attempt = 0U,
+                                      .image_version = 1U,
+                                      .event = PLAT_BOOT_EVENT_ROLLBACK,
+                                      .event_slot = 1U,
+                                      .select_write_error = 0U};
+    plat_boot_handoff_t bad;
+    can_frame_t frame;
+
+    TEST_ASSERT_TRUE(telemetry_boot_info(NULL, UPDATE_CONFIRM_NOT_NEEDED, 0U, &frame));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(none, frame.data, 8);
+
+    bad = good;
+    bad.slot = 2U;
+    TEST_ASSERT_FALSE(telemetry_boot_info(&bad, UPDATE_CONFIRM_NOT_NEEDED, 0U, &frame));
+    bad = good;
+    /* NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange): no event, on purpose */
+    bad.event = (plat_boot_event_t)3;
+    TEST_ASSERT_FALSE(telemetry_boot_info(&bad, UPDATE_CONFIRM_NOT_NEEDED, 0U, &frame));
+    bad = good;
+    /* NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange): no mode, on purpose */
+    bad.mode = (plat_boot_mode_t)0;
+    TEST_ASSERT_FALSE(telemetry_boot_info(&bad, UPDATE_CONFIRM_NOT_NEEDED, 0U, &frame));
+    bad = good;
+    bad.attempt = 4U;
+    TEST_ASSERT_FALSE(telemetry_boot_info(&bad, UPDATE_CONFIRM_NOT_NEEDED, 0U, &frame));
+    /* NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange): no state, on purpose */
+    TEST_ASSERT_FALSE(telemetry_boot_info(&good, (update_confirm_state_t)5, 0U, &frame));
+    TEST_ASSERT_TRUE(telemetry_boot_info(&good, UPDATE_CONFIRM_FAILED, 0U, &frame));
+    TEST_ASSERT_EQUAL_HEX8(0x51U, frame.data[0]); /* CONFIRMED 1, attempt 0, ROLLBACK 5 */
+    TEST_ASSERT_EQUAL_HEX8(0x0CU, frame.data[1]); /* FAILED 4, event slot B */
 }
 
 static void test_a_fault_frame_without_a_recent_fault_says_none_and_a_bad_one_is_refused(void)
@@ -400,7 +514,7 @@ static void test_a_fault_frame_without_a_recent_fault_says_none_and_a_bad_one_is
 
     TEST_ASSERT_EQUAL(E2E_E_OK, e2e_p11_protect_init(&counter));
     TEST_ASSERT_TRUE(telemetry_fault(&counter, &summary, &frame));
-    TEST_ASSERT_EQUAL_HEX8(0x1FU, frame.data[6]); /* NONE = 31, no warning */
+    TEST_ASSERT_EQUAL_HEX8(0x7CU, frame.data[6]); /* NONE = 31 in bits 2..6, no warning */
     TEST_ASSERT_EQUAL_HEX8(0x00U, frame.data[7]);
 
     /* A number that is neither a fault nor NONE builds nothing and leaves the counter alone. */
@@ -501,6 +615,9 @@ int main(void)
     RUN_TEST(test_the_task_stats_carry_one_task_in_the_units_of_the_dbc);
     RUN_TEST(test_the_task_stats_saturate_what_their_signals_cannot_carry);
     RUN_TEST(test_the_node_info_carries_the_version_the_reset_cause_and_the_uptime);
+    RUN_TEST(test_the_node_info_names_the_slot_of_the_hand_off);
+    RUN_TEST(test_the_boot_info_carries_the_hand_off_and_the_confirm);
+    RUN_TEST(test_the_boot_info_without_a_hand_off_and_what_it_refuses);
     RUN_TEST(test_the_fault_frame_carries_the_summary_and_passes_the_e2e_check);
     RUN_TEST(test_a_fault_frame_without_a_recent_fault_says_none_and_a_bad_one_is_refused);
     RUN_TEST(test_an_active_fault_makes_the_pack_state_fault_and_sets_its_flag);

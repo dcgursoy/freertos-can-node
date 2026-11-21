@@ -1,7 +1,7 @@
 """Client of the node's simulation control channel.
 
-The simulated hardware around the node (the CAN bus, the sensor front end, later the flash and
-the power supply) is controlled through a UDP socket on the loopback interface, the way a test
+The simulated hardware around the node (the CAN bus, the sensor front end, the flash and its
+supply) is controlled through a UDP socket on the loopback interface, the way a test
 bench controls relays and signal generators around a real device. The firmware itself never
 sees these commands. The protocol is documented in platform/posix/posix_sim.h:
 
@@ -21,13 +21,19 @@ import socket
 import time
 
 # Commands that may reach the node more than once without changing the outcome: they only
-# read (ping, can.status, sensor.status) or set a state to a value (can.fault and the other
-# sensor commands: a channel held, opened or cleared twice, or the front end taken off line or
-# made to hang twice, ends as it would after once). Any other command, can.inject above all (it
-# adds to the errors still to come), is sent once and waited for.
+# read (ping, can.status, sensor.status, flash.status) or set a state to a value (can.fault and
+# the other sensor commands: a channel held, opened or cleared twice, or the front end taken off
+# line or made to hang twice, ends as it would after once). Any other command is sent once and
+# waited for: can.inject above all (it adds to the errors still to come), and flash.cut, which
+# counts its operations from the moment it is served, so that a second delivery after an
+# operation would move the cut.
 REPEATABLE = frozenset({"ping", "can.status", "can.fault",
                         "sensor.status", "sensor.set", "sensor.open", "sensor.offline",
-                        "sensor.hang", "sensor.clear"})
+                        "sensor.hang", "sensor.clear", "flash.status"})
+
+# The largest N of flash.cut, and the largest seed (platform/posix/posix_flash.h).
+FLASH_CUT_MAX = 2147483647
+FLASH_SEED_MAX = 4294967295
 
 # The modes of sensor.hang (platform/posix/posix_sensor.c, docs/sensor-model.md).
 HANG_MODES = ("on", "spin", "off")
@@ -190,3 +196,37 @@ class SimControl:
         """End the fault of `channel`, or with no channel every fault, off line and hang
         included."""
         return self.request("sensor.clear" if channel is None else f"sensor.clear {channel}")
+
+    # ------------------------------------------------------------------- the simulated flash
+    #
+    # platform/posix/posix_flash.h describes the commands and their replies, and docs/update.md
+    # the flash model and what a cut leaves.
+
+    def flash_status(self) -> dict:
+        """The flash's counts since the node opened it and the armed cut.
+
+        Whole numbers are converted to int; `flash` (on, off) and `cut` (none, armed, fired)
+        stay strings. Without a flash (a node started without --flash-file) the reply is
+        {"flash": "off"} alone."""
+        reply = self.request("flash.status")
+        return {key: (int(value) if value.isdigit() else value) for key, value in reply.items()}
+
+    def flash_cut(self, operation: int, seed: int = 0) -> dict[str, str]:
+        """Cut the supply in the `operation`-th flash program or erase that starts after the
+        node served the command (1: the next one), torn as `seed` says; replaces a cut armed
+        before. The node's run then ends as a loss of supply (exit status 12).
+
+        `operation` is a whole number from 1 to FLASH_CUT_MAX and `seed` one from 0 to
+        FLASH_SEED_MAX; anything else raises TypeError or ValueError and sends nothing. Sent
+        once and waited for, never repeated (see REPEATABLE)."""
+        for name, value, low, high in (("operation", operation, 1, FLASH_CUT_MAX),
+                                       ("seed", seed, 0, FLASH_SEED_MAX)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"a flash cut's {name} is a whole number, not {value!r}")
+            if not low <= value <= high:
+                raise ValueError(f"a flash cut's {name} is from {low} to {high}, not {value}")
+        return self.request(f"flash.cut {operation}:{seed}")
+
+    def flash_cut_off(self) -> dict[str, str]:
+        """Disarm a cut that has not fired."""
+        return self.request("flash.cut off")

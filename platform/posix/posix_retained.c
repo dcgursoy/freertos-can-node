@@ -31,8 +31,95 @@
 
 static plat_retained_cell_t *s_cell; /* the mapping, or NULL */
 static int s_fd = -1;                /* open, and locked, while the cell is mapped */
-static posix_retained_info_t s_info = {
-    .open = false, .cause = PLAT_RESET_POWER_ON, .resets = 0U, .verdict = "no cell"};
+static posix_retained_info_t s_info = {.open = false,
+                                       .cause = PLAT_RESET_POWER_ON,
+                                       .resets = 0U,
+                                       .verdict = "no cell",
+                                       .handoff_verdict = "none",
+                                       .have_handoff = false};
+
+/* Word 1 of a hand-off: its fields' places (plat_retained.h, THE HAND-OFF). */
+#define HANDOFF_SLOT_SHIFT    0U
+#define HANDOFF_MODE_SHIFT    8U
+#define HANDOFF_ATTEMPT_SHIFT 16U
+#define HANDOFF_EVENT_SHIFT   24U
+/* Word 3. */
+#define HANDOFF_EVENT_SLOT_SHIFT  0U
+#define HANDOFF_WRITE_ERROR_SHIFT 8U
+#define HANDOFF_BYTE              0xFFU
+/* The largest boot_status_t of lib/boot (BOOT_E_POWER_LOST), the bound of a write error. */
+#define HANDOFF_WRITE_ERROR_MAX 10U
+
+_Static_assert(PLAT_RETAINED_RESERVED_WORDS == 4U, "the hand-off takes the four reserved words");
+
+void posix_handoff_encode(const plat_boot_handoff_t *handoff,
+                          uint32_t words[PLAT_RETAINED_RESERVED_WORDS])
+{
+    words[0] = PLAT_HANDOFF_MAGIC;
+    words[1] = ((uint32_t)handoff->slot << HANDOFF_SLOT_SHIFT) |
+               ((uint32_t)handoff->mode << HANDOFF_MODE_SHIFT) |
+               ((uint32_t)handoff->attempt << HANDOFF_ATTEMPT_SHIFT) |
+               ((uint32_t)handoff->event << HANDOFF_EVENT_SHIFT);
+    words[2] = handoff->image_version;
+    words[3] = ((uint32_t)handoff->event_slot << HANDOFF_EVENT_SLOT_SHIFT) |
+               ((uint32_t)handoff->select_write_error << HANDOFF_WRITE_ERROR_SHIFT);
+}
+
+static bool handoff_event_known(uint32_t event)
+{
+    return (event == (uint32_t)PLAT_BOOT_EVENT_NONE) ||
+           (event == (uint32_t)PLAT_BOOT_EVENT_ADOPT) ||
+           (event == (uint32_t)PLAT_BOOT_EVENT_ROLLBACK) ||
+           (event == (uint32_t)PLAT_BOOT_EVENT_REJECT) ||
+           (event == (uint32_t)PLAT_BOOT_EVENT_FALLBACK);
+}
+
+/* The rules of THE HAND-OFF for decoded fields. */
+static bool handoff_valid(uint32_t slot, uint32_t mode, uint32_t attempt, uint32_t event,
+                          uint32_t event_slot, uint32_t write_error)
+{
+    const bool trial = (mode == (uint32_t)PLAT_BOOT_TRIAL);
+    const bool confirmed = (mode == (uint32_t)PLAT_BOOT_CONFIRMED);
+    const bool attempt_ok =
+        trial ? ((attempt >= 1U) && (attempt <= PLAT_HANDOFF_MAX_ATTEMPT)) : (attempt == 0U);
+    const bool event_ok = handoff_event_known(event) && ((event == (uint32_t)PLAT_BOOT_EVENT_NONE)
+                                                             ? (event_slot == PLAT_HANDOFF_NO_SLOT)
+                                                             : (event_slot < 2U));
+
+    return (slot < 2U) && (trial || confirmed) && attempt_ok && event_ok &&
+           (write_error <= HANDOFF_WRITE_ERROR_MAX);
+}
+
+const char *posix_handoff_decode(const uint32_t words[PLAT_RETAINED_RESERVED_WORDS],
+                                 plat_boot_handoff_t *out)
+{
+    const char *verdict = "none";
+
+    if (words[0] == PLAT_HANDOFF_MAGIC) {
+        const uint32_t slot = (words[1] >> HANDOFF_SLOT_SHIFT) & HANDOFF_BYTE;
+        const uint32_t mode = (words[1] >> HANDOFF_MODE_SHIFT) & HANDOFF_BYTE;
+        const uint32_t attempt = (words[1] >> HANDOFF_ATTEMPT_SHIFT) & HANDOFF_BYTE;
+        const uint32_t event = (words[1] >> HANDOFF_EVENT_SHIFT) & HANDOFF_BYTE;
+        const uint32_t event_slot = (words[3] >> HANDOFF_EVENT_SLOT_SHIFT) & HANDOFF_BYTE;
+        const uint32_t write_error = (words[3] >> HANDOFF_WRITE_ERROR_SHIFT) & HANDOFF_BYTE;
+        const bool rest_zero = (words[3] >> 16U) == 0U;
+
+        verdict = "invalid";
+
+        if (rest_zero && handoff_valid(slot, mode, attempt, event, event_slot, write_error)) {
+            out->slot = (uint8_t)slot;
+            out->mode = (mode == (uint32_t)PLAT_BOOT_TRIAL) ? PLAT_BOOT_TRIAL : PLAT_BOOT_CONFIRMED;
+            out->attempt = (uint8_t)attempt;
+            out->image_version = words[2];
+            out->event = (plat_boot_event_t)event;
+            out->event_slot = (uint8_t)event_slot;
+            out->select_write_error = (uint8_t)write_error;
+            verdict = "taken";
+        }
+    }
+
+    return verdict;
+}
 
 bool posix_retained_reason_recorded(uint32_t reason)
 {
@@ -156,7 +243,35 @@ static bool fail(char *error, size_t error_len, const char *what, const char *pa
     return false;
 }
 
-bool posix_retained_open(const char *path, char *error, size_t error_len)
+/* A cell whose magic, version, size and CRC are right, whatever its reason says. */
+static bool intact(const char *verdict)
+{
+    return (verdict == NULL) || (strcmp(verdict, "no reset") == 0) ||
+           (strcmp(verdict, "reason") == 0);
+}
+
+/* Take the hand-off out of an intact cell: decode it into s_info and, if word 0 was the magic
+ * (a hand-off, valid or not), zero the four words. The caller seals the cell. */
+static void take_handoff(plat_retained_cell_t *cell)
+{
+    plat_boot_handoff_t handoff;
+    const char *verdict = posix_handoff_decode(cell->reserved, &handoff);
+
+    s_info.handoff_verdict = verdict;
+    s_info.have_handoff = (strcmp(verdict, "taken") == 0);
+
+    if (s_info.have_handoff) {
+        s_info.handoff = handoff;
+    }
+
+    if (strcmp(verdict, "none") != 0) {
+        (void)memset(cell->reserved, 0, sizeof(cell->reserved));
+    }
+}
+
+/* posix_retained_open() and posix_retained_open_boot(): `keep_reason` leaves the reason of a
+ * reset in the cell (the bootloader). */
+static bool open_cell(const char *path, bool keep_reason, char *error, size_t error_len)
 {
     struct stat info;
     bool existed;
@@ -169,9 +284,14 @@ bool posix_retained_open(const char *path, char *error, size_t error_len)
         return false;
     }
 
+    s_info = (posix_retained_info_t){.open = false,
+                                     .cause = PLAT_RESET_POWER_ON,
+                                     .resets = 0U,
+                                     .verdict = "no cell",
+                                     .handoff_verdict = "none",
+                                     .have_handoff = false};
+
     if (path == NULL) {
-        s_info = (posix_retained_info_t){
-            .open = false, .cause = PLAT_RESET_POWER_ON, .resets = 0U, .verdict = "no cell"};
         return true;
     }
 
@@ -223,22 +343,76 @@ bool posix_retained_open(const char *path, char *error, size_t error_len)
     {
         const char *verdict = (size_verdict != NULL) ? size_verdict : judge(s_cell);
 
+        s_info.open = true;
+
+        /* The hand-off first, whatever the reason: a bootloader that started the image after
+         * power-on wrote it into a cell that records no reset. */
+        if ((size_verdict == NULL) && intact(verdict)) {
+            take_handoff(s_cell);
+        }
+
         if (verdict == NULL) {
-            /* A reset: report its reason once, and keep the count and the reserved words. */
-            s_info = (posix_retained_info_t){.open = true,
-                                             .cause = (plat_reset_reason_t)s_cell->reset_reason,
-                                             .resets = s_cell->resets,
-                                             .verdict = "reset"};
-            s_cell->reset_reason = (uint32_t)PLAT_RESET_POWER_ON;
+            /* A reset: report its reason once, and keep the count and the reserved words (but
+             * for a hand-off, taken above). The bootloader leaves the reason for the image. */
+            s_info.cause = (plat_reset_reason_t)s_cell->reset_reason;
+            s_info.resets = s_cell->resets;
+            s_info.verdict = "reset";
+
+            if (!keep_reason) {
+                s_cell->reset_reason = (uint32_t)PLAT_RESET_POWER_ON;
+            }
+
             seal(s_cell);
         } else {
-            s_info = (posix_retained_info_t){
-                .open = true, .cause = PLAT_RESET_POWER_ON, .resets = 0U, .verdict = verdict};
+            s_info.verdict = verdict;
             initialise(s_cell);
         }
     }
 
     return true;
+}
+
+bool posix_retained_open(const char *path, char *error, size_t error_len)
+{
+    return open_cell(path, false, error, error_len);
+}
+
+bool posix_retained_open_boot(const char *path, char *error, size_t error_len)
+{
+    return open_cell(path, true, error, error_len);
+}
+
+bool posix_retained_set_handoff(const plat_boot_handoff_t *handoff)
+{
+    bool written = false;
+
+    if ((s_cell != NULL) && (handoff != NULL)) {
+        uint32_t words[PLAT_RETAINED_RESERVED_WORDS];
+        plat_boot_handoff_t check;
+
+        posix_handoff_encode(handoff, words);
+
+        /* Only a hand-off the image will take: what the encoding made of it must decode. */
+        if (strcmp(posix_handoff_decode(words, &check), "taken") == 0) {
+            (void)memcpy(s_cell->reserved, words, sizeof(words));
+            seal(s_cell);
+            written = true;
+        }
+    }
+
+    return written;
+}
+
+bool plat_boot_handoff(plat_boot_handoff_t *out)
+{
+    bool present = false;
+
+    if ((out != NULL) && s_info.have_handoff) {
+        *out = s_info.handoff;
+        present = true;
+    }
+
+    return present;
 }
 
 void posix_retained_note_reset(plat_reset_reason_t reason)

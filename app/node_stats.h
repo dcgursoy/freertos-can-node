@@ -12,16 +12,19 @@
 #include <stdint.h>
 
 #include "bms/bms.h"
+#include "boot/boot.h"
 #include "can_io.h"
 #include "command.h"
 #include "fault.h"
+#include "plat_retained.h"
+#include "update.h"
 #include "wdgm/wdgm.h"
 
 #define NODE_STATS_MAX_TASKS 12U
 #define NODE_STATS_NAME_LEN  16U
 
 /** The cyclic messages the node sends, one transmit-queue slot each. */
-#define NODE_STATS_MESSAGES 8U
+#define NODE_STATS_MESSAGES 9U
 
 typedef struct {
     char name[NODE_STATS_NAME_LEN];
@@ -103,6 +106,32 @@ typedef struct {
     can_txq_slot_stats_t queue;
 } node_message_stats_t;
 
+/** What the flash task did (app.c, THE UPDATE). */
+typedef struct {
+    bool flash;                     /**< the run has a flash (plat_flash_device() not NULL) */
+    bool boot_ready;                /**< boot_init() accepted the platform's layout */
+    boot_status_t boot_init_status; /**< what boot_init() returned (BOOT_E_ARG: no flash) */
+    bool described;                 /**< the metadata were read at start */
+    boot_status_t describe_status;  /**< what boot_describe() returned */
+    bool have_record;               /**< of the description: a record was found */
+    uint32_t seq;                   /**< the newest record's sequence number */
+    uint8_t active_slot;            /**< the CONFIRMED slot, or BOOT_NO_SLOT */
+    uint8_t trial_slot;             /**< the TRIAL slot, or BOOT_NO_SLOT */
+    uint8_t attempts_used;          /**< of the trial */
+    uint32_t records_valid;         /**< valid records in the log */
+    uint32_t confirms;              /**< confirms made (boot_confirm() calls) */
+    boot_status_t confirm_status;   /**< what the last one returned */
+    uint64_t confirm_ns;            /**< how long it took, waits for the flash included */
+} node_flash_task_stats_t;
+
+/** The update: the hand-off, the confirm monitor of the health task, the flash task. */
+typedef struct {
+    bool have_handoff;
+    plat_boot_handoff_t handoff;
+    update_monitor_t monitor;
+    node_flash_task_stats_t flash_task;
+} node_update_stats_t;
+
 typedef struct {
     bool valid;
     uint64_t total_run_time_us; /**< run-time counter when the snapshot was taken */
@@ -123,6 +152,7 @@ typedef struct {
     fault_monitor_t faults;        /**< the DTCs, copied by their owner, the health task */
     fault_summary_t fault_summary; /**< what the last BMS_Fault reported */
     node_supervision_stats_t supervision;
+    node_update_stats_t update; /**< the hand-off, the confirm, the flash task */
 } node_stats_t;
 
 /** Fill the task table of `out` from uxTaskGetSystemState() (overruns 0). Call from a task;

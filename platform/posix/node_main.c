@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "FreeRTOS.h"
@@ -24,6 +25,7 @@
 #include "app_tasks.h"
 #include "can_backend.h"
 #include "plat_can.h"
+#include "posix_flash.h"
 #include "posix_platform.h"
 #include "posix_retained.h"
 #include "posix_sensor.h"
@@ -51,6 +53,9 @@ typedef struct {
     app_config_t app;
     const char *stats_path;
     const char *retained_path; /* NULL: no retained cell, every start is a power-on */
+    const char *flash_path;    /* NULL: no flash, plat_flash_device() is NULL */
+    bool flash_cut_given;      /* --flash-cut: flash_cut is armed for this run */
+    posix_flash_cut_t flash_cut;
     const char *can_spec;
     uint32_t bitrate;
     uint32_t sensor_seed;
@@ -75,6 +80,12 @@ static void print_usage(const char *program)
                  "                         reset in PATH, which is created if missing; remove\n"
                  "                         it to simulate a power loss (default: no cell, every\n"
                  "                         start is a power-on)\n"
+                 "  --flash-file PATH      the flash (2 MiB and 8 KiB): PATH is created erased if\n"
+                 "                         missing, and one of another size is refused (default:\n"
+                 "                         no flash)\n"
+                 "  --flash-cut N[:SEED]   cut the supply in the N-th flash program or erase of\n"
+                 "                         this run (1 to %u), torn as SEED (0 to 4294967295,\n"
+                 "                         default 0) says; the run ends as a power loss (12)\n"
                  "  --tick-mode MODE       locked (default) or stock\n"
                  "  --irq-mode MODE        signal (default) or poll\n"
                  "  --log-file PATH        write the log to PATH instead of stderr\n"
@@ -86,8 +97,8 @@ static void print_usage(const char *program)
                  "%d when an orderly stop hung; 10 to 22 for a reset of the node\n"
                  "(platform/include/platform.h)\n",
                  program, (unsigned int)CAN_UDP_DEFAULT_PORT, (unsigned int)DEFAULT_BITRATE,
-                 (unsigned int)POSIX_SENSOR_DEFAULT_SEED, POSIX_EXIT_CAN_TRANSPORT_LOST,
-                 POSIX_EXIT_SHUTDOWN_TIMEOUT);
+                 (unsigned int)POSIX_SENSOR_DEFAULT_SEED, (unsigned int)POSIX_FLASH_CUT_MAX,
+                 POSIX_EXIT_CAN_TRANSPORT_LOST, POSIX_EXIT_SHUTDOWN_TIMEOUT);
 }
 
 static bool parse_log_level(const char *text, log_level_t *out)
@@ -144,6 +155,8 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         OPT_SIM_PORT,
         OPT_SENSOR_SEED,
         OPT_RETAINED,
+        OPT_FLASH,
+        OPT_FLASH_CUT,
         OPT_VERSION,
         OPT_HELP
     };
@@ -159,6 +172,8 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         {"sim-port", required_argument, NULL, OPT_SIM_PORT},
         {"sensor-seed", required_argument, NULL, OPT_SENSOR_SEED},
         {"retained-file", required_argument, NULL, OPT_RETAINED},
+        {"flash-file", required_argument, NULL, OPT_FLASH},
+        {"flash-cut", required_argument, NULL, OPT_FLASH_CUT},
         {"version", no_argument, NULL, OPT_VERSION},
         {"help", no_argument, NULL, OPT_HELP},
         {NULL, 0, NULL, 0}};
@@ -240,6 +255,20 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         case OPT_RETAINED:
             options->retained_path = optarg;
             break;
+        case OPT_FLASH:
+            options->flash_path = optarg;
+            break;
+        case OPT_FLASH_CUT: {
+            char message[200];
+
+            if (posix_flash_parse_cut(optarg, &options->flash_cut, message, sizeof(message))) {
+                options->flash_cut_given = true;
+            } else {
+                (void)fprintf(stderr, "invalid --flash-cut: %s\n", message);
+                result = 2;
+            }
+            break;
+        }
         case OPT_VERSION:
             (void)printf("fcn_node %s (FreeRTOS %s)\n", FCN_VERSION, tskKERNEL_VERSION_NUMBER);
             result = 1;
@@ -565,6 +594,123 @@ static void write_platform_reset_stats(FILE *file)
     put_u64(file, "longest_gap_ns", wdg.longest_gap_ns, "},\n");
 }
 
+/* "flash": what the simulated flash counted (posix_flash.h; the same figures as the simulation
+ * command flash.status). "file" is false for a run without --flash-file; every count is 0
+ * then. A cut that fired ends the run, so a run that writes statistics shows "none" or
+ * "armed". */
+static void write_flash_stats(FILE *file, const node_options_t *options)
+{
+    posix_flash_info_t flash;
+
+    posix_flash_get_info(&flash);
+    (void)fprintf(file, "  \"flash\": {");
+    put_bool(file, "file", (options->flash_path != NULL), ", ");
+    put_bool(file, "created", flash.created, ", ");
+    put_u64(file, "reads", flash.reads, ", ");
+    put_u64(file, "bytes_read", flash.bytes_read, ", ");
+    put_u64(file, "programs", flash.programs, ", ");
+    put_u64(file, "units_programmed", flash.units_programmed, ", ");
+    put_u64(file, "erases", flash.erases, ", ");
+    put_u64(file, "refused", flash.refused, ",\n    ");
+    put_u64(file, "busy_ns", flash.busy_ns, ", ");
+    put_u64(file, "erases_meta", flash.erases_meta, ", ");
+    put_u64(file, "erases_slot_a", flash.erases_slot[0], ", ");
+    put_u64(file, "erases_slot_b", flash.erases_slot[1], ", ");
+    put_u64(file, "max_sector_erases", flash.max_sector_erases, ", ");
+
+    const char *cut = "none";
+
+    if (flash.cut_fired) {
+        cut = "fired";
+    } else if (flash.cut_in != 0U) {
+        cut = "armed";
+    } else {
+        /* none armed */
+    }
+
+    (void)fprintf(file, "\"cut\": \"%s\", ", cut);
+    put_u64(file, "cut_in", flash.cut_in, ", ");
+    put_u64(file, "cut_seed", flash.cut_seed, "},\n");
+}
+
+/* A slot index as a JSON value: "A", "B", or null for any other. */
+static const char *slot_name(uint8_t slot)
+{
+    static const char *const names[] = {"\"A\"", "\"B\""};
+
+    return (slot < 2U) ? names[slot] : "null";
+}
+
+/* An image version (lib/image: major.minor.patch) as "1.2.3" and its number. */
+static void put_version(FILE *file, const char *key, uint32_t version, const char *separator)
+{
+    (void)fprintf(file, "\"%s\": \"%u.%u.%u\", \"%s_code\": %lu%s", key,
+                  (unsigned int)(version >> 24U), (unsigned int)((version >> 16U) & 0xFFU),
+                  (unsigned int)(version & 0xFFFFU), key, (unsigned long)version, separator);
+}
+
+/*
+ * "handoff" and "confirm": what the bootloader handed over (plat_retained.h, THE HAND-OFF; the
+ * verdict is posix_retained_info_t's) and the confirm of a trial (app/update.h) with the flash
+ * task that makes it (app.c, THE UPDATE). Without a hand-off "present" is false and the slot,
+ * mode and version are null. The names are fixed words, which need no escaping.
+ */
+static void write_update_stats(FILE *file, const node_stats_t *stats)
+{
+    const node_update_stats_t *update = &stats->update;
+    const plat_boot_handoff_t *h = &update->handoff;
+    const update_monitor_t *m = &update->monitor;
+    const node_flash_task_stats_t *f = &update->flash_task;
+    posix_retained_info_t retained;
+
+    posix_retained_get_info(&retained);
+    (void)fprintf(file, "  \"handoff\": {\"verdict\": \"%s\", ", retained.handoff_verdict);
+    put_bool(file, "present", update->have_handoff, ", ");
+
+    if (update->have_handoff) {
+        (void)fprintf(file, "\"slot\": %s, \"mode\": \"%s\", ", slot_name(h->slot),
+                      (h->mode == PLAT_BOOT_TRIAL) ? "trial" : "confirmed");
+        put_u64(file, "attempt", h->attempt, ", ");
+        put_version(file, "image_version", h->image_version, ", ");
+        (void)fprintf(file, "\"event\": \"%s\", \"event_slot\": %s, ", update_event_name(h->event),
+                      slot_name(h->event_slot));
+        put_u64(file, "select_write_error", h->select_write_error, ", ");
+    } else {
+        (void)fprintf(file, "\"slot\": null, \"mode\": null, \"attempt\": 0, "
+                            "\"image_version\": null, \"image_version_code\": null, "
+                            "\"event\": \"NONE\", \"event_slot\": null, "
+                            "\"select_write_error\": 0, ");
+    }
+
+    put_bool(file, "rolled_back", update_rolled_back(update->have_handoff ? h : NULL), "},\n");
+
+    (void)fprintf(file, "  \"confirm\": {\"state\": \"%s\", ", update_confirm_state_name(m->state));
+    put_u64(file, "confirm_after_s", UPDATE_CONFIRM_AFTER_S, ", ");
+    put_u64(file, "periods_needed", m->periods_needed, ", ");
+    put_u64(file, "periods", m->periods, ", ");
+    put_u64(file, "healthy_periods", m->healthy_periods, ", ");
+    put_u64(file, "window_restarts", m->window_restarts, ", ");
+    put_u64(file, "requested_period", m->requested_period, ", ");
+    (void)fprintf(file, "\"status\": \"%s\",\n    \"flash_task\": {",
+                  boot_status_name(m->confirm_status));
+    put_bool(file, "flash", f->flash, ", ");
+    (void)fprintf(file, "\"boot_init\": \"%s\", ", boot_status_name(f->boot_init_status));
+    put_bool(file, "described", f->described, ", ");
+
+    if (f->described) {
+        put_bool(file, "have_record", f->have_record, ", ");
+        put_u64(file, "seq", f->seq, ", ");
+        (void)fprintf(file, "\"active_slot\": %s, \"trial_slot\": %s, ", slot_name(f->active_slot),
+                      slot_name(f->trial_slot));
+        put_u64(file, "attempts_used", f->attempts_used, ", ");
+        put_u64(file, "records_valid", f->records_valid, ", ");
+    }
+
+    put_u64(file, "confirms", f->confirms, ", ");
+    (void)fprintf(file, "\"confirm_status\": \"%s\", ", boot_status_name(f->confirm_status));
+    put_u64(file, "confirm_ns", f->confirm_ns, "}},\n");
+}
+
 /* "command": the receiver of TESTER_Command (app/command.h). */
 static void write_command_stats(FILE *file, const node_stats_t *stats)
 {
@@ -759,6 +905,8 @@ static bool write_stats(const char *path, const node_options_t *options, uint64_
                   (unsigned long long)irq.serviced_by_tick, (unsigned int)irq.max_nesting);
     (void)fprintf(file, "  \"log_lines_dropped\": %u,\n", (unsigned int)posix_log_dropped());
     write_platform_reset_stats(file);
+    write_flash_stats(file, options);
+    write_update_stats(file, stats);
     write_can_stats(file, stats);
     (void)fprintf(file, "  \"run_time_total_us\": %llu,\n",
                   (unsigned long long)stats->total_run_time_us);
@@ -874,6 +1022,11 @@ static bool check_configuration(const node_options_t *options, char *error, size
         return false;
     }
 
+    if (options->flash_cut_given && (options->flash_path == NULL)) {
+        (void)snprintf(error, error_len, "--flash-cut needs a flash (--flash-file)");
+        return false;
+    }
+
     return output_path_usable(options->platform.log_path, "--log-file", error, error_len) &&
            output_path_usable(options->stats_path, "--stats-json", error, error_len) &&
            output_path_usable(options->retained_path, "--retained-file", error, error_len);
@@ -884,6 +1037,21 @@ static bool check_configuration(const node_options_t *options, char *error, size
 static void sensor_wait_one_tick(void)
 {
     vTaskDelay(1U);
+}
+
+/* A flash operation (posix_flash.h) waits as a driver of a serial NOR waits for the busy flag
+ * of its part: it looks once per tick and blocks its task in between, so that the tasks below
+ * it run. Called again until the operation's modelled time has passed. Before the scheduler
+ * runs there is no task to block: the main thread sleeps for a millisecond instead. */
+static void flash_wait_one_tick(void)
+{
+    if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+        vTaskDelay(1U);
+    } else {
+        const struct timespec nap = {0, 1000000L};
+
+        (void)nanosleep(&nap, NULL);
+    }
 }
 
 int main(int argc, char **argv)
@@ -932,6 +1100,20 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    /* The flash is part of the board as well: a file of the wrong size is a start-up error,
+     * before anything runs. Without --flash-file the run has no flash and nothing changes. */
+    if (!posix_flash_open(options.flash_path, NULL, error, sizeof(error))) {
+        (void)fprintf(stderr, "fcn_node: %s\n", error);
+        posix_retained_close();
+        return EXIT_FAILURE;
+    }
+
+    posix_flash_set_wait(flash_wait_one_tick);
+
+    if (options.flash_cut_given) {
+        posix_flash_arm_cut(&options.flash_cut);
+    }
+
     posix_platform_init(&options.platform);
     LOG_INF("main", "fcn_node %s starting (FreeRTOS %s)", FCN_VERSION, tskKERNEL_VERSION_NUMBER);
 
@@ -942,6 +1124,23 @@ int main(int argc, char **argv)
         LOG_INF("main", "reset cause %s (retained cell: %s, %lu resets since power-on)",
                 posix_reset_reason_name(retained.cause), retained.verdict,
                 (unsigned long)retained.resets);
+    }
+
+    if (options.flash_path != NULL) {
+        posix_flash_info_t flash;
+
+        /* The path last: a long one is cut off at the end of the line, not the rest. */
+        posix_flash_get_info(&flash);
+
+        if (options.flash_cut_given) {
+            LOG_INF("main", "flash %s, power cut in program or erase %lu, seed %lu: %s",
+                    flash.created ? "created erased" : "opened",
+                    (unsigned long)options.flash_cut.operation,
+                    (unsigned long)options.flash_cut.seed, options.flash_path);
+        } else {
+            LOG_INF("main", "flash %s, no power cut: %s",
+                    flash.created ? "created erased" : "opened", options.flash_path);
+        }
     }
 
     /* The simulated hardware comes up before the application, as a board is powered before
@@ -960,6 +1159,7 @@ int main(int argc, char **argv)
         (void)fprintf(stderr, "fcn_node: %s\n", error);
         posix_sim_close();
         posix_platform_shutdown();
+        posix_flash_close();
         posix_retained_close();
         return EXIT_FAILURE;
     }
@@ -979,6 +1179,7 @@ int main(int argc, char **argv)
     posix_sim_close();
     LOG_INF("main", "scheduler stopped");
     posix_platform_shutdown();
+    posix_flash_close();
     posix_retained_close();
 
     const int transport_error = posix_can_transport_error();

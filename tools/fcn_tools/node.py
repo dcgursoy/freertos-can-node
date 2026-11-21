@@ -9,6 +9,17 @@ retained RAM intact. The bench does the same with restarted(): a new run of the 
 with the same options and the same retained-RAM cell (`retained_file`, the node's
 `--retained-file`), so that the new run learns why the last one ended. Removing the cell's file
 before the restart is a loss of power.
+
+A node with a flash (`flash_file`) is started the way a board with a bootloader starts: through
+fcn_boot (platform/posix/boot_main.c), which selects the image in the flash, writes its hand-off
+into the retained cell and replaces itself with the image, keeping the process id, so that the
+bench sees one process, the node, and its exit status. Its own log goes to `boot_log_path` (the
+node truncates its own log when it starts). restarted() keeps the flash file: the next run
+starts through the bootloader again, as a board does after every reset.
+
+A run that ends with PLAT_RESET_POWER_LOSS (12) lost its supply, which on the host only a cut of
+the flash's supply does (--flash-cut, flash.cut). Such an end is expected only from a run in which
+the test armed a cut (`cut_armed`): otherwise it is reported, also when the test waited for it.
 """
 from __future__ import annotations
 
@@ -45,6 +56,30 @@ RESET_MALLOC_FAILED = 22
 RESETS = frozenset({RESET_REQUESTED, RESET_WATCHDOG, RESET_POWER_LOSS, RESET_IMAGE_FAULT,
                     RESET_ASSERT, RESET_STACK_OVERFLOW, RESET_MALLOC_FAILED})
 
+#: fcn_boot's own exit statuses (platform/posix/boot_host.h), when it starts no image. None of
+#: them is a reset: a board whose bootloader finds nothing to start stays there.
+BOOT_NOTHING_BOOTABLE = 40
+BOOT_FLASH_ERROR = 41
+BOOT_JUMP_FAILED = 42
+
+
+def _without_cut(args: Sequence[str]) -> tuple[str, ...]:
+    """`args` without a `--flash-cut N[:SEED]` (as two arguments or as --flash-cut=...)."""
+    kept: list[str] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg == "--flash-cut":
+            skip = True
+        elif not arg.startswith("--flash-cut="):
+            kept.append(arg)
+    return tuple(kept)
+
+
+def _has_cut(args: Sequence[str]) -> bool:
+    return any(arg == "--flash-cut" or arg.startswith("--flash-cut=") for arg in args)
+
 
 def lost_kicks_in(stats: dict, name: str) -> str | None:
     """NodeProcess.lost_kicks() on the statistics `stats` of a run that ended in order (status
@@ -76,7 +111,14 @@ class NodeProcess:
     sim_port: int | None = None   # serve simulation control on this port; None: off
     # The retained-RAM cell (--retained-file); None: no cell, every start is a power-on.
     retained_file: Path | None = None
+    # The flash file (--flash-file); with one, the node is started through fcn_boot.
+    flash_file: Path | None = None
+    # Options of fcn_boot itself (before "--"), for example its own --flash-cut.
+    boot_args: Sequence[str] = ()
+    boot_binary: Path = field(default_factory=paths.boot_binary)
     _proc: subprocess.Popen | None = field(default=None, init=False, repr=False)
+    # True once a cut of the flash's supply was armed for this run (see cut_armed).
+    _cut_armed_at_run_time: bool = field(default=False, init=False, repr=False)
     # True once the caller has taken note of how the run ended: it waited for the node,
     # stopped it, or killed it on purpose. See unnoticed_end().
     _end_noticed: bool = field(default=False, init=False, repr=False)
@@ -99,30 +141,61 @@ class NodeProcess:
     def stderr_path(self) -> Path:
         return self.workdir / f"{self.name}.stderr.txt"
 
+    @property
+    def boot_log_path(self) -> Path:
+        """The bootloader's log of this run (only a run with a flash file has one)."""
+        return self.workdir / f"{self.name}.boot.log"
+
+    @property
+    def cut_armed(self) -> bool:
+        """Whether a cut of the flash's supply was armed for this run: --flash-cut among the
+        node's or the bootloader's options, or arm_flash_cut() at run time. Only such a run may
+        end as a power loss (12)."""
+        return (_has_cut(self.args) or _has_cut(self.boot_args)
+                or self._cut_armed_at_run_time)
+
+    def command(self) -> list[str]:
+        """The command line start() runs: the node, or, with a flash file, the bootloader with
+        the node's options after "--" (it adds --flash-file and --retained-file to them)."""
+        options = ["--log-file", str(self.log_path), "--stats-json", str(self.stats_path)]
+        if self.can is not None:
+            options += ["--can", self.can]
+        if self.sim_port is not None:
+            options += ["--sim-port", str(self.sim_port)]
+        if self.flash_file is None:
+            if self.retained_file is not None:
+                options += ["--retained-file", str(self.retained_file)]
+            return [str(self.binary), *options, *self.args]
+        boot = [str(self.boot_binary), "--flash-file", str(self.flash_file),
+                "--log-file", str(self.boot_log_path)]
+        if self.retained_file is not None:
+            boot += ["--retained-file", str(self.retained_file)]
+        return [*boot, *self.boot_args, "--", *options, *self.args]
+
+    def arm_flash_cut(self, operation: int, seed: int = 0) -> dict[str, str]:
+        """Cut the flash's supply in the `operation`-th program or erase from now (simulation
+        command flash.cut, SimControl.flash_cut()), and note that this run may end as a power
+        loss. Returns the reply."""
+        with self.sim() as control:
+            reply = control.flash_cut(operation, seed)
+        self._cut_armed_at_run_time = True
+        return reply
     def start(self) -> "NodeProcess":
-        if not self.binary.exists():
+        program = self.binary if self.flash_file is None else self.boot_binary
+        if not program.exists():
             raise FileNotFoundError(
-                f"{self.binary} does not exist: build it with scripts/build.sh release"
+                f"{program} does not exist: build it with scripts/build.sh release"
             )
         self.workdir.mkdir(parents=True, exist_ok=True)
         # Files of an earlier run with the same name would otherwise answer for this one: a
         # node that dies before writing its statistics must leave no statistics file at all.
-        for path in (self.log_path, self.stats_path, self.stdout_path, self.stderr_path):
+        for path in (self.log_path, self.stats_path, self.stdout_path, self.stderr_path,
+                     self.boot_log_path):
             path.unlink(missing_ok=True)
         self._end_noticed = False
         self._reset_awaited = False
-        command = [
-            str(self.binary),
-            "--log-file", str(self.log_path),
-            "--stats-json", str(self.stats_path),
-        ]
-        if self.can is not None:
-            command += ["--can", self.can]
-        if self.sim_port is not None:
-            command += ["--sim-port", str(self.sim_port)]
-        if self.retained_file is not None:
-            command += ["--retained-file", str(self.retained_file)]
-        command += self.args
+        self._cut_armed_at_run_time = False
+        command = self.command()
         # A session of its own: a Ctrl-C aimed at the test runner must not reach the node
         # behind the test's back. FCN_DIE_WITH_PARENT carries this process's id: the node
         # asks the kernel to kill it when its parent exits, so a crashed test run leaves no
@@ -190,18 +263,31 @@ class NodeProcess:
         status = self.wait(timeout=timeout)
         assert status in RESETS, (f"{self.name} ended with status {status}, not a reset\n"
                                   f"--- stderr\n{self.stderr()}")
+        assert status != RESET_POWER_LOSS or self.cut_armed, (
+            f"{self.name} ended as a loss of supply (status {status}) in a run without a cut of "
+            f"the flash's supply armed\n--- stderr\n{self.stderr()}")
         return status
 
-    def restarted(self, name: str | None = None) -> "NodeProcess":
+    def restarted(self, name: str | None = None, args: Sequence[str] | None = None,
+                  boot_args: Sequence[str] | None = None) -> "NodeProcess":
         """A new run of this node, as a board starts again after a reset: the same binary,
-        options, bus, simulation control port and retained-RAM cell, not yet started. It gets
-        files of its own, under `name` (default: this run's name with "-again"), so that this
-        run's log and statistics stay. This run must have ended: two runs never share a cell."""
+        options, bus, simulation control port, retained-RAM cell and flash file (so through the
+        bootloader again if this run had one), not yet started. A cut of the flash's supply
+        armed for this run on a command line (--flash-cut) is not armed again: it was a fault of
+        that run. `args` and `boot_args` replace the node's and the bootloader's options. It
+        gets files of its own, under `name` (default: this run's name with "-again"), so that
+        this run's log and statistics stay. This run must have ended: two runs never share a
+        cell."""
         assert self._proc is not None and self._proc.poll() is not None, \
             f"{self.name} is still running"
-        return NodeProcess(workdir=self.workdir, args=tuple(self.args), binary=self.binary,
-                           name=name or f"{self.name}-again", can=self.can,
-                           sim_port=self.sim_port, retained_file=self.retained_file)
+        return NodeProcess(workdir=self.workdir,
+                           args=tuple(_without_cut(self.args) if args is None else args),
+                           binary=self.binary, name=name or f"{self.name}-again", can=self.can,
+                           sim_port=self.sim_port, retained_file=self.retained_file,
+                           flash_file=self.flash_file,
+                           boot_args=tuple(_without_cut(self.boot_args) if boot_args is None
+                                           else boot_args),
+                           boot_binary=self.boot_binary)
 
     def kill(self) -> None:
         """Pull the plug: SIGKILL, no chance to clean up. A test that calls this has decided
@@ -252,9 +338,14 @@ class NodeProcess:
         if self._proc is None:
             return None
         status = self._proc.poll()
-        if status is None or status not in RESETS or self._reset_awaited:
+        if status is None or status not in RESETS:
             return None
         tail = "\n".join(self.stderr().strip().splitlines()[-20:])
+        if status == RESET_POWER_LOSS and not self.cut_armed:
+            return (f"{self.name} ended as a loss of supply (status {status}) although the test "
+                    f"armed no cut of the flash's supply\n--- stderr (last lines)\n{tail}")
+        if self._reset_awaited:
+            return None
         return (f"{self.name} was reset (status {status}) in a test that does not expect a "
                 f"reset (it never called wait_for_reset())\n--- stderr (last lines)\n{tail}")
 
@@ -292,6 +383,11 @@ class NodeProcess:
 
     def log(self) -> str:
         return self.log_path.read_text(errors="replace") if self.log_path.exists() else ""
+
+    def boot_log(self) -> str:
+        """What the bootloader of this run logged ("" for a run without a flash file)."""
+        path = self.boot_log_path
+        return path.read_text(errors="replace") if path.exists() else ""
 
     def stats(self) -> dict:
         """The statistics this run wrote when it stopped. Raises FileNotFoundError if it

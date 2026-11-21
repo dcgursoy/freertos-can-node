@@ -434,6 +434,265 @@ static void test_the_crc_is_crc32_over_the_bytes_before_it(void)
     TEST_ASSERT_EQUAL_HEX32(0xCBF43926U, crc32_compute(check, 9U));
 }
 
+/* ------------------------------------------------------------------------- the hand-off */
+
+/* The four words of a hand-off, written here from the table of plat_retained.h, THE HAND-OFF:
+ * the magic, then slot | mode << 8 | attempt << 16 | event << 24, the version, and
+ * event_slot | write_error << 8. */
+static void handoff_words(uint32_t words[4], uint32_t slot, uint32_t mode, uint32_t attempt,
+                          uint32_t event, uint32_t version, uint32_t event_slot,
+                          uint32_t write_error)
+{
+    words[0] = 0x484E4346U; /* the bytes 'F' 'C' 'N' 'H' */
+    words[1] = slot | (mode << 8U) | (attempt << 16U) | (event << 24U);
+    words[2] = version;
+    words[3] = event_slot | (write_error << 8U);
+}
+
+/* A valid cell with `reason` and the hand-off `words` in its reserved words. */
+static plat_retained_cell_t cell_with_words(uint32_t reason, const uint32_t words[4])
+{
+    plat_retained_cell_t cell = make_cell(reason, 2U);
+
+    (void)memcpy(cell.reserved, words, sizeof(cell.reserved));
+    cell.crc = expected_crc(&cell);
+    return cell;
+}
+
+/* A hand-off in a cell that records a reset, and in one that records none: taken with every
+ * field, the reason of the cell as before, the four words zeroed and the cell sealed; the next
+ * start without the bootloader finds none. */
+static void test_the_image_takes_the_hand_off_once_and_zeroes_its_words(void)
+{
+    static const uint32_t reasons[] = {(uint32_t)PLAT_RESET_WATCHDOG,
+                                       (uint32_t)PLAT_RESET_POWER_ON};
+    uint32_t words[4];
+
+    handoff_words(words, 1U, 2U, 2U, 0U, 0x01020003U, 0xFFU, 0U);
+
+    for (size_t i = 0U; i < 2U; i++) {
+        const plat_retained_cell_t before = cell_with_words(reasons[i], words);
+        plat_boot_handoff_t got;
+
+        write_bytes(&before, sizeof(before));
+        const posix_retained_info_t info = start();
+
+        TEST_ASSERT_EQUAL_STRING("taken", info.handoff_verdict);
+        TEST_ASSERT_TRUE(info.have_handoff);
+        TEST_ASSERT_TRUE(plat_boot_handoff(&got));
+        TEST_ASSERT_EQUAL_UINT8(1U, got.slot);
+        TEST_ASSERT_EQUAL_INT((int)PLAT_BOOT_TRIAL, (int)got.mode);
+        TEST_ASSERT_EQUAL_UINT8(2U, got.attempt);
+        TEST_ASSERT_EQUAL_HEX32(0x01020003U, got.image_version);
+        TEST_ASSERT_EQUAL_INT((int)PLAT_BOOT_EVENT_NONE, (int)got.event);
+        TEST_ASSERT_EQUAL_UINT8(PLAT_HANDOFF_NO_SLOT, got.event_slot);
+        TEST_ASSERT_EQUAL_UINT8(0U, got.select_write_error);
+        TEST_ASSERT_EQUAL_INT((int)reasons[i], (int)info.cause);
+
+        const plat_retained_cell_t after = read_cell();
+
+        for (uint32_t w = 0U; w < PLAT_RETAINED_RESERVED_WORDS; w++) {
+            TEST_ASSERT_EQUAL_HEX32(0U, after.reserved[w]);
+        }
+
+        TEST_ASSERT_EQUAL_HEX32(expected_crc(&after), after.crc);
+        posix_retained_close();
+
+        const posix_retained_info_t next = start();
+
+        TEST_ASSERT_EQUAL_STRING("none", next.handoff_verdict);
+        TEST_ASSERT_FALSE(next.have_handoff);
+        TEST_ASSERT_FALSE(plat_boot_handoff(&got));
+        posix_retained_close();
+    }
+
+    TEST_ASSERT_FALSE(plat_boot_handoff(NULL));
+}
+
+/* Each rule of THE HAND-OFF broken on its own: no hand-off ("invalid"), and the words zeroed,
+ * so that the garbage does not stay for a later start. */
+static void test_a_hand_off_that_breaks_a_rule_is_none(void)
+{
+    /* slot, mode, attempt, event, event slot, write error, word 3's top half */
+    static const uint32_t broken[][7] = {
+        {2U, 1U, 0U, 0U, 0xFFU, 0U, 0U},  /* no such slot */
+        {0U, 0U, 0U, 0U, 0xFFU, 0U, 0U},  /* no mode */
+        {0U, 3U, 1U, 0U, 0xFFU, 0U, 0U},  /* no such mode */
+        {0U, 2U, 0U, 0U, 0xFFU, 0U, 0U},  /* a trial without an attempt */
+        {0U, 2U, 4U, 0U, 0xFFU, 0U, 0U},  /* a fourth attempt */
+        {0U, 1U, 1U, 0U, 0xFFU, 0U, 0U},  /* the confirmed image with an attempt */
+        {0U, 1U, 0U, 2U, 0U, 0U, 0U},     /* BEGIN is no event of a select */
+        {0U, 1U, 0U, 0U, 0U, 0U, 0U},     /* NONE acting on a slot */
+        {0U, 1U, 0U, 5U, 0xFFU, 0U, 0U},  /* ROLLBACK acting on no slot */
+        {0U, 1U, 0U, 5U, 2U, 0U, 0U},     /* ROLLBACK of no such slot */
+        {0U, 1U, 0U, 0U, 0xFFU, 11U, 0U}, /* no such status of lib/boot */
+        {0U, 1U, 0U, 0U, 0xFFU, 0U, 1U},  /* the unused half of word 3 */
+    };
+
+    for (size_t i = 0U; i < (sizeof(broken) / sizeof(broken[0])); i++) {
+        uint32_t words[4];
+
+        handoff_words(words, broken[i][0], broken[i][1], broken[i][2], broken[i][3], 7U,
+                      broken[i][4], broken[i][5]);
+        words[3] |= broken[i][6] << 16U;
+
+        const plat_retained_cell_t before = cell_with_words((uint32_t)PLAT_RESET_REQUESTED, words);
+
+        write_bytes(&before, sizeof(before));
+        const posix_retained_info_t info = start();
+
+        TEST_ASSERT_EQUAL_STRING_MESSAGE("invalid", info.handoff_verdict, "a broken hand-off");
+        TEST_ASSERT_FALSE(info.have_handoff);
+
+        const plat_retained_cell_t after = read_cell();
+
+        for (uint32_t w = 0U; w < PLAT_RETAINED_RESERVED_WORDS; w++) {
+            TEST_ASSERT_EQUAL_HEX32(0U, after.reserved[w]);
+        }
+
+        posix_retained_close();
+    }
+
+    /* In a cell that is not valid there is nothing to take. */
+    uint32_t words[4];
+
+    handoff_words(words, 0U, 1U, 0U, 0U, 7U, 0xFFU, 0U);
+    plat_retained_cell_t bad = cell_with_words((uint32_t)PLAT_RESET_REQUESTED, words);
+
+    bad.crc ^= 1U;
+    write_bytes(&bad, sizeof(bad));
+    const posix_retained_info_t info = start();
+
+    TEST_ASSERT_EQUAL_STRING("crc", info.verdict);
+    TEST_ASSERT_EQUAL_STRING("none", info.handoff_verdict);
+    TEST_ASSERT_FALSE(info.have_handoff);
+}
+
+/* The bootloader's side: its open leaves the reason in the cell for the image, a cell that is
+ * not valid is written afresh, and what it writes the image takes. */
+static void test_the_bootloader_keeps_the_reason_and_hands_over(void)
+{
+    const plat_retained_cell_t before = make_cell((uint32_t)PLAT_RESET_IMAGE_FAULT, 3U);
+    const plat_boot_handoff_t handoff = {.slot = 0U,
+                                         .mode = PLAT_BOOT_CONFIRMED,
+                                         .attempt = 0U,
+                                         .image_version = 0x01000000U,
+                                         .event = PLAT_BOOT_EVENT_ROLLBACK,
+                                         .event_slot = 1U,
+                                         .select_write_error = 0U};
+    posix_retained_info_t info;
+    uint32_t words[4];
+
+    write_bytes(&before, sizeof(before));
+    TEST_ASSERT_TRUE_MESSAGE(posix_retained_open_boot(s_path, s_error, sizeof(s_error)), s_error);
+    posix_retained_get_info(&info);
+    ASSERT_START("IMAGE_FAULT", "reset", 3U, info);
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)PLAT_RESET_IMAGE_FAULT, read_cell().reset_reason);
+    TEST_ASSERT_TRUE(posix_retained_set_handoff(&handoff));
+
+    plat_retained_cell_t cell = read_cell();
+
+    handoff_words(words, 0U, 1U, 0U, 5U, 0x01000000U, 1U, 0U);
+    TEST_ASSERT_EQUAL_HEX32_ARRAY(words, cell.reserved, 4U);
+    TEST_ASSERT_EQUAL_HEX32(expected_crc(&cell), cell.crc);
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)PLAT_RESET_IMAGE_FAULT, cell.reset_reason);
+    posix_retained_close();
+
+    info = start();
+    ASSERT_START("IMAGE_FAULT", "reset", 3U, info);
+    TEST_ASSERT_TRUE(info.have_handoff);
+    TEST_ASSERT_EQUAL_INT((int)PLAT_BOOT_EVENT_ROLLBACK, (int)info.handoff.event);
+    TEST_ASSERT_EQUAL_UINT8(1U, info.handoff.event_slot);
+    posix_retained_close();
+
+    /* After power-on (no file): a fresh cell from the bootloader, the image's start sees no
+     * reset and the hand-off. */
+    (void)unlink(s_path);
+    TEST_ASSERT_TRUE_MESSAGE(posix_retained_open_boot(s_path, s_error, sizeof(s_error)), s_error);
+    posix_retained_get_info(&info);
+    ASSERT_START("POWER_ON", "missing", 0U, info);
+    TEST_ASSERT_TRUE(posix_retained_set_handoff(&handoff));
+    posix_retained_close();
+    info = start();
+    ASSERT_START("POWER_ON", "no reset", 0U, info);
+    TEST_ASSERT_TRUE(info.have_handoff);
+}
+
+/* What the bootloader cannot hand over: without a cell, a NULL hand-off, one that breaks a rule
+ * (nothing of the cell changes then). */
+static void test_a_hand_off_that_cannot_be_written_changes_nothing(void)
+{
+    plat_boot_handoff_t handoff = {.slot = 1U,
+                                   .mode = PLAT_BOOT_TRIAL,
+                                   .attempt = 1U,
+                                   .image_version = 1U,
+                                   .event = PLAT_BOOT_EVENT_NONE,
+                                   .event_slot = PLAT_HANDOFF_NO_SLOT,
+                                   .select_write_error = 0U};
+
+    TEST_ASSERT_TRUE(posix_retained_open_boot(NULL, s_error, sizeof(s_error)));
+    TEST_ASSERT_FALSE(posix_retained_set_handoff(&handoff));
+    posix_retained_close();
+
+    TEST_ASSERT_TRUE_MESSAGE(posix_retained_open_boot(s_path, s_error, sizeof(s_error)), s_error);
+    const plat_retained_cell_t fresh = read_cell();
+
+    TEST_ASSERT_FALSE(posix_retained_set_handoff(NULL));
+    handoff.attempt = 0U; /* a trial without an attempt */
+    TEST_ASSERT_FALSE(posix_retained_set_handoff(&handoff));
+    handoff.attempt = 1U;
+    handoff.slot = 2U;
+    TEST_ASSERT_FALSE(posix_retained_set_handoff(&handoff));
+
+    const plat_retained_cell_t after = read_cell();
+
+    TEST_ASSERT_EQUAL_MEMORY(&fresh, &after, sizeof(fresh));
+}
+
+/* Every hand-off the rules allow comes back from its words as it went in. */
+static void test_every_valid_hand_off_survives_its_encoding(void)
+{
+    static const plat_boot_event_t events[] = {PLAT_BOOT_EVENT_NONE, PLAT_BOOT_EVENT_ADOPT,
+                                               PLAT_BOOT_EVENT_ROLLBACK, PLAT_BOOT_EVENT_REJECT,
+                                               PLAT_BOOT_EVENT_FALLBACK};
+    uint32_t count = 0U;
+
+    for (uint8_t slot = 0U; slot < 2U; slot++) {
+        for (uint8_t attempt = 0U; attempt <= 3U; attempt++) {
+            for (size_t e = 0U; e < 5U; e++) {
+                for (uint8_t error = 0U; error <= 10U; error += 5U) {
+                    plat_boot_handoff_t in;
+                    plat_boot_handoff_t out;
+                    uint32_t words[PLAT_RETAINED_RESERVED_WORDS];
+
+                    (void)memset(&in, 0, sizeof(in));
+                    (void)memset(&out, 0xA5, sizeof(out));
+                    in.slot = slot;
+                    in.mode = (attempt == 0U) ? PLAT_BOOT_CONFIRMED : PLAT_BOOT_TRIAL;
+                    in.attempt = attempt;
+                    in.image_version = 0xFFFEFDFCU - count;
+                    in.event = events[e];
+                    in.event_slot = (events[e] == PLAT_BOOT_EVENT_NONE) ? PLAT_HANDOFF_NO_SLOT
+                                                                        : (uint8_t)(1U - slot);
+                    in.select_write_error = error;
+                    posix_handoff_encode(&in, words);
+                    TEST_ASSERT_EQUAL_STRING("taken", posix_handoff_decode(words, &out));
+                    TEST_ASSERT_EQUAL_UINT8(in.slot, out.slot);
+                    TEST_ASSERT_EQUAL_INT((int)in.mode, (int)out.mode);
+                    TEST_ASSERT_EQUAL_UINT8(in.attempt, out.attempt);
+                    TEST_ASSERT_EQUAL_HEX32(in.image_version, out.image_version);
+                    TEST_ASSERT_EQUAL_INT((int)in.event, (int)out.event);
+                    TEST_ASSERT_EQUAL_UINT8(in.event_slot, out.event_slot);
+                    TEST_ASSERT_EQUAL_UINT8(in.select_write_error, out.select_write_error);
+                    count++;
+                }
+            }
+        }
+    }
+
+    TEST_ASSERT_EQUAL_UINT32(2U * 4U * 5U * 3U, count);
+}
+
 int main(void)
 {
     const char *tmp = getenv("TMPDIR");
@@ -460,6 +719,11 @@ int main(void)
     RUN_TEST(test_a_file_that_cannot_be_used_is_an_error_with_a_reason);
     RUN_TEST(test_the_reasons_and_their_names);
     RUN_TEST(test_the_crc_is_crc32_over_the_bytes_before_it);
+    RUN_TEST(test_the_image_takes_the_hand_off_once_and_zeroes_its_words);
+    RUN_TEST(test_a_hand_off_that_breaks_a_rule_is_none);
+    RUN_TEST(test_the_bootloader_keeps_the_reason_and_hands_over);
+    RUN_TEST(test_a_hand_off_that_cannot_be_written_changes_nothing);
+    RUN_TEST(test_every_valid_hand_off_survives_its_encoding);
 
     const int status = UNITY_END();
 

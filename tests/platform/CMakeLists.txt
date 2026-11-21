@@ -32,6 +32,13 @@ target_compile_definitions(wdg_selftest PRIVATE _POSIX_C_SOURCE=200809L)
 target_link_libraries(wdg_selftest PRIVATE fcn_platform_posix)
 fcn_target_defaults(wdg_selftest NO_COVERAGE)
 
+# The self-tests of the host's flash that need real time or the scheduler (flash_selftest.c).
+add_executable(flash_selftest flash_selftest.c flash_script.c)
+target_include_directories(flash_selftest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(flash_selftest PRIVATE _POSIX_C_SOURCE=200809L)
+target_link_libraries(flash_selftest PRIVATE fcn_platform_posix)
+fcn_target_defaults(flash_selftest NO_COVERAGE)
+
 # fcn_add_platform_test(<name> STATUS <exit status> LABELS <labels...>
 #                       [STDERR <regex>] [FILE <path> <regex>] [TIMEOUT <seconds>]
 #                       [PROGRAM <target>] ARGS <selftest arguments...>)
@@ -85,6 +92,18 @@ foreach(_test IN ITEMS can_backend posix_sim posix_sensor posix_retained)
     set_tests_properties(platform_${_test} PROPERTIES
         LABELS "platform" TIMEOUT 60 ENVIRONMENT "${_fcn_sanitizer_env}")
 endforeach()
+
+# The flash of the host (posix_flash.c) without a kernel: the file, the device, the simulation
+# commands, cuts that end a child process with the model's tear, and the commands served from
+# a thread of their own while operations run (run under TSan too). flash_script.c is the
+# sequence of operations it shares with flash_selftest below.
+add_executable(test_posix_flash test_posix_flash.c flash_script.c)
+target_compile_definitions(test_posix_flash PRIVATE _POSIX_C_SOURCE=200809L)
+target_link_libraries(test_posix_flash PRIVATE fcn_host_io unity Threads::Threads)
+fcn_target_defaults(test_posix_flash NO_COVERAGE)
+add_test(NAME platform_posix_flash COMMAND test_posix_flash)
+set_tests_properties(platform_posix_flash PROPERTIES
+    LABELS "platform" TIMEOUT 120 ENVIRONMENT "${_fcn_sanitizer_env}")
 
 # ------------------------------------------------- the CAN controller without a scheduler
 # The test plays the driver: it calls plat_can.h itself and polls, against the real hardware
@@ -178,6 +197,22 @@ fcn_add_platform_test(sensor_hang_on STATUS 0 LABELS platform PROGRAM wdg_selfte
                       ARGS hang on)
 fcn_add_platform_test(sensor_hang_spin STATUS 0 LABELS platform PROGRAM wdg_selftest
                       ARGS hang spin)
+
+# The flash. Each program and erase takes its modelled time (0.4 ms, 45 ms) and at most 20 ms
+# more (else status 75), without a kernel and under the scheduler with the node's wait, which
+# blocks the flash task (a task below it runs during every erase).
+fcn_add_platform_test(flash_waits STATUS 0 LABELS platform timing PROGRAM flash_selftest
+                      ARGS waits "${_dir}/selftest_flash_waits.bin")
+fcn_add_platform_test(flash_task_wait STATUS 0 LABELS platform timing PROGRAM flash_selftest
+                      ARGS task-wait "${_dir}/selftest_flash_task_wait.bin")
+# A cut under the scheduler ends the child through plat_reset() with status 12 and the model's
+# tear: the first, a middle and the last write of the script, and one past its end.
+foreach(_cut IN ITEMS 1:5 6:77 10:4242 11:1)
+    string(REPLACE ":" "_" _name "${_cut}")
+    fcn_add_platform_test(flash_task_cut_${_name} STATUS 0 LABELS platform PROGRAM flash_selftest
+                          ARGS task-cut "${_dir}/selftest_flash_cut_${_name}.bin"
+                          "${_dir}/selftest_flash_cut_${_name}.cell" ${_cut})
+endforeach()
 
 # An orderly stop on SIGTERM must leave through main() with status 0.
 add_test(NAME platform_sigterm

@@ -100,6 +100,7 @@ SPEC = {
     "RESET_ASSERT": Dtc(0x1B0300, "P1B03-00", 1, -1, False),
     "RESET_STACK_OVERFLOW": Dtc(0x1B0400, "P1B04-00", 1, -1, False),
     "RESET_MALLOC_FAILED": Dtc(0x1B0500, "P1B05-00", 1, -1, False),
+    "UPDATE_ROLLBACK": Dtc(0x1B0600, "P1B06-00", 1, -1, False),
 }
 assert list(SPEC) == [NAME[n] for n in range(len(NAME))], "SPEC is in the DBC's order"
 
@@ -1590,7 +1591,9 @@ def test_a_run_without_faults_supervises_every_task_and_kicks_in_every_period(st
     for name, entry in dtcs.items():
         assert entry["status"] == (AFTER_CLEAR if name == "CAN_BUS_OFF" else 0x00), entry
     assert dtcs["CAN_BUS_OFF"]["counter"] == -20          # one step per health period
-    assert stats["faults"]["status_changes"] == 15
+    # The four reset faults and UPDATE_ROLLBACK passed at the start, and the other changes of
+    # this run.
+    assert stats["faults"]["status_changes"] == 16
     # A verdict per sample, every one taken by the health task but those of the samples after
     # its last period: fewer than the queue holds.
     process = stats["process"]

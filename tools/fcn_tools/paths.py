@@ -20,6 +20,19 @@ def node_binary(preset: str = "release") -> Path:
     return Path(override) if override else build_root() / preset / "bin" / "fcn_node"
 
 
+def boot_binary(preset: str = "release") -> Path:
+    """fcn_boot, the bootloader of the host build (platform/posix/boot_main.c); FCN_BOOT
+    overrides it, as FCN_NODE does the node."""
+    override = os.environ.get("FCN_BOOT")
+    return Path(override) if override else build_root() / preset / "bin" / "fcn_boot"
+
+
+def flash_tool_binary(preset: str = "release") -> Path:
+    """fcn_flash, the flash tool (platform/posix/flash_tool.c); FCN_FLASH_TOOL overrides it."""
+    override = os.environ.get("FCN_FLASH_TOOL")
+    return Path(override) if override else build_root() / preset / "bin" / "fcn_flash"
+
+
 def tool_binary(name: str, preset: str = "release") -> Path:
     """A program of tests/tools/, for example "can_bits_cli": the build puts them next to the
     node. They exist only to be run from a build tree by the tests, so there is no override."""

@@ -22,9 +22,47 @@ fcn_add_unit_test(test_dtc SOURCES test_dtc.c LIBS fcn_dtc)
 # The watchdog manager; one test reports checkpoints from several threads (also run under
 # ThreadSanitizer by scripts/test-tsan.sh, which selects unit tests that create threads).
 fcn_add_unit_test(test_wdgm SOURCES test_wdgm.c LIBS fcn_wdgm Threads::Threads)
+# The flash interface on the NOR model, power cuts included.
+fcn_add_unit_test(test_flash SOURCES test_flash.c LIBS fcn_flash)
+fcn_add_unit_test(test_sha256 SOURCES test_sha256.c LIBS fcn_sha256)
+# The image format and the validation of a slot, over a flash device in the test's RAM.
+fcn_add_unit_test(test_image SOURCES test_image.c LIBS fcn_image)
 # The parts of the application that need no kernel (app/signals.c, app/telemetry.c,
-# app/command.c, app/fault.c).
+# app/command.c, app/fault.c, app/update.c).
 fcn_add_unit_test(test_signals SOURCES test_signals.c LIBS fcn_app_logic)
 fcn_add_unit_test(test_telemetry SOURCES test_telemetry.c LIBS fcn_app_logic)
 fcn_add_unit_test(test_command SOURCES test_command.c LIBS fcn_app_logic)
 fcn_add_unit_test(test_fault SOURCES test_fault.c LIBS fcn_app_logic)
+fcn_add_unit_test(test_update SOURCES test_update.c LIBS fcn_app_logic)
+# lib/image's validation as lib/boot's validator, over a RAM flash and lib/flash's model.
+fcn_add_unit_test(test_bootimg SOURCES test_bootimg.c LIBS fcn_bootimg fcn_flash)
+# Boot control and the slot writer (lib/boot), on the tests' own NOR model (boot_test_nor.c,
+# behind boot_test_flash.h). test_boot_cuts.c is the power-cut campaign, in three parts that are
+# three tests (BOOT_CUTS_PART): the host geometry with an empty log, the host geometry with the
+# log filled first, and two other geometries.
+set(FCN_BOOT_TEST_SUPPORT boot_test_support.c boot_test_nor.c)
+fcn_add_unit_test(test_boot SOURCES test_boot.c ${FCN_BOOT_TEST_SUPPORT} LIBS fcn_boot)
+fcn_add_unit_test(test_boot_cuts_host SOURCES test_boot_cuts.c ${FCN_BOOT_TEST_SUPPORT}
+                  LIBS fcn_boot)
+target_compile_definitions(test_boot_cuts_host PRIVATE BOOT_CUTS_PART=0)
+fcn_add_unit_test(test_boot_cuts_host_log SOURCES test_boot_cuts.c ${FCN_BOOT_TEST_SUPPORT}
+                  LIBS fcn_boot)
+target_compile_definitions(test_boot_cuts_host_log PRIVATE BOOT_CUTS_PART=1)
+fcn_add_unit_test(test_boot_cuts_small SOURCES test_boot_cuts.c ${FCN_BOOT_TEST_SUPPORT}
+                  LIBS fcn_boot)
+target_compile_definitions(test_boot_cuts_small PRIVATE BOOT_CUTS_PART=2)
+# The same tests on lib/flash's NOR model (flash/nor.h, through boot_test_flash_lib.c), which
+# tears with its own seeded model: lib/boot is shown safe on both models, not only on the one
+# written for its tests.
+set(FCN_BOOT_TEST_SUPPORT_LIBFLASH boot_test_support.c boot_test_flash_lib.c)
+fcn_add_unit_test(test_boot_libflash SOURCES test_boot.c ${FCN_BOOT_TEST_SUPPORT_LIBFLASH}
+                  LIBS fcn_boot fcn_flash)
+fcn_add_unit_test(test_boot_cuts_host_libflash SOURCES test_boot_cuts.c
+                  ${FCN_BOOT_TEST_SUPPORT_LIBFLASH} LIBS fcn_boot fcn_flash)
+target_compile_definitions(test_boot_cuts_host_libflash PRIVATE BOOT_CUTS_PART=0)
+fcn_add_unit_test(test_boot_cuts_host_log_libflash SOURCES test_boot_cuts.c
+                  ${FCN_BOOT_TEST_SUPPORT_LIBFLASH} LIBS fcn_boot fcn_flash)
+target_compile_definitions(test_boot_cuts_host_log_libflash PRIVATE BOOT_CUTS_PART=1)
+fcn_add_unit_test(test_boot_cuts_small_libflash SOURCES test_boot_cuts.c
+                  ${FCN_BOOT_TEST_SUPPORT_LIBFLASH} LIBS fcn_boot fcn_flash)
+target_compile_definitions(test_boot_cuts_small_libflash PRIVATE BOOT_CUTS_PART=2)

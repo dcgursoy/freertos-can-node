@@ -43,6 +43,14 @@ STAND_INS = {
                 '  if [ "$1" = --stats-json ]; then echo \'{"schema": "stand-in"}\' > "$2"; fi\n'
                 '  shift\n'
                 'done\n'),
+    # A cut of the flash's supply: the FATAL line and status 12 (PLAT_RESET_POWER_LOSS).
+    "loses_power": 'echo "FATAL flash: power cut in operation 1" >&2\nexit 12\n',
+    # A bootloader: writes its arguments and a line to the --log-file named before "--".
+    "boots": ('echo "parent=$FCN_DIE_WITH_PARENT args=$*"\n'
+              'while [ $# -gt 0 ] && [ "$1" != -- ]; do\n'
+              '  if [ "$1" = --log-file ]; then echo "I boot: select" >> "$2"; fi\n'
+              '  shift\n'
+              'done\n'),
     # Writes $STAND_IN_STATS as its statistics and ends with status $STAND_IN_STATUS (0).
     "writes_stats": ('while [ $# -gt 0 ]; do\n'
                      '  if [ "$1" = --stats-json ]; then printf %s "$STAND_IN_STATS" > "$2"; fi\n'
@@ -224,6 +232,79 @@ def test_the_retained_cell_is_passed_and_a_restart_keeps_it_and_the_options(stan
     # The first run's files are its own and stay.
     assert node.stdout_path.exists() and node.stdout_path != again.stdout_path
     assert node.restarted("third").name == "third"
+
+
+# ------------------------------------------------------------------ through the bootloader
+
+
+def test_a_node_with_a_flash_file_is_started_through_the_bootloader(stand_in, started, tmp_path):
+    """The bootloader gets the flash, its own log, the cell and its own options before "--",
+    and the node's options after it, without --retained-file (the bootloader adds that and
+    --flash-file itself)."""
+    flash, cell = tmp_path / "flash.bin", tmp_path / "cell.bin"
+    node = started(stand_in("clean"), boot_binary=stand_in("boots"), flash_file=flash,
+                   retained_file=cell, can="udp:21000", sim_port=21016,
+                   args=("--duration-s", "1"), boot_args=("--log-level", "debug"))
+    assert node.wait(timeout=10) == 0
+    out = node.stdout_path.read_text()
+    assert f"parent={os.getpid()} " in out
+    assert (f"args=--flash-file {flash} --log-file {node.boot_log_path} --retained-file {cell} "
+            f"--log-level debug -- --log-file {node.log_path} --stats-json {node.stats_path} "
+            "--can udp:21000 --sim-port 21016 --duration-s 1\n") in out
+    assert node.boot_log() == "I boot: select\n"
+    assert node.command()[0] == str(node.boot_binary)
+
+
+def test_without_a_flash_file_the_node_is_started_itself(stand_in, started, tmp_path):
+    node = started(stand_in("reports"), boot_binary=tmp_path / "no-such-bootloader")
+    assert node.wait(timeout=10) == 0
+    assert node.command()[0] == str(node.binary)
+    assert "--flash-file" not in node.stdout_path.read_text()
+    assert node.boot_log() == ""
+
+
+def test_a_restart_keeps_the_flash_file_and_arms_no_cut_again(stand_in, started, tmp_path):
+    flash = tmp_path / "flash.bin"
+    node = started(stand_in("clean"), boot_binary=stand_in("boots"), flash_file=flash,
+                   args=("--flash-cut", "3:9", "--duration-s", "1"),
+                   boot_args=("--flash-cut=2", "--log-level", "warn"))
+    assert node.cut_armed
+    assert node.wait(timeout=10) == 0
+    again = node.restarted()
+    assert (again.flash_file, again.boot_binary) == (flash, node.boot_binary)
+    assert tuple(again.args) == ("--duration-s", "1")
+    assert tuple(again.boot_args) == ("--log-level", "warn")
+    assert not again.cut_armed
+    # Options given to the restart replace them, a cut among them included.
+    third = node.restarted("third", args=("--flash-cut", "1"), boot_args=())
+    assert tuple(third.args) == ("--flash-cut", "1") and tuple(third.boot_args) == ()
+    assert third.cut_armed
+
+
+def test_a_power_loss_is_a_reset_only_in_a_run_with_a_cut_armed(stand_in, started, tmp_path):
+    """Status 12 with no cut armed is reported, waited for or not; with a cut on a command
+    line it is a reset like any other."""
+    lost = started(stand_in("loses_power"))
+    with pytest.raises(AssertionError, match="loss of supply .* without a cut"):
+        lost.wait_for_reset(timeout=10)
+    problem = lost.unexpected_reset()
+    assert problem is not None and "armed no cut of the flash's supply" in problem
+    assert "FATAL flash: power cut in operation 1" in problem
+
+    cut = started(stand_in("loses_power"), name="cut", args=("--flash-cut", "1"))
+    assert cut.wait_for_reset(timeout=10) == 12
+    assert cut.unexpected_reset() is None
+
+    by_boot = started(stand_in("loses_power"), name="by_boot", flash_file=tmp_path / "f.bin",
+                      boot_binary=stand_in("loses_power"), boot_args=("--flash-cut", "2"))
+    assert by_boot.wait_for_reset(timeout=10) == 12
+    assert by_boot.unexpected_reset() is None
+
+    # A cut armed but the reset not waited for: unexpected as any reset.
+    unseen = started(stand_in("loses_power"), name="unseen", args=("--flash-cut", "1"))
+    assert unseen.wait(timeout=10) == 12
+    assert "was reset (status 12) in a test that does not expect a reset" in (
+        unseen.unexpected_reset() or "")
 
 
 def test_a_node_that_runs_cannot_be_restarted(stand_in, started):

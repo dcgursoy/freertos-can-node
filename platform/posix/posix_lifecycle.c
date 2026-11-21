@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "posix_flash.h"
 #include "posix_retained.h"
 #include "task.h"
 
@@ -22,10 +23,18 @@ static void shutdown_signal_handler(int signum)
     s_shutdown_requested = 1;
 }
 
+/* A cut of the simulated flash's supply (posix_flash.h) is a loss of supply of the board: the
+ * run ends as every reset does, here with PLAT_RESET_POWER_LOSS, which destroys the cell. */
+static void flash_power_lost(void)
+{
+    plat_reset(PLAT_RESET_POWER_LOSS);
+}
+
 void posix_platform_init(const posix_config_t *config)
 {
     struct sigaction action;
 
+    posix_flash_set_power_loss(flash_power_lost);
     posix_clock_init();
     posix_stack_init();
     posix_tick_configure(config->tick_mode);

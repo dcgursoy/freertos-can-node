@@ -7,7 +7,7 @@ measurements on CAN and takes fail-safe A/B firmware updates over the same bus. 
 as a Linux process on the FreeRTOS POSIX port, and its CAN controller, flash and sensors are
 simulated around it, so that all of it builds, runs and is tested on a laptop and in CI.
 
-> **Work in progress: phases 0 to 3 of 8 are done.** This page is a placeholder until the
+> **Work in progress: phases 0 to 4 of 8 are done.** This page is a placeholder until the
 > last phase. The sections below describe only what exists today and quote no results; the
 > final README will take every number from `results/*.json`.
 
@@ -19,8 +19,8 @@ simulated around it, so that all of it builds, runs and is tested on a laptop an
 | 1 | CAN stack: CRCs, frame bit timing, controller model with fault confinement, transmit queue, SocketCAN and UDP transports, CAN tasks | done |
 | 2 | Application: tasks and IPC, DBC, end-to-end protection, telemetry | done |
 | 3 | Fault handling: trouble codes, the fault frame, watchdogs, reset cause | done |
-| 4 | Simulated NOR flash, bootloader, A/B update logic | next |
-| 5 | ISO-TP, UDS download, end-to-end update | |
+| 4 | Simulated NOR flash, bootloader, A/B update logic | done |
+| 5 | ISO-TP, UDS download, end-to-end update | next |
 | 6 | Measurements and plots | |
 | 7 | Cortex-M3 build in QEMU with a real bootloader jump | |
 | 8 | Final README and documentation | |
@@ -206,7 +206,8 @@ target yet.
   microcontroller keeps in RAM across a reset is modelled by a cell with a magic, a version and
   a CRC, on the host a file the node maps (`--retained-file`); removing it is a loss of power.
   The next start reports why the last run ended, in its statistics, in BMS_NodeInfo and, after
-  a reset caused by a fault, as a DTC. The cell has room for phase 4's boot attempts.
+  a reset caused by a fault, as a DTC. Its reserved words carry phase 4's hand-off from the
+  bootloader to the image.
 - **A hang from outside.** `sensor.hang on|spin` makes the simulated sensor front end hang, as
   a transfer that never completes would, so that the watchdog tests need no hook in the
   application.
@@ -221,6 +222,67 @@ target yet.
   checks in the test harness that the node of no other system test was ever reset, and that
   in every run that ended in order every kick the health task decided on reached the hardware
   watchdog.
+
+## What phase 4 adds
+
+The node can now be updated without ever being left with nothing to start: two image slots in a
+simulated NOR flash, a bootloader that starts a new image as a trial and rolls it back when it
+does not prove itself, and metadata that survive a loss of supply in the middle of any write.
+The transport is phase 5's: here a tool writes the update, with exactly the calls the UDS
+download will make. [docs/update.md](docs/update.md) describes all of it; no timing has been
+measured for a target.
+
+- **A NOR flash with tearable writes** ([lib/flash](lib/flash/flash.h)). One device interface
+  for the update code, with the rules of a NOR part and one made stricter: a program unit is
+  written at most once between two erases, as a flash with an error-correcting code per unit
+  requires. Behind it, a model that counts operations and wear, says how long each would take,
+  and cuts the supply at a chosen operation with a seeded, reproducible tear: a torn program
+  leaves a subset of one unit's transitions done, a torn erase a subset of the sector's bits
+  set. Its limits (no weak bits, no retention errors, no read disturb, no suspend) are written
+  down. On the host it runs over a file of 2 MiB and 8 KiB (`--flash-file`), each operation
+  waits the typical time of a 3 V serial NOR from its datasheet, and a cut is armed on the
+  command line (`--flash-cut N[:SEED]`) or at run time (`flash.cut`), as a fault of the
+  simulated hardware: the run ends as a loss of supply and the next start finds what the cut
+  left.
+- **An image format** ([lib/image](lib/image/image.h), [lib/sha256](lib/sha256/sha256.h)). A
+  256-byte header with the payload's SHA-256 (FIPS 180-4) and a CRC over the header, validated
+  in steps of one 64-byte read, so that a check of a whole slot can be spread over many calls.
+  A second implementation in Python ([tools/fcn_tools/image.py](tools/fcn_tools/image.py))
+  is held against the C code on thousands of images. Integrity only: the documentation says
+  what signatures and anti-rollback would add.
+- **Boot control** ([lib/boot](lib/boot/boot.h)). Every state change of an update (adopt,
+  begin, commit, attempt, confirm, rollback, reject, fallback) as a record in a log in two
+  metadata sectors, with a separate commit field that holds the record's count of zero bits, so
+  that every torn write is rejected with certainty, not with a probability; every operation is
+  justified against the tear model step by step. A trial gets three attempts, each counted in
+  the flash before it starts, so a torn attempt counts against the image and a trial that cuts
+  its own supply still runs out of them. The log spreads the erases, so that the slots and not
+  the metadata limit the part's endurance. A slot writer in the steps a UDS download makes,
+  which erases one sector per call. Tested with a reference model of the state machine and a
+  campaign that cuts every operation of every sequence at every unit position, on two flash
+  models.
+- **A bootloader** (`fcn_boot`, [platform/posix/boot_main.c](platform/posix/boot_main.c)). It
+  reads the reset cause, selects the slot, writes a hand-off into the retained cell (slot, trial
+  or confirmed, attempt, version, the rollback it made), copies the payload into a sealed memory
+  file, checks its digest again and replaces itself with it (`fexecve`), so the test harness
+  still sees one process. Phase 7's bootloader on the Cortex-M3 sets VTOR and the stack pointer
+  and branches instead.
+- **The node's side** ([app/update.h](app/update.h)). A trial confirms itself once it has run
+  5 s with the watchdog manager OK and the bus never off; a new lowest-priority task makes every
+  write of the node to the flash, so that its waits delay no deadline (task table, schedulability
+  check and [docs/architecture.md](docs/architecture.md) updated). BMS_NodeInfo reports the
+  active slot, a new message BMS_BootInfo the trial, its attempt and the confirm, and a rollback
+  is the DTC UPDATE_ROLLBACK in the first BMS_Fault.
+- **A flash tool** (`fcn_flash factory|stage|info`) and a reader of the flash file written from
+  the documentation alone ([tools/fcn_tools/flash.py](tools/fcn_tools/flash.py)), which every
+  test holds against the tool's own reading.
+- **Tests.** Unit tests of every new module, each challenged with planted defects; system tests
+  that start the node through the bootloader and watch it from the bus: a factory image, a trial
+  that confirms itself and stays, trials that crash or hang and are rolled back after exactly
+  three starts, a slot with one flipped bit that is never started, an update refused while a
+  trial is pending, and power cuts while an update is staged, while the bootloader counts an
+  attempt or writes a rollback, and while the node confirms, each followed by a start that must
+  be what the state machine says.
 
 ## Build and test
 
@@ -246,8 +308,9 @@ scripts/check.sh
 static analysis, the debug and release builds, the unit and platform tests under
 AddressSanitizer and UndefinedBehaviorSanitizer, the tests of code shared between threads
 under ThreadSanitizer (the lock-free ring, the watchdog manager's alive counters, the CAN
-driver against the controller's hardware thread, and the sensor model read by one thread while
-another serves its simulation control commands), coverage of `lib/`, the system tests and the
+driver against the controller's hardware thread, the sensor model read by one thread while
+another serves its simulation control commands, and the host's flash, operated by one thread
+while another serves `flash.status` and `flash.cut`), coverage of `lib/`, the system tests and the
 verification of the bug log. The
 individual steps are `scripts/codegen-check.sh`, `scripts/static-analysis.sh`,
 `scripts/build.sh`, `scripts/test-unit.sh`, `scripts/test-tsan.sh`, `scripts/coverage.sh`,
@@ -276,22 +339,24 @@ SocketCAN interface `vcan0`, and runs the timing benchmark for the record.
 lib/             portable C11 modules: no OS calls, no malloc; covered by the unit tests
 app/             the FreeRTOS application: tasks and their IPC (app.c), the conversions to the
                  DBC (signals.c), the frames (telemetry.c), the command receiver (command.c),
-                 the faults and their DTCs (fault.c); gen/ is generated from the DBC by
-                 tools/gen_can_db.py
+                 the faults and their DTCs (fault.c), the node's side of an update (update.c);
+                 gen/ is generated from the DBC by tools/gen_can_db.py
 dbc/             the CAN messages (fcn.dbc), the source of app/gen/ and of the Python decoders
 platform/        include/ is what the application expects from a platform;
-                 posix/ implements it on Linux under the FreeRTOS POSIX port
+                 posix/ implements it on Linux under the FreeRTOS POSIX port, and holds the
+                 host's bootloader (fcn_boot) and flash tool (fcn_flash)
 config/          FreeRTOSConfig.h, MISRA deviation list
 cmake/           the compiler settings every project target gets
 tests/           unit/ (Unity), platform/ (tests of the host layer), python/ (pytest, tools),
                  system/ (pytest, the node as a process), tools/ (C helpers the tests call)
 tools/           Python package: node and bus control, UDP bus for python-can, decoding and
-                 E2E checks, the schedulability check, result files; the codec generator
+                 E2E checks, the schedulability check, the image format and the flash file,
+                 result files; the codec generator
 bench/           measurement scripts; they write results/
 results/         measured data (JSON with provenance) and plots; host timing only
 scripts/         one script per build, test and analysis step
 docs/            the application, the CAN protocol, the simulated CAN bus, the sensor model,
-                 fault handling, bug log, MISRA deviations, notes on WSL
+                 fault handling, the update, bug log, MISRA deviations, notes on WSL
 third_party/     FreeRTOS-Kernel and Unity, pinned submodules
 ```
 

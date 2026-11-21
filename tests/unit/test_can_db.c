@@ -142,6 +142,7 @@ static void test_the_message_set_is_the_one_of_the_design(void)
         {0x100U, 8U, 100U, 0x0200}, /* TESTER_Command */
         {0x600U, 8U, 200U, -1},     /* BMS_TaskStats */
         {0x610U, 8U, 1000U, -1},    /* BMS_NodeInfo */
+        {0x611U, 8U, 1000U, -1},    /* BMS_BootInfo */
         {0x6F0U, 8U, 0U, -1},       /* TESTER_Ping */
         {0x6F1U, 8U, 0U, -1},       /* BMS_Pong */
         {0x7E0U, 8U, 0U, -1},       /* UDS_Request */
@@ -377,22 +378,25 @@ static void test_temperatures_command_task_stats_and_node_info_by_hand(void)
  * BMS_Fault:
  *   byte 0      E2E_Crc 0x3C
  *   byte 1      E2E_Counter 14 in bits 0..3; bits 4..7 belong to no signal: 0x0E
- *   bytes 2..3  FaultActive 0x1234, low byte first: 34 12
- *   bytes 4..5  FaultConfirmed 0xFEDC: DC FE
- *   byte 6      FaultMostRecent 21 (0b10101) in bits 0..4, FaultWarning 1 in bit 5; bits 6..7
- *               belong to no signal: 0x35
+ *   bits 16..32 FaultActive 0x11234 (17 bits), low byte first: bytes 2..3 34 12, its bit 16 in
+ *               bit 0 of byte 4
+ *   bits 33..49 FaultConfirmed 0x1FEDC (0b1_1111_1110_1101_1100): its bits 0..6 (0b1011100) in
+ *               bits 1..7 of byte 4, which is 0xB9 with FaultActive's bit; bits 7..14 (0xFD) in
+ *               byte 5; bits 15..16 (0b11) in bits 0..1 of byte 6
+ *   bits 50..54 FaultMostRecent 21 (0b10101) in bits 2..6 of byte 6, FaultWarning 1 in bit 7:
+ *               byte 6 is 0b1101_0111, 0xD7
  *   byte 7      FaultClearCount 0xA5
  */
 static void test_fault_by_hand(void)
 {
     const can_db_bms_fault_t fault = {.e2e_crc = 0x3CU,
                                       .e2e_counter = 14U,
-                                      .fault_active = 0x1234U,
-                                      .fault_confirmed = 0xFEDCU,
+                                      .fault_active = 0x11234U,
+                                      .fault_confirmed = 0x1FEDCU,
                                       .fault_most_recent = 21U,
                                       .fault_warning = 1U,
                                       .fault_clear_count = 0xA5U};
-    const uint8_t expected[8] = {0x3C, 0x0E, 0x34, 0x12, 0xDC, 0xFE, 0x35, 0xA5};
+    const uint8_t expected[8] = {0x3C, 0x0E, 0x34, 0x12, 0xB9, 0xFD, 0xD7, 0xA5};
     uint8_t data[8];
     can_db_bms_fault_t back;
 
@@ -403,13 +407,13 @@ static void test_fault_by_hand(void)
     TEST_ASSERT_TRUE(can_db_bms_fault_unpack(&back, data, sizeof(data)));
     TEST_ASSERT_EQUAL_HEX8(0x3CU, back.e2e_crc);
     TEST_ASSERT_EQUAL_UINT8(14U, back.e2e_counter);
-    TEST_ASSERT_EQUAL_HEX16(0x1234U, back.fault_active);
-    TEST_ASSERT_EQUAL_HEX16(0xFEDCU, back.fault_confirmed);
+    TEST_ASSERT_EQUAL_HEX32(0x11234U, back.fault_active);
+    TEST_ASSERT_EQUAL_HEX32(0x1FEDCU, back.fault_confirmed);
     TEST_ASSERT_EQUAL_UINT8(21U, back.fault_most_recent);
     TEST_ASSERT_EQUAL_UINT8(1U, back.fault_warning);
     TEST_ASSERT_EQUAL_HEX8(0xA5U, back.fault_clear_count);
 
-    /* NONE, no warning, nothing active: byte 6 holds 31 alone. */
+    /* NONE, no warning, nothing active: byte 6 holds 31 alone, in bits 2..6. */
     const can_db_bms_fault_t none = {.e2e_crc = 0U,
                                      .e2e_counter = 0U,
                                      .fault_active = 0U,
@@ -417,7 +421,7 @@ static void test_fault_by_hand(void)
                                      .fault_most_recent = CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_NONE,
                                      .fault_warning = 0U,
                                      .fault_clear_count = 0U};
-    const uint8_t none_expected[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F, 0x00};
+    const uint8_t none_expected[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, 0x00};
 
     TEST_ASSERT_TRUE(can_db_bms_fault_pack(&none, data, sizeof(data)));
     TEST_ASSERT_EQUAL_HEX8_ARRAY(none_expected, data, 8);
@@ -569,7 +573,7 @@ static void test_every_signal_alone_at_its_maximum_changes_only_its_own_bits(voi
         }
     }
 
-    TEST_ASSERT_EQUAL_size_t(50U, checked); /* the signals of the DBC */
+    TEST_ASSERT_EQUAL_size_t(59U, checked); /* the signals of the DBC */
 }
 
 static void test_every_signal_cleared_alone_clears_only_its_own_bits(void)

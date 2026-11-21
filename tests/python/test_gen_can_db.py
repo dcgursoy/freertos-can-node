@@ -92,6 +92,7 @@ MESSAGE_SET = [
     (0x100, "TESTER_Command", "TESTER", 8, 100, 0x0200),
     (0x600, "BMS_TaskStats", "BMS", 8, 200, None),
     (0x610, "BMS_NodeInfo", "BMS", 8, 1000, None),
+    (0x611, "BMS_BootInfo", "BMS", 8, 1000, None),
     (0x6F0, "TESTER_Ping", "TESTER", 8, 0, None),
     (0x6F1, "BMS_Pong", "BMS", 8, 0, None),
     (0x7E0, "UDS_Request", "TESTER", 8, 0, None),
@@ -792,7 +793,7 @@ def test_every_message_with_signals_was_compared(project_codec):
     _, db, groups = project_codec
     compared = {int(case.line.split()[1], 16) for case in groups["pack"][0]}
     assert compared == {m.frame_id for m in db.messages if m.signals}
-    assert len(groups["pack"][0]) == 9 * (1500 + 3)
+    assert len(groups["pack"][0]) == 10 * (1500 + 3)
 
 
 # ------------------------------------------------------------------------------------------

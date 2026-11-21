@@ -4,7 +4,10 @@ What the node's firmware does: its tasks and their priorities and periods, how t
 other and why each mechanism was chosen, the path of a measurement from the front end to a frame
 on the bus, and the analysis that says whether the tasks meet their deadlines. Phase 3 added the
 fault monitor and the supervision of the tasks to the processing and the health task
-([app/fault.h](../app/fault.h), SUPERVISION in [app/app.c](../app/app.c)).
+([app/fault.h](../app/fault.h), SUPERVISION in [app/app.c](../app/app.c)). Phase 4 added the
+node's side of an update: the bootloader's hand-off read at start, the confirm of a trial image,
+and the flash task that makes every write of the node to the flash ([app/update.h](../app/update.h),
+THE UPDATE in [app/app.c](../app/app.c)).
 The messages themselves are described in [can-protocol.md](can-protocol.md), the simulated bus in
 [can-simulation.md](can-simulation.md) and the sensor model in [sensor-model.md](sensor-model.md).
 
@@ -21,6 +24,10 @@ The messages themselves are described in [can-protocol.md](can-protocol.md), the
 
   sensor, process, can_rx, can_tx ──(alive indications)──> watchdog manager (lib/wdgm), run by health
   health ──(kick, while the manager allows it)──> hardware watchdog (plat_wdg.h) ──> reset if not kicked
+
+  bootloader's hand-off (plat_retained.h) ──> app_start: ActiveSlot, BMS_BootInfo, UPDATE_ROLLBACK
+  health ──(confirm request, once a trial ran 5 s in good health)──> flash ──> lib/boot ──> flash (plat_flash.h)
+         <──(the confirm's result)──────────────────────────────────┘
 ```
 
 The DTCs ([lib/dtc](../lib/dtc/dtc.h), the faults in [app/fault.c](../app/fault.c)) have one
@@ -32,7 +39,7 @@ their DTCs, the fault frame, the watchdogs and the reset cause.
 
 ## Tasks
 
-Five tasks of the application, all created statically before the scheduler starts
+Six tasks of the application, all created statically before the scheduler starts
 ([app/app.c](../app/app.c), [app/can_io.c](../app/can_io.c)); priorities and periods are defined in
 one place, [app/app_tasks.h](../app/app_tasks.h) and [app/can_io.h](../app/can_io.h). A higher number
 is more urgent.
@@ -43,11 +50,22 @@ is more urgent.
 | `sensor` | 5 | every 10 ms (`xTaskDelayUntil`) | publishes BMS_Heartbeat, reads the current in every period, the cells in every second and the temperatures in every tenth, posts the sample |
 | `process` | 4 | a sample in the queue, or 30 ms without one | runs lib/bms on the sample under the pack mutex, builds, protects and publishes the protected messages; judges the sample (or the timeout) for the fault monitor and posts the verdict to `health` |
 | `can_tx` | 3 | a producer or the controller (task notification), or the queue's next deadline, at the latest after 50 ms | loads the controller's three mailboxes from the transmit queue, handles transmit-done events, the bus-off policy |
-| `health` | 2 | every 100 ms (`xTaskDelayUntil`) | the supervision cycle of the watchdog manager and the kick of the hardware watchdog; the DTCs (the verdicts, the CAN controller, the supervision, clears) and BMS_Fault in every period; BMS_TaskStats every second period (one task per frame), BMS_NodeInfo and a log line every tenth; ends a run of `--duration-s` |
+| `health` | 2 | every 100 ms (`xTaskDelayUntil`) | the supervision cycle of the watchdog manager and the kick of the hardware watchdog; the DTCs (the verdicts, the CAN controller, the supervision, clears) and BMS_Fault in every period; whether a trial image runs in good health, and once it has for 5 s the request for its confirm; BMS_TaskStats every second period (one task per frame), BMS_NodeInfo and a log line every tenth, BMS_BootInfo in the periods 2, 12, 22, ...; ends a run of `--duration-s` |
+| `flash` | 1 | the health task's request (task notification) | every write of the node to the flash: the confirm of a trial (`boot_confirm()` of lib/boot), and at start, when the bootloader started the node, a read of the metadata for the log and the statistics; phase 5's slot writer will run here too. Without a flash it waits and does nothing. Each flash operation blocks it for the time the part takes (a page program 0.4 ms, a sector erase 45 ms, [plat_flash.h](../platform/include/plat_flash.h)) |
 
 Every task's stack is 512 words (`APP_TASK_STACK_WORDS`, `TASK_STACK_WORDS` in can_io.c), the
 size meant for the target; on the host each task runs on a pthread stack of its own, which the
 platform measures ([README](../README.md#what-phase-0-contains)).
+
+**Why the flash task is the lowest.** A flash operation is synchronous and slow: the driver of a
+serial NOR polls the part's busy flag, and the host's flash blocks the calling task one tick at a
+time until the modelled time has passed. A task with a deadline, or one the watchdog manager
+supervises, would spend that time waiting: a sector erase is 45 ms, almost half a health period,
+and phase 5's erase of a slot is 256 of them. Below every other task the waits delay nobody; the
+only cost to the others is its short critical sections (see the analysis below). It is not a
+supervised entity of the watchdog manager: it waits for requests without a period, and in phase 4
+it has one job per run at most. A hang of it shows as a confirm that never comes (BMS_BootInfo
+ConfirmState CONFIRMING), after which the trial is rolled back by its attempts.
 
 **Rate-monotonic order, with one exception.** A task with a shorter period has the higher
 priority: `can_rx` (modelled per tick, T = 1 ms; frames can come every 47 µs) above `sensor` and
@@ -73,6 +91,9 @@ response-time analysis below holds for any fixed priorities and is the verdict.
 | `health` | `process` | the summary of the DTCs (`fault_summary_t`), written after every health period and read once per sample in critical sections | PackFaultActive and PackState FAULT follow the faults active in the summary; a few words, like the telemetry switch |
 | `can_rx` | `process`, `health` | the count of clear requests of TESTER_Command, written and read in critical sections | the processing task tags each verdict with it, and the health task carries out a clear once per new count (`command_rx_t.clear_requests`), before the first verdict that carries it |
 | `sensor`, `process`, `can_rx`, `can_tx` | `health` | alive indications to the watchdog manager ([lib/wdgm](../lib/wdgm/wdgm.h)), one lock-free atomic addition each | a task that hangs stops counting; the health task examines the counts once per period and kicks the hardware watchdog only while the manager allows it |
+| bootloader | every task | the hand-off (`plat_boot_handoff()`), read once by `app_start()` before the scheduler starts and constant after | written before the image runs, read-only while it runs: no lock |
+| `health` | `flash` | a task notification (`xTaskNotifyGive`), once per run when the trial has run 5 s in good health | one request and no data: the slot to confirm is the hand-off's, which both tasks read |
+| `flash` | `health` | the result of the confirm (`boot_status_t` and a flag), written and read in critical sections | two words; the health task takes it in its next period and updates the confirm's state (BMS_BootInfo) |
 | every task | statistics | counters each written by one task only; the health task copies them at the end after raising itself to the highest priority | no task is in the middle of an update when they are read |
 
 Every kernel object of the application is allocated statically (`xTaskCreateStatic`,
@@ -129,8 +150,9 @@ Every kernel object of the application is allocated statically (`xTaskCreateStat
 | BMS_Heartbeat 0x030 | sensor | first thing in every period, 10 ms | no |
 | BMS_CellVoltages1/2 0x040/0x041 | process | every sample with cells, 20 ms | yes |
 | BMS_Temperatures 0x050 | process | every sample with temperatures, 100 ms | yes |
-| BMS_TaskStats 0x600 | health | every 200 ms (the odd health periods), round robin over can_rx, sensor, process, can_tx, health, IDLE | no |
+| BMS_TaskStats 0x600 | health | every 200 ms (the odd health periods), round robin over can_rx, sensor, process, can_tx, health, flash, IDLE | no |
 | BMS_NodeInfo 0x610 | health | every second | no |
+| BMS_BootInfo 0x611 | health | every second, 200 ms after BMS_NodeInfo | no |
 | BMS_Pong 0x6F1 | can_rx | for every ping | no |
 
 The heartbeat comes from the sensor task because its two numbers describe that task: the
@@ -194,7 +216,23 @@ node, rather than the tester, stood still.
   `max_count`) and its configuration;
 - in `process`, `verdicts_posted`, `verdicts_lost` and `recoveries` (samples that came after a
   timeout); in `sensor`, `skipped_periods` (the periods skipped after an overrun, which `periods`
-  does not count); in `command`, `clear_requests`; in `can.driver`, `error_passive_entries`.
+  does not count); in `command`, `clear_requests`; in `can.driver`, `error_passive_entries`;
+- `flash` (phase 4): what the host's flash counted ([posix_flash.h](../platform/posix/posix_flash.h)):
+  `file`, `created`, the reads, programs, units programmed, erases and refused calls, `busy_ns`,
+  the erases per area (`erases_meta`, `erases_slot_a`, `erases_slot_b`), `max_sector_erases`, and
+  the cut (`cut`: none, armed or fired, `cut_in`, `cut_seed`);
+- `handoff` (phase 4): the bootloader's hand-off as the node took it
+  ([plat_retained.h](../platform/include/plat_retained.h)): `verdict` (taken, invalid, none),
+  `present`, `slot`, `mode` (confirmed or trial), `attempt`, `image_version` and its
+  `image_version_code`, `event` (NONE, ADOPT, ROLLBACK, REJECT, FALLBACK), `event_slot`,
+  `select_write_error`, and `rolled_back` (the evidence of UPDATE_ROLLBACK);
+- `confirm` (phase 4): the confirm of a trial ([app/update.h](../app/update.h)): `state`
+  (NOT_NEEDED, WAITING, CONFIRMING, CONFIRMED, FAILED), `confirm_after_s`, `periods_needed`,
+  `periods` judged, `healthy_periods`, `window_restarts`, `requested_period`, `status` (lib/boot's
+  result), and the flash task's own counts in `flash_task`: `flash`, `boot_init`, `described`
+  and what the metadata said at start (`have_record`, `seq`, `active_slot`, `trial_slot`,
+  `attempts_used`, `records_valid`), `confirms`, `confirm_status` and `confirm_ns`, how long the
+  confirm took with its waits for the flash.
 
 ## Schedulability
 
@@ -301,6 +339,19 @@ as app/task_table.c applies them:
   more in `can_tx`'s response time. With the owner's work in the processing task (its budget
   160 + 54 = 214 µs: the reports, the summary and BMS_Fault) the analysis finds `can_tx`
   unschedulable, R = 1209 µs against its deadline of 1000 µs.
+- **Phase 4** added the flash task and five microseconds to the health task's budget.
+  `health`: the period judged for the confirm of a trial and, once per run, the request to the
+  flash task (5 µs); one more fault, UPDATE_ROLLBACK, adds two possible log lines (200 µs):
+  5149 → 5354 µs. BMS_BootInfo goes out in a period without BMS_TaskStats and BMS_NodeInfo, so
+  a period still publishes at most two frames and `can_tx`'s count of passes for the health task
+  stays at two. `flash`: sporadic, released at most once per health period (T = D = 100 ms), its
+  budget the CPU time of one confirm: two scans of the 64 entries of the metadata log (30 µs an
+  entry), the record handed to the driver (100 µs) and two log lines (100 µs each): 4140 µs. Its
+  waits for the part block it and take no processor time, so they are not in the budget; a job
+  that waits in the middle is outside the model (see [Filling in the table for another
+  task](#filling-in-the-table-for-another-task)), which for the lowest-priority task lengthens
+  only its own response. Its critical sections (a log line's push, the result handed back) are
+  counted as 5 µs, those of the transmit queue.
 - **The idle task** is not listed. There are no software timers (`configUSE_TIMERS` is 0), so
   there is no timer task either.
 
@@ -356,10 +407,10 @@ python -m fcn_tools.sched task_table.json
 ```
 
 ```
-Utilisation U = sum of C/T = 0.7710
+Utilisation U = sum of C/T = 0.8145
   necessary          U <= 1                                       holds
-  Liu and Layland    U <= n(2^(1/n) - 1) = 0.7286 for n = 7       not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx; priorities not in rate-monotonic order
-  hyperbolic         prod(C/T + 1) = 1.9508 <= 2                  not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx; priorities not in rate-monotonic order
+  Liu and Layland    U <= n(2^(1/n) - 1) = 0.7241 for n = 8       not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx, health; priorities not in rate-monotonic order
+  hyperbolic         prod(C/T + 1) = 2.0355 <= 2                  not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx, health; priorities not in rate-monotonic order
 
 Priority order (a higher number is more urgent)
   rate-monotonic      no: can_tx (T 1000, priority 3) is not above sensor (T 10000, priority 5) (and 1 more pair(s))
@@ -370,9 +421,10 @@ Priority order (a higher number is more urgent)
   tick_irq     8  periodic    1000    1000     3     0  20     25    975  1/1  meets
   can_rx       6  sporadic    1000    1000   169     0  20    202    798  1/1  meets
   sensor       5  periodic   10000    2000   100     0  20    306   1694  1/1  meets
-  process      4  periodic   10000   10000   160  2000  25   2479   7521  1/1  meets
-  can_tx       3  sporadic    1000    1000   479     0  20    973     27  1/1  meets
-  health       2  periodic  100000  100000  5149     0   0  19687  80313  1/1  meets
+  process      4  periodic   10000   10000   160  2000  30   2484   7516  1/1  meets
+  can_tx       3  sporadic    1000    1000   479     0  25    978     22  1/1  meets
+  health       2  periodic  100000  100000  5354     0   5  19907  80093  1/1  meets
+  flash        1  sporadic  100000  100000  4140     0   0  34801  65199  1/1  meets
 
 Verdict: schedulable: every task meets its deadline
 ```
@@ -383,14 +435,20 @@ applicable, as expected for this table: the sensor task's deadline is shorter th
 the processing task has release jitter, the critical sections and the pack mutex mean blocking,
 and `can_tx` breaks rate-monotonic order. The response-time analysis is the verdict: with the
 design budgets, every task meets its deadline. The smallest margin relative to its deadline is
-`can_tx`'s, 27 of 1000 µs (37 in phase 2: the 10 µs added to the processing task's budget are
-10 µs more of `can_tx`'s response). That margin is thin, and most of `can_tx`'s 479 µs is what
-its passes cost whatever they carry: 338 µs, 13 µs for each of 26. The processing task's
-response, 2479 µs from the tick, is mostly the 2000 µs of release jitter that the sensor task's
-deadline allows it. The health task's response, 19687 µs, is a fifth of its period. The largest
-blocking term, 20 µs, is the health task's scheduler suspension, which the analysis counts
-against the interrupts as well, a pessimistic choice for `vTaskSuspendAll()`, which does not
-mask interrupts.
+`can_tx`'s, 22 of 1000 µs (37 in phase 2, 27 in phase 3: the 10 µs added to the processing
+task's budget in phase 3 are 10 µs more of `can_tx`'s response, and in phase 4 the flash task's
+critical sections add 5 µs to its blocking). That margin is thin, and most of `can_tx`'s 479 µs
+is what its passes cost whatever they carry: 338 µs, 13 µs for each of 26. The analysis adds up
+the non-preemptive stretches of the lower-priority tasks (`can_tx`: the health task's 20 µs and
+the flash task's 5 µs, B = 25), the smaller of its two sums; on one processor a job can be
+blocked by only one of them, the one running when it arrives, so 20 µs would be the bound here
+and the 5 µs are a pessimism of the analysis. The processing task's response, 2484 µs from the
+tick, is mostly the 2000 µs of release jitter that the sensor task's deadline allows it. The
+health task's response, 19907 µs, is a fifth of its period, and the flash task's, 34801 µs from
+the request, a third of its: CPU time only, before its waits for the part. The largest blocking
+term, 20 µs, is the health task's scheduler suspension, which the analysis counts against the
+interrupts as well, a pessimistic choice for `vTaskSuspendAll()`, which does not mask
+interrupts.
 
 ### The model, and where the POSIX port leaves it
 

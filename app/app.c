@@ -68,8 +68,23 @@
  *     so every change goes out in the frame of the period that made it: a fault whose
  *     testFailed rose in the period is active in its frame, even if it passed again before the
  *     frame (fault.h, THE SUMMARY OF A PERIOD).
- *   - BMS_TaskStats, BMS_NodeInfo: the health task.
+ *   - BMS_TaskStats, BMS_NodeInfo, BMS_BootInfo: the health task.
  *   - BMS_Pong: the receive task, as in phase 1.
+ *
+ * THE UPDATE (update.h). The bootloader's hand-off (plat_retained.h) is read once, before the
+ * scheduler starts, and is constant after: which slot runs, as a trial or as the confirmed
+ * image, the image's version, and a rollback the bootloader made (the DTC UPDATE_ROLLBACK,
+ * judged in fault_init() as the reset faults are). The health task judges every period
+ * whether a trial runs in good health (update_health_period()); once it has done so for
+ * UPDATE_CONFIRM_AFTER_S seconds without a break it asks the flash task to confirm it, once.
+ * The FLASH TASK, the lowest-priority task, makes every write of the node to the flash: a flash
+ * operation blocks its caller for the time the part takes (a record: two page programs of
+ * 0.4 ms, and a sector erase of 45 ms when it is the first of a sector), which no task with a
+ * deadline or an alive indication to give may spend waiting. It owns lib/boot's state (boot_t):
+ * at start it reads the metadata once (boot_describe(), for the log and the statistics), and on
+ * each request it calls boot_confirm() for the slot the hand-off names and hands the result
+ * back to the health task. Phase 5's slot writer runs in it too. Without a flash
+ * (plat_flash_device() NULL) it waits and does nothing.
  *
  * SUPERVISION. The sensor, processing, receive and transmit tasks each report an alive
  * indication once per pass of their loop (s_supervised). The health task runs one supervision
@@ -94,17 +109,20 @@
 #include "task.h"
 
 #include "app_tasks.h"
+#include "boot/boot.h"
 #include "can_db.h"
 #include "can_io.h"
 #include "command.h"
 #include "fault.h"
 #include "log/log.h"
 #include "plat_can.h"
+#include "plat_flash.h"
 #include "plat_retained.h"
 #include "plat_sensor.h"
 #include "plat_wdg.h"
 #include "platform.h"
 #include "telemetry.h"
+#include "update.h"
 #include "wdgm/wdgm.h"
 
 #ifndef FCN_VERSION_MAJOR
@@ -131,7 +149,8 @@ _Static_assert((FCN_VERSION_PATCH >= 0) && (FCN_VERSION_PATCH <= 255), "SwPatch:
 #define SLOT_TASK_STATS     5U
 #define SLOT_NODE_INFO      6U
 #define SLOT_FAULT          7U
-#define SLOTS               8U
+#define SLOT_BOOT_INFO      8U
+#define SLOTS               9U
 
 _Static_assert(SLOTS == NODE_STATS_MESSAGES, "one statistics entry per cyclic message");
 _Static_assert(SLOTS <= CAN_TXQ_CYCLIC_SLOTS, "the transmit queue has a slot for each");
@@ -155,10 +174,16 @@ _Static_assert((1000U % APP_HEALTH_PERIOD_MS) == 0U, "whole health periods per s
  * not from the tick count, and sends it once a second: BMS_NodeInfo's period has to be one. */
 _Static_assert((APP_HEALTH_PERIOD_MS * APP_NODE_INFO_EVERY) == 1000U,
                "NodeInfo: once a second, with the seconds the health task counts");
-/* BMS_TaskStats goes in the odd periods and BMS_NodeInfo in periods divisible by
- * APP_NODE_INFO_EVERY, which are even: a period sends BMS_Fault and at most one of the two. */
+/* BMS_TaskStats goes in the odd periods, BMS_NodeInfo in periods divisible by
+ * APP_NODE_INFO_EVERY, which are even, and BMS_BootInfo in the periods APP_BOOT_INFO_PHASE past
+ * those, even and not divisible: a period sends BMS_Fault and at most one of the three. */
 _Static_assert(APP_TASK_STATS_EVERY == 2U, "TaskStats: the odd periods");
 _Static_assert((APP_NODE_INFO_EVERY % APP_TASK_STATS_EVERY) == 0U, "NodeInfo: even periods only");
+_Static_assert(((APP_BOOT_INFO_PHASE % APP_TASK_STATS_EVERY) == 0U) &&
+                   (APP_BOOT_INFO_PHASE != 0U) && (APP_BOOT_INFO_PHASE < APP_NODE_INFO_EVERY),
+               "BootInfo: even periods that are not NodeInfo's");
+_Static_assert((APP_HEALTH_PERIOD_MS * APP_NODE_INFO_EVERY) == CAN_DB_BMS_BOOT_INFO_CYCLE_MS,
+               "BootInfo: once a second");
 
 /* The hardware watchdog: a timeout the IWDG can have, several health periods long. */
 _Static_assert((APP_WDG_TIMEOUT_MS >= PLAT_WDG_TIMEOUT_MIN_MS) &&
@@ -175,9 +200,9 @@ _Static_assert(APP_FAULT_VERDICT_QUEUE_LENGTH >=
 _Static_assert(APP_SAMPLE_TIMEOUT_MS > APP_SENSOR_PERIOD_MS, "a timeout is longer than a period");
 
 /* The tasks BMS_TaskStats goes round, in this order (TaskIndex). */
-#define TASK_STATS_TASKS 6U
-static const char *const s_stats_tasks[TASK_STATS_TASKS] = {"can_rx", "sensor", "process",
-                                                            "can_tx", "health", "IDLE"};
+#define TASK_STATS_TASKS 7U
+static const char *const s_stats_tasks[TASK_STATS_TASKS] = {"can_rx", "sensor", "process", "can_tx",
+                                                            "health", "flash",  "IDLE"};
 _Static_assert(TASK_STATS_TASKS <= (CAN_DB_BMS_TASK_STATS_TASK_INDEX_RAW_MAX + 1U),
                "TaskIndex holds every index");
 _Static_assert((uint32_t)configMAX_PRIORITIES <= (CAN_DB_BMS_TASK_STATS_TASK_PRIORITY_RAW_MAX + 1U),
@@ -218,7 +243,9 @@ static const message_info_t s_messages[SLOTS] = {
     [SLOT_NODE_INFO] = {"BMS_NodeInfo", CAN_DB_BMS_NODE_INFO_ID, CAN_DB_BMS_NODE_INFO_CYCLE_MS, 0U,
                         false, false},
     [SLOT_FAULT] = {"BMS_Fault", CAN_DB_BMS_FAULT_ID, CAN_DB_BMS_FAULT_CYCLE_MS,
-                    CAN_DB_BMS_FAULT_E2E_DATA_ID, true, false}};
+                    CAN_DB_BMS_FAULT_E2E_DATA_ID, true, false},
+    [SLOT_BOOT_INFO] = {"BMS_BootInfo", CAN_DB_BMS_BOOT_INFO_ID, CAN_DB_BMS_BOOT_INFO_CYCLE_MS, 0U,
+                        false, false}};
 
 /*
  * The supervised entities of the watchdog manager, one per task that must not stop, numbered as
@@ -329,6 +356,9 @@ static StaticTask_t s_process_tcb;
 static StackType_t s_process_stack[APP_TASK_STACK_WORDS];
 static StaticTask_t s_health_tcb;
 static StackType_t s_health_stack[APP_TASK_STACK_WORDS];
+static StaticTask_t s_flash_tcb;
+static StackType_t s_flash_stack[APP_TASK_STACK_WORDS];
+static TaskHandle_t s_flash_task;
 
 /* The queues' storage as arrays of their items: the right size and alignment by construction.
  * The kernel takes it as bytes (a conversion MISRA rule 11.3 permits, to a character type). */
@@ -377,6 +407,21 @@ static bool s_telemetry_on;
 static uint32_t s_clear_requests;
 
 static message_counts_t s_counts[SLOTS];
+
+/* The bootloader's hand-off, read in app_start() and constant after it: read by any task. */
+static bool s_have_handoff;
+static plat_boot_handoff_t s_handoff;
+
+/* The confirm of a trial: the health task's monitor (update.h). */
+static update_monitor_t s_update;
+
+/* Owned by the flash task: lib/boot's state and what the task did. The result of a confirm
+ * goes to the health task in s_confirm_result, s_confirm_reported, read and written in
+ * critical sections. */
+static boot_t s_boot;
+static node_flash_task_stats_t s_flash_stats;
+static boot_status_t s_confirm_result;
+static bool s_confirm_reported;
 
 /* ------------------------------------------------------------------------------- helpers */
 
@@ -822,7 +867,7 @@ static void log_sample_wait(void)
 static void log_fault_changes(const fault_changes_t *changes)
 {
     for (uint32_t event = 0U; event < (uint32_t)FAULT_EVENTS; event++) {
-        const uint16_t mask = (uint16_t)(1UL << event);
+        const uint32_t mask = (uint32_t)(1UL << event);
         const bool rose = (changes->rose & mask) != 0U;
         const bool fell = (changes->fell & mask) != 0U;
         const bool failed = (changes->failed & mask) != 0U;
@@ -863,7 +908,7 @@ static void log_fault_changes(const fault_changes_t *changes)
  * never go back, and no verdict left for the next period comes from before a clear of this
  * one.
  */
-static void run_faults(void)
+static void run_faults(fault_health_inputs_t *read)
 {
     fault_verdict_t verdict;
     can_io_stats_t io;
@@ -912,6 +957,163 @@ static void run_faults(void)
     const bool built = telemetry_fault(&s_fault_counter, &summary, &frame);
 
     publish(SLOT_FAULT, built, &frame, plat_time_ns());
+    *read = inputs;
+}
+
+/* ------------------------------------------------------------------------------ update */
+
+/* The three parts of an image version (lib/image's encoding: major.minor.patch), for a log
+ * line's "%u.%u.%u". */
+static unsigned int version_major(uint32_t version)
+{
+    return (unsigned int)(version >> 24U);
+}
+
+static unsigned int version_minor(uint32_t version)
+{
+    return (unsigned int)((version >> 16U) & 0xFFU);
+}
+
+static unsigned int version_patch(uint32_t version)
+{
+    return (unsigned int)(version & 0xFFFFU);
+}
+
+static const char *slot_name(uint8_t slot)
+{
+    const char *name = "none";
+
+    if (slot == 0U) {
+        name = "A";
+    } else if (slot == 1U) {
+        name = "B";
+    } else {
+        /* no slot */
+    }
+
+    return name;
+}
+
+/* Health task context, after run_faults() with what it read: take the flash task's result of a
+ * confirm, judge the period for the confirm of a trial, and ask the flash task for it when the
+ * trial has run long enough in good health. */
+static void run_update(const fault_health_inputs_t *read)
+{
+    const update_health_t health = {.supervision = read->supervision,
+                                    .can_state = read->can_state,
+                                    .bus_off_count = read->bus_off_count};
+    boot_status_t result;
+    bool reported;
+
+    taskENTER_CRITICAL();
+    reported = s_confirm_reported;
+    result = s_confirm_result;
+    s_confirm_reported = false;
+    taskEXIT_CRITICAL();
+
+    if (reported) {
+        update_confirm_done(&s_update, result);
+    }
+
+    if (update_health_period(&s_update, &health)) {
+        (void)xTaskNotifyGive(s_flash_task);
+    }
+}
+
+/* Flash task context: the metadata as the task finds them at start, into its statistics and
+ * the log. Reads only. */
+static void describe_metadata(void)
+{
+    boot_description_t d;
+
+    s_flash_stats.describe_status = boot_describe(&s_boot, &d);
+
+    if (s_flash_stats.describe_status == BOOT_OK) {
+        s_flash_stats.described = true;
+        s_flash_stats.have_record = d.have_record;
+        s_flash_stats.seq = d.seq;
+        s_flash_stats.active_slot = d.active_slot;
+        s_flash_stats.trial_slot = d.trial_slot;
+        s_flash_stats.attempts_used = d.attempts_used;
+        s_flash_stats.records_valid = d.records_valid;
+        LOG_INF(TAG,
+                "metadata: record %lu, active slot %s, trial slot %s with %u of %u attempts used",
+                (unsigned long)d.seq, slot_name(d.active_slot), slot_name(d.trial_slot),
+                (unsigned int)d.attempts_used, (unsigned int)BOOT_MAX_ATTEMPTS);
+    } else {
+        LOG_WRN(TAG, "metadata: cannot be read (%s)",
+                boot_status_name(s_flash_stats.describe_status));
+    }
+}
+
+/* Flash task context: the confirm the health task asked for. */
+static boot_status_t confirm_trial(void)
+{
+    boot_status_t status = BOOT_E_ARG; /* no flash, or lib/boot refused its layout */
+    const uint64_t start_ns = plat_time_ns();
+
+    LOG_INF(TAG, "trial in slot %s ran %u s in good health: writing its confirm",
+            slot_name(s_handoff.slot), (unsigned int)UPDATE_CONFIRM_AFTER_S);
+
+    if (s_flash_stats.boot_ready) {
+        status = boot_confirm(&s_boot, s_handoff.slot);
+    }
+
+    s_flash_stats.confirms++;
+    s_flash_stats.confirm_status = status;
+    s_flash_stats.confirm_ns = plat_time_ns() - start_ns;
+
+    if (status == BOOT_OK) {
+        LOG_INF(TAG, "confirmed: slot %s, image %u.%u.%u, is the active image (%lu us)",
+                slot_name(s_handoff.slot), version_major(s_handoff.image_version),
+                version_minor(s_handoff.image_version), version_patch(s_handoff.image_version),
+                (unsigned long)(s_flash_stats.confirm_ns / 1000U));
+    } else {
+        LOG_ERR(TAG,
+                "the confirm of slot %s failed: %s; it stays a trial, rolled back after its "
+                "attempts unless a later start confirms it",
+                slot_name(s_handoff.slot), boot_status_name(status));
+    }
+
+    return status;
+}
+
+/*
+ * The flash task: every write of the node to the flash (see THE UPDATE). Blocked between
+ * requests; each operation it makes blocks it for the part's time (plat_flash.h), which only the
+ * idle task waits behind.
+ */
+static void flash_task(void *arg)
+{
+    const flash_dev_t *dev = plat_flash_device();
+    boot_config_t config;
+
+    (void)arg;
+    plat_task_enter("flash");
+
+    s_flash_stats.flash = (dev != NULL);
+    s_flash_stats.boot_init_status = BOOT_E_ARG;
+
+    if (update_boot_config(plat_flash_layout(), dev, &config)) {
+        s_flash_stats.boot_init_status = boot_init(&s_boot, &config);
+        s_flash_stats.boot_ready = (s_flash_stats.boot_init_status == BOOT_OK);
+    }
+
+    /* With a hand-off the metadata say what the bootloader decided: read them once. */
+    if (s_flash_stats.boot_ready && s_have_handoff) {
+        describe_metadata();
+    }
+
+    for (;;) {
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        const boot_status_t status = confirm_trial();
+
+        taskENTER_CRITICAL();
+        s_confirm_result = status;
+        s_confirm_reported = true;
+        taskEXIT_CRITICAL();
+    }
 }
 
 /* ------------------------------------------------------------------------------ health */
@@ -981,11 +1183,23 @@ static void send_task_stats(uint32_t index)
 static void send_node_info(uint32_t uptime_s)
 {
     can_frame_t frame;
-    const bool built =
-        telemetry_node_info((uint8_t)FCN_VERSION_MAJOR, (uint8_t)FCN_VERSION_MINOR,
-                            (uint8_t)FCN_VERSION_PATCH, plat_reset_cause(), uptime_s, &frame);
+    const uint8_t active_slot = s_have_handoff ? s_handoff.slot : (uint8_t)PLAT_HANDOFF_NO_SLOT;
+    const bool built = telemetry_node_info((uint8_t)FCN_VERSION_MAJOR, (uint8_t)FCN_VERSION_MINOR,
+                                           (uint8_t)FCN_VERSION_PATCH, active_slot,
+                                           plat_reset_cause(), uptime_s, &frame);
 
     publish(SLOT_NODE_INFO, built, &frame, plat_time_ns());
+}
+
+/* Health task context: the hand-off and the confirm as BMS_BootInfo. */
+static void send_boot_info(void)
+{
+    can_frame_t frame;
+    const uint32_t per_second = 1000U / APP_HEALTH_PERIOD_MS;
+    const bool built = telemetry_boot_info(s_have_handoff ? &s_handoff : NULL, s_update.state,
+                                           update_healthy_seconds(&s_update, per_second), &frame);
+
+    publish(SLOT_BOOT_INFO, built, &frame, plat_time_ns());
 }
 
 static const char *state_name(bms_state_t state)
@@ -1026,10 +1240,10 @@ static void log_alive(uint32_t seconds)
 
     LOG_INF(TAG,
             "alive: %lu s, sensor periods %lu, pack %s %lu mV %ld mA, telemetry %s, faults "
-            "active 0x%04X confirmed 0x%04X",
+            "active 0x%05lX confirmed 0x%05lX",
             (unsigned long)seconds, (unsigned long)periods, state_name(state),
             (unsigned long)pack_mv, (long)current_ma, telemetry_on ? "on" : "off",
-            (unsigned int)faults.active, (unsigned int)faults.confirmed);
+            (unsigned long)faults.active, (unsigned long)faults.confirmed);
 }
 
 /* The watchdog manager as the statistics show it. Health task context. */
@@ -1072,9 +1286,14 @@ static void capture_app(node_stats_t *out)
     out->pack = s_pack;
     (void)xSemaphoreGive(s_pack_mutex);
 
-    /* The health task's own state: no lock. */
+    /* The health task's own state: no lock. The flash task's statistics: it is below this task,
+     * which runs above every other now, so it is not in the middle of an update of them. */
     out->faults = s_faults;
     capture_supervision(&out->supervision);
+    out->update.have_handoff = s_have_handoff;
+    out->update.handoff = s_handoff;
+    out->update.monitor = s_update;
+    out->update.flash_task = s_flash_stats;
 
     taskENTER_CRITICAL();
     out->sensor = s_sensor;
@@ -1142,9 +1361,12 @@ static void health_task(void *arg)
         cycles++;
 
         /* First the supervision and the kick, at the same point of every period. */
+        fault_health_inputs_t read;
+
         supervise();
         log_sample_wait();
-        run_faults();
+        run_faults(&read);
+        run_update(&read);
 
         if ((cycles % APP_TASK_STATS_EVERY) == 1U) {
             send_task_stats(next_task);
@@ -1155,6 +1377,10 @@ static void health_task(void *arg)
         if (telemetry_uptime_period(&uptime, APP_NODE_INFO_EVERY)) {
             send_node_info(uptime.seconds);
             log_alive(uptime.seconds);
+        }
+
+        if ((cycles % APP_NODE_INFO_EVERY) == APP_BOOT_INFO_PHASE) {
+            send_boot_info();
         }
 
         const bool time_is_up = (s_config.run_seconds != 0U) &&
@@ -1168,6 +1394,34 @@ static void health_task(void *arg)
 
 /* ------------------------------------------------------------------------------ start-up */
 
+/* Before the scheduler: the hand-off, for the log. */
+static void log_handoff(void)
+{
+    const uint32_t version = s_handoff.image_version;
+
+    if (!s_have_handoff) {
+        LOG_INF(TAG, "started without the bootloader (no hand-off): nothing to confirm");
+    } else {
+        if (s_handoff.mode == PLAT_BOOT_TRIAL) {
+            LOG_INF(TAG,
+                    "started by the bootloader: slot %s as a trial, attempt %u of %u, image "
+                    "%u.%u.%u",
+                    slot_name(s_handoff.slot), (unsigned int)s_handoff.attempt,
+                    (unsigned int)PLAT_HANDOFF_MAX_ATTEMPT, version_major(version),
+                    version_minor(version), version_patch(version));
+        } else {
+            LOG_INF(TAG, "started by the bootloader: slot %s, the confirmed image, image %u.%u.%u",
+                    slot_name(s_handoff.slot), version_major(version), version_minor(version),
+                    version_patch(version));
+        }
+
+        if (update_rolled_back(&s_handoff)) {
+            LOG_WRN(TAG, "the bootloader rolled back before this start (%s of slot %s)",
+                    update_event_name(s_handoff.event), slot_name(s_handoff.event_slot));
+        }
+    }
+}
+
 void app_start(const app_config_t *config)
 {
     const plat_reset_reason_t cause = plat_reset_cause();
@@ -1175,6 +1429,8 @@ void app_start(const app_config_t *config)
     bool ok;
 
     s_config = *config;
+    s_have_handoff = plat_boot_handoff(&s_handoff);
+    log_handoff();
 
     bms_init(&s_pack);
     telemetry_init(&s_sender);
@@ -1185,7 +1441,9 @@ void app_start(const app_config_t *config)
     /* The DTCs, with the reset faults judged from this start's cause, and their summary, so
      * that the first BMS_PackStatus already says whether one is active. A reset fault is
      * active from the start, not a change: no line for it (the reset cause has one, below). */
-    ok = fault_init(&s_faults, cause);
+    ok = fault_init(&s_faults, cause, update_rolled_back(s_have_handoff ? &s_handoff : NULL));
+    ok = ok &&
+         update_init(&s_update, s_have_handoff ? &s_handoff : NULL, 1000U / APP_HEALTH_PERIOD_MS);
     fault_summary(&s_faults, &s_fault_summary, &start_changes);
     ok = ok && (e2e_p11_protect_init(&s_fault_counter) == E2E_E_OK);
 
@@ -1220,6 +1478,9 @@ void app_start(const app_config_t *config)
                             APP_PROCESS_PRIORITY, s_process_stack, &s_process_tcb);
     (void)xTaskCreateStatic(health_task, "health", APP_TASK_STACK_WORDS, NULL, APP_HEALTH_PRIORITY,
                             s_health_stack, &s_health_tcb);
+    s_flash_task = xTaskCreateStatic(flash_task, "flash", APP_TASK_STACK_WORDS, NULL,
+                                     APP_FLASH_PRIORITY, s_flash_stack, &s_flash_tcb);
+    configASSERT(s_flash_task != NULL);
 }
 
 const node_stats_t *app_final_stats(void)

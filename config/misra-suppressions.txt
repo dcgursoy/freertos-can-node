@@ -18,6 +18,16 @@ misra-c2012-8.9
 // elements of a caller-chosen type and, like memcpy, takes them as void pointers.
 misra-c2012-11.5:*/lib/ring/spsc_ring.c
 
+// Advisory rule 11.5 in the NOR flash model's three flash_dev_t adapters only: the device
+// interface (lib/flash/flash.h) passes each implementation its own context as a void pointer,
+// and the adapters convert it back to the nor_t that nor_device() stored there.
+misra-c2012-11.5:*/lib/flash/nor.c
+
+// Advisory rule 11.5 in lib/image's validator for lib/boot only: lib/boot's validator interface
+// (boot_validator_t) passes the implementation its own context as a void pointer, and the two
+// callbacks convert it back to the bootimg_t that bootimg_init() stored there.
+misra-c2012-11.5:*/lib/bootimg/bootimg.c
+
 // Required rule 17.1 and rule 21.6 in the logging front end only: a printf-style log call
 // needs <stdarg.h> and vsnprintf. No other file may use them.
 misra-c2012-17.1:*/lib/log/log.c

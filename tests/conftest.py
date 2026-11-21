@@ -12,7 +12,9 @@ through the simulation control channel. Every test gets
     fails). The test fails if one of its nodes ended by itself without the test looking at
     its exit status (or exited 0 but wrote to stderr), did not end in order when the harness
     stopped it, was reset (an exit status of plat_reset_reason_t, the hardware watchdog's 11
-    among them) without the test waiting for that reset with wait_for_reset(), or ended in
+    among them) without the test waiting for that reset with wait_for_reset(), ended as a loss
+    of supply (12) in a run without a cut of the flash's supply armed (NodeProcess.cut_armed),
+    or ended in
     order with statistics that show a kick of the hardware watchdog missing
     (NodeProcess.lost_kicks()). The session fails if a node is still running at the end, and
     the kernel kills a node whose test run died. The reset check shows that no node was
@@ -188,22 +190,25 @@ def started_nodes():
 
 @pytest.fixture
 def start_node(workdir, node_binary, ports, started_nodes):
-    """Factory: start_node(*args, name="node", can=None, retained_file=None) returns a running
-    NodeProcess.
+    """Factory: start_node(*args, name="node", can=None, retained_file=None, flash_file=None,
+    boot_args=()) returns a running NodeProcess.
 
     Without `can` the node gets the test's own UDP bus. The first node of a test serves
     simulation control on the test's port; further nodes of the same test do not, except runs
     started by restart_node, which take the place of the run they follow. `retained_file` is
-    the node's retained-RAM cell (--retained-file).
+    the node's retained-RAM cell (--retained-file). With a `flash_file` the node is started
+    through the bootloader, fcn_boot, with `boot_args` as its own options: the image the
+    bootloader selects in the flash runs, and `args` are its options (NodeProcess).
     """
 
     def _start(*args: str, name: str = "node", can: str | None = None,
-               retained_file: Path | None = None) -> NodeProcess:
+               retained_file: Path | None = None, flash_file: Path | None = None,
+               boot_args: tuple[str, ...] = ()) -> NodeProcess:
         node = NodeProcess(
             workdir=workdir, args=args, binary=node_binary, name=name,
             can=can or f"udp:{ports.bus}",
             sim_port=None if started_nodes else ports.sim,
-            retained_file=retained_file,
+            retained_file=retained_file, flash_file=flash_file, boot_args=boot_args,
         ).start()
         started_nodes.append(node)
         return node
@@ -213,12 +218,14 @@ def start_node(workdir, node_binary, ports, started_nodes):
 
 @pytest.fixture
 def restart_node(started_nodes):
-    """Factory: restart_node(node, name=None) starts the next run of a node that has ended, with
-    its options, bus, simulation control port and retained-RAM cell, as a board starts again
-    after a reset (NodeProcess.restarted()), and returns it running."""
+    """Factory: restart_node(node, name=None, args=None, boot_args=None) starts the next run of
+    a node that has ended, with its options, bus, simulation control port, retained-RAM cell and
+    flash file, as a board starts again after a reset (NodeProcess.restarted(), which also says
+    what `args` and `boot_args` replace), and returns it running."""
 
-    def _restart(node: NodeProcess, name: str | None = None) -> NodeProcess:
-        again = node.restarted(name).start()
+    def _restart(node: NodeProcess, name: str | None = None, args=None,
+                 boot_args=None) -> NodeProcess:
+        again = node.restarted(name, args=args, boot_args=boot_args).start()
         started_nodes.append(again)
         return again
 

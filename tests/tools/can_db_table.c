@@ -4,7 +4,7 @@
  * signal, and the adapters between arrays of raw values and the structs.
  *
  * GENERATED FILE, DO NOT EDIT. Test support, not part of the node. Made by tools/gen_can_db.py from
- * dbc/fcn.dbc, SHA-256 3da8310bc4c08d0cda27c7ed24a837228262a8bab37b153ed4b11f5c754144a9.
+ * dbc/fcn.dbc, SHA-256 a02487f999c9af5ca8814dcb829ef8b55573747bccf6df43a8f86e9873228d40.
  *
  * After a change of the DBC, run scripts/codegen-check.sh --update. Without --update the script
  * fails while this file is out of date; CI and scripts/check.sh run it.
@@ -19,8 +19,8 @@ static bool pack_bms_fault(const int64_t *raw, uint8_t *data, size_t capacity)
 
     msg.e2e_crc = (uint8_t)raw[0];
     msg.e2e_counter = (uint8_t)raw[1];
-    msg.fault_active = (uint16_t)raw[2];
-    msg.fault_confirmed = (uint16_t)raw[3];
+    msg.fault_active = (uint32_t)raw[2];
+    msg.fault_confirmed = (uint32_t)raw[3];
     msg.fault_most_recent = (uint8_t)raw[4];
     msg.fault_warning = (uint8_t)raw[5];
     msg.fault_clear_count = (uint8_t)raw[6];
@@ -46,13 +46,13 @@ static bool unpack_bms_fault(const uint8_t *data, size_t len, int64_t *raw)
 }
 
 static const can_db_table_signal_t SIGNALS_BMS_FAULT[] = {
-    {"E2E_Crc", 0U, 8U, false, 0, 255, 0, 255},              /* uint8_t e2e_crc */
-    {"E2E_Counter", 8U, 4U, false, 0, 15, 0, 255},           /* uint8_t e2e_counter */
-    {"FaultActive", 16U, 16U, false, 0, 65535, 0, 65535},    /* uint16_t fault_active */
-    {"FaultConfirmed", 32U, 16U, false, 0, 65535, 0, 65535}, /* uint16_t fault_confirmed */
-    {"FaultMostRecent", 48U, 5U, false, 0, 31, 0, 255},      /* uint8_t fault_most_recent */
-    {"FaultWarning", 53U, 1U, false, 0, 1, 0, 255},          /* uint8_t fault_warning */
-    {"FaultClearCount", 56U, 8U, false, 0, 255, 0, 255},     /* uint8_t fault_clear_count */
+    {"E2E_Crc", 0U, 8U, false, 0, 255, 0, 255},                    /* uint8_t e2e_crc */
+    {"E2E_Counter", 8U, 4U, false, 0, 15, 0, 255},                 /* uint8_t e2e_counter */
+    {"FaultActive", 16U, 17U, false, 0, 131071, 0, 4294967295},    /* uint32_t fault_active */
+    {"FaultConfirmed", 33U, 17U, false, 0, 131071, 0, 4294967295}, /* uint32_t fault_confirmed */
+    {"FaultMostRecent", 50U, 5U, false, 0, 31, 0, 255},            /* uint8_t fault_most_recent */
+    {"FaultWarning", 55U, 1U, false, 0, 1, 0, 255},                /* uint8_t fault_warning */
+    {"FaultClearCount", 56U, 8U, false, 0, 255, 0, 255},           /* uint8_t fault_clear_count */
 };
 
 static bool pack_bms_pack_status(const int64_t *raw, uint8_t *data, size_t capacity)
@@ -352,6 +352,54 @@ static const can_db_table_signal_t SIGNALS_BMS_NODE_INFO[] = {
     {"UptimeSeconds", 32U, 32U, false, 0, 4294967295, 0, 4294967295}, /* uint32_t uptime_seconds */
 };
 
+static bool pack_bms_boot_info(const int64_t *raw, uint8_t *data, size_t capacity)
+{
+    can_db_bms_boot_info_t msg;
+
+    msg.boot_mode = (uint8_t)raw[0];
+    msg.boot_attempt = (uint8_t)raw[1];
+    msg.boot_event = (uint8_t)raw[2];
+    msg.confirm_state = (uint8_t)raw[3];
+    msg.boot_event_slot = (uint8_t)raw[4];
+    msg.image_version_major = (uint8_t)raw[5];
+    msg.image_version_minor = (uint8_t)raw[6];
+    msg.image_version_patch = (uint16_t)raw[7];
+    msg.confirm_seconds = (uint8_t)raw[8];
+    return can_db_bms_boot_info_pack(&msg, data, capacity);
+}
+
+static bool unpack_bms_boot_info(const uint8_t *data, size_t len, int64_t *raw)
+{
+    can_db_bms_boot_info_t msg = {0};
+    const bool unpacked = can_db_bms_boot_info_unpack(&msg, data, len);
+
+    if (unpacked) {
+        raw[0] = msg.boot_mode;
+        raw[1] = msg.boot_attempt;
+        raw[2] = msg.boot_event;
+        raw[3] = msg.confirm_state;
+        raw[4] = msg.boot_event_slot;
+        raw[5] = msg.image_version_major;
+        raw[6] = msg.image_version_minor;
+        raw[7] = msg.image_version_patch;
+        raw[8] = msg.confirm_seconds;
+    }
+
+    return unpacked;
+}
+
+static const can_db_table_signal_t SIGNALS_BMS_BOOT_INFO[] = {
+    {"BootMode", 0U, 2U, false, 0, 3, 0, 255},                  /* uint8_t boot_mode */
+    {"BootAttempt", 2U, 2U, false, 0, 3, 0, 255},               /* uint8_t boot_attempt */
+    {"BootEvent", 4U, 3U, false, 0, 7, 0, 255},                 /* uint8_t boot_event */
+    {"ConfirmState", 8U, 3U, false, 0, 7, 0, 255},              /* uint8_t confirm_state */
+    {"BootEventSlot", 11U, 2U, false, 0, 3, 0, 255},            /* uint8_t boot_event_slot */
+    {"ImageVersionMajor", 16U, 8U, false, 0, 255, 0, 255},      /* uint8_t image_version_major */
+    {"ImageVersionMinor", 24U, 8U, false, 0, 255, 0, 255},      /* uint8_t image_version_minor */
+    {"ImageVersionPatch", 32U, 16U, false, 0, 65535, 0, 65535}, /* uint16_t image_version_patch */
+    {"ConfirmSeconds", 48U, 8U, false, 0, 255, 0, 255},         /* uint8_t confirm_seconds */
+};
+
 const can_db_table_message_t can_db_table[] = {
     {
         .name = "BMS_Fault",
@@ -451,6 +499,17 @@ const can_db_table_message_t can_db_table[] = {
         .signals = SIGNALS_BMS_NODE_INFO,
         .pack = pack_bms_node_info,
         .unpack = unpack_bms_node_info,
+    },
+    {
+        .name = "BMS_BootInfo",
+        .id = CAN_DB_BMS_BOOT_INFO_ID,
+        .dlc = CAN_DB_BMS_BOOT_INFO_DLC,
+        .cycle_ms = CAN_DB_BMS_BOOT_INFO_CYCLE_MS,
+        .e2e_data_id = -1,
+        .signal_count = 9U,
+        .signals = SIGNALS_BMS_BOOT_INFO,
+        .pack = pack_bms_boot_info,
+        .unpack = unpack_bms_boot_info,
     },
     {
         .name = "TESTER_Ping",

@@ -34,6 +34,9 @@
  *             into the queue), so like the receive task modelled by its demand per tick,
  *             counted below at TX_WCET_US.
  *   health    Periodic.
+ *   flash     Released by the health task's request (a task notification), at most once per
+ *             health period: sporadic, with the health period as its shortest time between two
+ *             releases and as its deadline. The lowest priority (app_tasks.h).
  *
  * Why a budget per tick bounds what the two CAN tasks take from the tasks below them: every
  * wake-up of either is one pass of its loop (can_io.c), and RX_WCET_US and TX_WCET_US count the
@@ -168,7 +171,7 @@ _Static_assert(TX_EVENTS_PER_TICK == 47U, "can_tx: 2 x 22 + 3 events in any 1000
  *   - the clears: at most one before each verdict and one after the last (a tester that changes
  *     CmdClearFaultsSeq with every command), 15 us each: every DTC cleared and the testFailed
  *     bits it ends noted;
- *   - the CAN controller's counters and state 10 us, its monitors 10 us, the summary of 16
+ *   - the CAN controller's counters and state 10 us, its monitors 10 us, the summary of 17
  *     DTCs 20 us, BMS_Fault built, protected and published 25 us;
  *   - log lines at 100 us each: two for each fault, as one that rose and fell (or fell and
  *     rose) in the period has both, one for the clears, one for the expiry of a supervised task
@@ -182,11 +185,36 @@ _Static_assert(TX_EVENTS_PER_TICK == 47U, "can_tx: 2 x 22 + 3 events in any 1000
 #define HEALTH_FAULT_WORK_US                                                                       \
     (15U + 2U + (APP_FAULT_VERDICT_QUEUE_LENGTH * HEALTH_VERDICT_US) + (HEALTH_CLEARS * 15U) +     \
      10U + 10U + 20U + 25U + (HEALTH_LOG_LINES * 100U))
-#define HEALTH_WCET_US (300U + HEALTH_FAULT_WORK_US)
+/* Phase 4 adds the confirm of a trial: the period judged (update_health_period()) and, once per
+ * run, the request to the flash task (a task notification), 5 us. Its log lines are the flash
+ * task's. A period still sends at most two frames: BMS_BootInfo goes in periods without
+ * BMS_TaskStats and BMS_NodeInfo (app_tasks.h), within the two frames of phase 2. */
+#define HEALTH_UPDATE_US 5U
+#define HEALTH_WCET_US   (300U + HEALTH_FAULT_WORK_US + HEALTH_UPDATE_US)
 
-_Static_assert(HEALTH_LOG_LINES == 36U, "health: 2 x 16 fault lines, the clears, the expiry, "
+_Static_assert(HEALTH_LOG_LINES == 38U, "health: 2 x 17 fault lines, the clears, the expiry, "
                                         "and the 2 lines of the processing task's wait");
-_Static_assert(HEALTH_WCET_US == 5149U, "health: 300 us + the fault work of phase 3");
+_Static_assert(HEALTH_WCET_US == 5354U, "health: 300 us + the fault work of phase 3 + phase 4");
+
+/*
+ * flash, the lowest-priority task. Its job is the confirm of a trial (boot_confirm()): two scans
+ * of the metadata log (before the record is written and to read it back), each a read of one
+ * entry and the check of its commit field for each of the 64 entries of the host's two
+ * metadata sectors, 30 us an entry; the record encoded and its two programs handed to the
+ * driver, 100 us; the two log lines of the job, 100 us each. The waits for the part (two page
+ * programs of 0.4 ms, and a sector erase of 45 ms when the record is the first of its sector)
+ * block the task (the driver's wait is a vTaskDelay of a tick at a time, plat_flash.h) and take
+ * no processor time: they are not in the budget, and in that the job waits in the middle it is
+ * outside the model of the analysis (docs/architecture.md, "Filling in the table for another
+ * task"), which for the lowest-priority task lengthens only its own response. Its critical
+ * sections (a log line's push into the ring, the result handed back) are the length of the
+ * transmit queue's, CRITICAL_US.
+ */
+#define FLASH_SCAN_ENTRIES 64U
+#define FLASH_ENTRY_US     30U
+#define FLASH_WCET_US      ((2U * FLASH_SCAN_ENTRIES * FLASH_ENTRY_US) + 100U + (2U * 100U))
+
+_Static_assert(FLASH_WCET_US == 4140U, "flash: two scans of 64 entries, a record, two lines");
 #define HEALTH_SUSPENDED_US  20U
 #define HEALTH_PACK_MUTEX_US 10U /* a copy of the pack state */
 
@@ -267,7 +295,17 @@ static const app_task_budget_t s_table[] = {{.name = "can_irq",
                                              .jitter_us = 0U,
                                              .nonpreemptive_us = HEALTH_SUSPENDED_US,
                                              .mutex = "pack",
-                                             .mutex_us = HEALTH_PACK_MUTEX_US}};
+                                             .mutex_us = HEALTH_PACK_MUTEX_US},
+                                            {.name = "flash",
+                                             .priority = APP_FLASH_PRIORITY,
+                                             .periodic = false,
+                                             .period_us = APP_HEALTH_PERIOD_MS * US_PER_MS,
+                                             .deadline_us = APP_HEALTH_PERIOD_MS * US_PER_MS,
+                                             .wcet_us = FLASH_WCET_US,
+                                             .jitter_us = 0U,
+                                             .nonpreemptive_us = CRITICAL_US,
+                                             .mutex = NULL,
+                                             .mutex_us = 0U}};
 
 const app_task_budget_t *app_task_table(size_t *count)
 {

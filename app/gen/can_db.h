@@ -45,7 +45,7 @@
  * or interrupt, also concurrently, as long as no two calls write the same buffer.
  *
  * GENERATED FILE, DO NOT EDIT. The interface of the codec. Made by tools/gen_can_db.py from
- * dbc/fcn.dbc, SHA-256 3da8310bc4c08d0cda27c7ed24a837228262a8bab37b153ed4b11f5c754144a9.
+ * dbc/fcn.dbc, SHA-256 a02487f999c9af5ca8814dcb829ef8b55573747bccf6df43a8f86e9873228d40.
  *
  * After a change of the DBC, run scripts/codegen-check.sh --update. Without --update the script
  * fails while this file is out of date; CI and scripts/check.sh run it.
@@ -99,43 +99,44 @@
 #define CAN_DB_BMS_FAULT_E2E_COUNTER_OFFSET_DEN ((int32_t)1)
 
 /*
- * FaultActive: bits 16..31 (16 bits, unsigned); raw 0..65535; physical = raw, range 0..65535. Bit
+ * FaultActive: bits 16..32 (17 bits, unsigned); raw 0..131071; physical = raw, range 0..131071. Bit
  * n: the DTC of fault n has testFailed (ISO 14229-1 status bit 0) at the end of the period, or its
  * testFailed rose during the period (after the clear, if the period had one): the fault is present,
  * or was present since the last frame. PackFaultActive is 1 while any bit is.
  */
 #define CAN_DB_BMS_FAULT_FAULT_ACTIVE_START      16U
-#define CAN_DB_BMS_FAULT_FAULT_ACTIVE_LENGTH     16U
+#define CAN_DB_BMS_FAULT_FAULT_ACTIVE_LENGTH     17U
 #define CAN_DB_BMS_FAULT_FAULT_ACTIVE_RAW_MIN    0U
-#define CAN_DB_BMS_FAULT_FAULT_ACTIVE_RAW_MAX    65535U
+#define CAN_DB_BMS_FAULT_FAULT_ACTIVE_RAW_MAX    131071U
 #define CAN_DB_BMS_FAULT_FAULT_ACTIVE_FACTOR_NUM ((int32_t)1)
 #define CAN_DB_BMS_FAULT_FAULT_ACTIVE_FACTOR_DEN ((int32_t)1)
 #define CAN_DB_BMS_FAULT_FAULT_ACTIVE_OFFSET_NUM ((int32_t)0)
 #define CAN_DB_BMS_FAULT_FAULT_ACTIVE_OFFSET_DEN ((int32_t)1)
 
 /*
- * FaultConfirmed: bits 32..47 (16 bits, unsigned); raw 0..65535; physical = raw, range 0..65535.
+ * FaultConfirmed: bits 33..49 (17 bits, unsigned); raw 0..131071; physical = raw, range 0..131071.
  * Bit n: the DTC of fault n has confirmedDTC (status bit 3): the fault occurred since the node
  * started or since the last clear (CmdClearFaultsSeq).
  */
-#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_START      32U
-#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_LENGTH     16U
+#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_START      33U
+#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_LENGTH     17U
 #define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_RAW_MIN    0U
-#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_RAW_MAX    65535U
+#define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_RAW_MAX    131071U
 #define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_FACTOR_NUM ((int32_t)1)
 #define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_FACTOR_DEN ((int32_t)1)
 #define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_OFFSET_NUM ((int32_t)0)
 #define CAN_DB_BMS_FAULT_FAULT_CONFIRMED_OFFSET_DEN ((int32_t)1)
 
 /*
- * FaultMostRecent: bits 48..52 (5 bits, unsigned); raw 0..31; physical = raw, range 0..15. Value
+ * FaultMostRecent: bits 50..54 (5 bits, unsigned); raw 0..31; physical = raw, range 0..16. Value
  * table: 0 CELL_OVERVOLTAGE, 1 CELL_UNDERVOLTAGE, 2 OVERTEMPERATURE, 3 UNDERTEMPERATURE, 4
  * OVERCURRENT_DISCHARGE, 5 OVERCURRENT_CHARGE, 6 SENSOR_CHANNEL_INVALID, 7 FRONT_END_NO_ANSWER, 8
  * SAMPLE_TIMEOUT, 9 CAN_BUS_OFF, 10 CAN_ERROR_PASSIVE, 11 SUPERVISION_EXPIRED, 12 RESET_WATCHDOG,
- * 13 RESET_ASSERT, 14 RESET_STACK_OVERFLOW, 15 RESET_MALLOC_FAILED, 31 NONE. The fault whose DTC
- * went to testFailed most recently since the start or the last clear; NONE if none did.
+ * 13 RESET_ASSERT, 14 RESET_STACK_OVERFLOW, 15 RESET_MALLOC_FAILED, 16 UPDATE_ROLLBACK, 31 NONE.
+ * The fault whose DTC went to testFailed most recently since the start or the last clear; NONE if
+ * none did.
  */
-#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_START                  48U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_START                  50U
 #define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_LENGTH                 5U
 #define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RAW_MIN                0U
 #define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RAW_MAX                31U
@@ -159,14 +160,15 @@
 #define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_ASSERT           13U
 #define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_STACK_OVERFLOW   14U
 #define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_MALLOC_FAILED    15U
+#define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_UPDATE_ROLLBACK        16U
 #define CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_NONE                   31U
 
 /*
- * FaultWarning: bit 53 (1 bit, unsigned); raw 0..1; physical = raw, range 0..1. 1 while a DTC
+ * FaultWarning: bit 55 (1 bit, unsigned); raw 0..1; physical = raw, range 0..1. 1 while a DTC
  * requests the warning indicator (status bit 7): a limit of the pack was exceeded, or its
  * measurement failed, since the start or the last clear.
  */
-#define CAN_DB_BMS_FAULT_FAULT_WARNING_START      53U
+#define CAN_DB_BMS_FAULT_FAULT_WARNING_START      55U
 #define CAN_DB_BMS_FAULT_FAULT_WARNING_LENGTH     1U
 #define CAN_DB_BMS_FAULT_FAULT_WARNING_RAW_MIN    0U
 #define CAN_DB_BMS_FAULT_FAULT_WARNING_RAW_MAX    1U
@@ -192,8 +194,8 @@
 typedef struct {
     uint8_t e2e_crc;           /**< E2E_Crc */
     uint8_t e2e_counter;       /**< E2E_Counter */
-    uint16_t fault_active;     /**< FaultActive */
-    uint16_t fault_confirmed;  /**< FaultConfirmed */
+    uint32_t fault_active;     /**< FaultActive */
+    uint32_t fault_confirmed;  /**< FaultConfirmed */
     uint8_t fault_most_recent; /**< FaultMostRecent */
     uint8_t fault_warning;     /**< FaultWarning */
     uint8_t fault_clear_count; /**< FaultClearCount */
@@ -1009,7 +1011,8 @@ bool can_db_bms_task_stats_unpack(can_db_bms_task_stats_t *msg, const uint8_t *d
 
 /*
  * ActiveSlot: bits 24..25 (2 bits, unsigned); raw 0..3; physical = raw, range 0..1. Value table: 0
- * A, 1 B, 3 SNA. The firmware slot the node runs from (phase 4); SNA until the node has A/B slots.
+ * A, 1 B, 3 SNA. The firmware slot the node runs from, as the bootloader's hand-off names it; SNA
+ * for a node started without the bootloader. BMS_BootInfo says whether the image runs as a trial.
  */
 #define CAN_DB_BMS_NODE_INFO_ACTIVE_SLOT_START      24U
 #define CAN_DB_BMS_NODE_INFO_ACTIVE_SLOT_LENGTH     2U
@@ -1083,6 +1086,190 @@ bool can_db_bms_node_info_pack(const can_db_bms_node_info_t *msg, uint8_t *data,
  * a pointer is NULL or `len` is not CAN_DB_BMS_NODE_INFO_DLC.
  */
 bool can_db_bms_node_info_unpack(can_db_bms_node_info_t *msg, const uint8_t *data, size_t len);
+
+/* -------------------------------------------------------------------------------------------------
+ * BMS_BootInfo: 0x611, 8 bytes, every 1000 ms; from BMS to TESTER. Not protected end to end.
+ * The image the node runs and its update state, once per second: the companion of BMS_NodeInfo,
+ * whose 64 bits are all in use. Taken from the bootloader's hand-off at start, except ConfirmState
+ * and ConfirmSeconds, which follow the confirm of a trial. Not protected end to end.
+ * ---------------------------------------------------------------------------------------------- */
+#define CAN_DB_BMS_BOOT_INFO_ID            0x611U
+#define CAN_DB_BMS_BOOT_INFO_DLC           8U
+#define CAN_DB_BMS_BOOT_INFO_CYCLE_MS      1000U
+#define CAN_DB_BMS_BOOT_INFO_E2E_PROTECTED 0U
+
+/*
+ * BootMode: bits 0..1 (2 bits, unsigned); raw 0..3; physical = raw, range 0..2. Value table: 0
+ * NONE, 1 CONFIRMED, 2 TRIAL. How the bootloader started the image: as the CONFIRMED image, as a
+ * TRIAL that confirms itself once it has run in good health, or NONE: the node was started without
+ * the bootloader (no hand-off), and every other signal of this message but ConfirmState is 0.
+ */
+#define CAN_DB_BMS_BOOT_INFO_BOOT_MODE_START      0U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_MODE_LENGTH     2U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_MODE_RAW_MIN    0U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_MODE_RAW_MAX    3U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_MODE_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_MODE_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_MODE_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_MODE_OFFSET_DEN ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_MODE_NONE       0U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_MODE_CONFIRMED  1U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_MODE_TRIAL      2U
+
+/*
+ * BootAttempt: bits 2..3 (2 bits, unsigned); raw 0..3; physical = raw, range 0..3. For a TRIAL, the
+ * attempt this start is: 1 to 3 (a trial is rolled back when its third start does not confirm it);
+ * 0 otherwise.
+ */
+#define CAN_DB_BMS_BOOT_INFO_BOOT_ATTEMPT_START      2U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_ATTEMPT_LENGTH     2U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_ATTEMPT_RAW_MIN    0U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_ATTEMPT_RAW_MAX    3U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_ATTEMPT_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_ATTEMPT_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_ATTEMPT_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_ATTEMPT_OFFSET_DEN ((int32_t)1)
+
+/*
+ * BootEvent: bits 4..6 (3 bits, unsigned); raw 0..7; physical = raw, range 0..7. Value table: 0
+ * NONE, 1 ADOPT, 5 ROLLBACK, 6 REJECT, 7 FALLBACK. The state change the bootloader made before this
+ * start: ADOPT (the factory image became the confirmed one), ROLLBACK (a trial used its 3
+ * attempts), REJECT (a trial did not validate), FALLBACK (the confirmed image did not validate; the
+ * one before it runs again), or NONE. ROLLBACK, REJECT and FALLBACK set the DTC UPDATE_ROLLBACK
+ * (BMS_Fault).
+ */
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_START      4U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_LENGTH     3U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_RAW_MIN    0U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_RAW_MAX    7U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_OFFSET_DEN ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_NONE       0U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_ADOPT      1U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_ROLLBACK   5U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_REJECT     6U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_FALLBACK   7U
+
+/*
+ * ConfirmState: bits 8..10 (3 bits, unsigned); raw 0..7; physical = raw, range 0..4. Value table: 0
+ * NOT_NEEDED, 1 WAITING, 2 CONFIRMING, 3 CONFIRMED, 4 FAILED. NOT_NEEDED: the image is not a trial.
+ * WAITING: a trial counting its time in good health (ConfirmSeconds). CONFIRMING: the confirm is
+ * being written. CONFIRMED: this trial confirmed itself and is the active image. FAILED: the
+ * confirm could not be written; the trial will be rolled back after its attempts.
+ */
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_START      8U
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_LENGTH     3U
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_RAW_MIN    0U
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_RAW_MAX    7U
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_OFFSET_DEN ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_NOT_NEEDED 0U
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_WAITING    1U
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_CONFIRMING 2U
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_CONFIRMED  3U
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_FAILED     4U
+
+/*
+ * BootEventSlot: bits 11..12 (2 bits, unsigned); raw 0..3; physical = raw, range 0..1. Value table:
+ * 0 A, 1 B, 3 SNA. The slot BootEvent acted on: the adopted slot (ADOPT), the rejected trial's
+ * (ROLLBACK, REJECT), or the slot fallen back to, whose image is the confirmed one again
+ * (FALLBACK); SNA for none.
+ */
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_START      11U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_LENGTH     2U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_RAW_MIN    0U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_RAW_MAX    3U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_OFFSET_DEN ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_A          0U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_B          1U
+#define CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_SNA        3U
+
+/*
+ * ImageVersionMajor: bits 16..23 (8 bits, unsigned); raw 0..255; physical = raw, range 0..255. The
+ * version of the running image as its header gives it (major.minor.patch); 0 without the
+ * bootloader.
+ */
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MAJOR_START      16U
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MAJOR_LENGTH     8U
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MAJOR_RAW_MIN    0U
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MAJOR_RAW_MAX    255U
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MAJOR_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MAJOR_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MAJOR_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MAJOR_OFFSET_DEN ((int32_t)1)
+
+/*
+ * ImageVersionMinor: bits 24..31 (8 bits, unsigned); raw 0..255; physical = raw, range 0..255. As
+ * ImageVersionMajor.
+ */
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MINOR_START      24U
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MINOR_LENGTH     8U
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MINOR_RAW_MIN    0U
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MINOR_RAW_MAX    255U
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MINOR_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MINOR_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MINOR_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_MINOR_OFFSET_DEN ((int32_t)1)
+
+/*
+ * ImageVersionPatch: bits 32..47 (16 bits, unsigned); raw 0..65535; physical = raw, range 0..65535.
+ * As ImageVersionMajor.
+ */
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_PATCH_START      32U
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_PATCH_LENGTH     16U
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_PATCH_RAW_MIN    0U
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_PATCH_RAW_MAX    65535U
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_PATCH_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_PATCH_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_PATCH_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_PATCH_OFFSET_DEN ((int32_t)1)
+
+/*
+ * ConfirmSeconds: bits 48..55 (8 bits, unsigned); raw 0..255; physical = raw s, range 0..255 s. For
+ * a trial: the seconds of good health counted towards its confirm (the watchdog manager OK and the
+ * controller never bus off, without a break), saturated at 255; the confirm is made at 5.
+ */
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_SECONDS_START      48U
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_SECONDS_LENGTH     8U
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_SECONDS_RAW_MIN    0U
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_SECONDS_RAW_MAX    255U
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_SECONDS_FACTOR_NUM ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_SECONDS_FACTOR_DEN ((int32_t)1)
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_SECONDS_OFFSET_NUM ((int32_t)0)
+#define CAN_DB_BMS_BOOT_INFO_CONFIRM_SECONDS_OFFSET_DEN ((int32_t)1)
+
+/** The raw signal values of BMS_BootInfo, in the order of their start bits. */
+typedef struct {
+    uint8_t boot_mode;            /**< BootMode */
+    uint8_t boot_attempt;         /**< BootAttempt */
+    uint8_t boot_event;           /**< BootEvent */
+    uint8_t confirm_state;        /**< ConfirmState */
+    uint8_t boot_event_slot;      /**< BootEventSlot */
+    uint8_t image_version_major;  /**< ImageVersionMajor */
+    uint8_t image_version_minor;  /**< ImageVersionMinor */
+    uint16_t image_version_patch; /**< ImageVersionPatch */
+    uint8_t confirm_seconds;      /**< ConfirmSeconds */
+} can_db_bms_boot_info_t;
+
+/**
+ * Write the CAN_DB_BMS_BOOT_INFO_DLC data bytes of BMS_BootInfo into data[0] to data[7]. Returns
+ * false, writing nothing, if a pointer is NULL or `capacity`, the size of `data` in bytes, is less
+ * than the DLC.
+ */
+bool can_db_bms_boot_info_pack(const can_db_bms_boot_info_t *msg, uint8_t *data, size_t capacity);
+
+/**
+ * Read the signals of BMS_BootInfo from `len` data bytes. Returns false, leaving *msg as it was, if
+ * a pointer is NULL or `len` is not CAN_DB_BMS_BOOT_INFO_DLC.
+ */
+bool can_db_bms_boot_info_unpack(can_db_bms_boot_info_t *msg, const uint8_t *data, size_t len);
 
 /* -------------------------------------------------------------------------------------------------
  * TESTER_Ping: 0x6F0, 8 bytes, sent on events; from TESTER to -. Not protected end to end.

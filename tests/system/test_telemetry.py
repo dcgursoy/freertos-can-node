@@ -55,6 +55,7 @@ CELLS = ("BMS_CellVoltages1", "BMS_CellVoltages2")
 TEMPERATURES = "BMS_Temperatures"
 TASK_STATS = "BMS_TaskStats"
 NODE_INFO = "BMS_NodeInfo"
+BOOT_INFO = "BMS_BootInfo"
 COMMAND = "TESTER_Command"
 
 ID = {message.name: message.frame_id for message in DB.messages}
@@ -82,9 +83,9 @@ SAMPLE_CHAIN = (HEARTBEAT, PACK_STATUS, *CELLS, TEMPERATURES)
 EVERY = {"current": 1, "cells": CYCLE_MS[CELLS[0]] // SENSOR_PERIOD_MS,
          "temps": CYCLE_MS[TEMPERATURES] // SENSOR_PERIOD_MS}
 #: The tasks BMS_TaskStats goes round, by TaskIndex (app/app.c, s_stats_tasks).
-STATS_TASKS = ("can_rx", "sensor", "process", "can_tx", "health", "IDLE")
+STATS_TASKS = ("can_rx", "sensor", "process", "can_tx", "health", "flash", "IDLE")
 #: Tasks without a period of their own, which never count an overrun.
-UNPERIODIC = ("can_rx", "can_tx", "IDLE")
+UNPERIODIC = ("can_rx", "can_tx", "flash", "IDLE")
 
 COUNTER_MODULUS = e2e.COUNTER_MODULUS
 
@@ -998,7 +999,8 @@ def test_telemetry_off_silences_exactly_the_protected_messages_and_on_brings_the
     positions = [i for i, frame_id in enumerate(ids) if frame_id in protected_ids]
     gap = max(zip(positions, positions[1:]), key=lambda pair: pair[1] - pair[0])
     inside = ids[gap[0] + 1:gap[1]]
-    assert set(inside) <= {ID[HEARTBEAT], ID[TASK_STATS], ID[NODE_INFO], ID[COMMAND], ID[FAULT]}
+    assert set(inside) <= {ID[HEARTBEAT], ID[TASK_STATS], ID[NODE_INFO], ID[BOOT_INFO],
+                           ID[COMMAND], ID[FAULT]}
     assert inside.count(ID[HEARTBEAT]) >= 3 * EVERY["temps"]
     assert protected_ids <= set(ids[:gap[0] + 1]) and protected_ids <= set(ids[gap[1]:])
     heartbeats = [frame for frame in frames if is_status(frame)]
@@ -1210,6 +1212,10 @@ def test_every_cyclic_message_keeps_its_period_on_the_wall_clock(open_link):
             for a, b in zip(decoded, decoded[1:]):
                 numbers.append(numbers[-1] + ((b.raw[counter] - a.raw[counter]) % modulus
                                               or modulus))
+        elif name == BOOT_INFO:
+            # No number in it: one frame a second, and a value the node replaced shows as a
+            # long gap.
+            numbers = list(range(len(decoded)))
         else:
             numbers = [frame.raw["UptimeSeconds"] for frame in decoded]
         stamps = [frame.timestamp for frame in decoded]

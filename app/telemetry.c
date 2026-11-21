@@ -88,8 +88,10 @@ _Static_assert(CAN_DB_BMS_FAULT_DLC == E2E_P11_MAX_DATA_LEN, "BMS_Fault: 8 bytes
 _Static_assert(CAN_DB_BMS_FAULT_E2E_CRC_START == (E2E_P11_CRC_BYTE * 8U), "CRC: byte 0");
 _Static_assert(CAN_DB_BMS_FAULT_E2E_COUNTER_START == (E2E_P11_COUNTER_BYTE * 8U),
                "counter: low nibble of byte 1");
-_Static_assert(CAN_DB_BMS_FAULT_FAULT_ACTIVE_LENGTH == 16U, "FaultActive: a bit per fault");
-_Static_assert(CAN_DB_BMS_FAULT_FAULT_CONFIRMED_LENGTH == 16U, "FaultConfirmed: a bit per fault");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_ACTIVE_LENGTH == (uint32_t)FAULT_EVENTS,
+               "FaultActive: a bit per fault");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_CONFIRMED_LENGTH == (uint32_t)FAULT_EVENTS,
+               "FaultConfirmed: a bit per fault");
 _Static_assert(CAN_DB_BMS_FAULT_FAULT_CLEAR_COUNT_LENGTH == 8U, "FaultClearCount: modulo 256");
 _Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_NONE == FAULT_NONE, "FaultMostRecent: NONE");
 _Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_CELL_OVERVOLTAGE ==
@@ -136,7 +138,47 @@ _Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_STACK_OVERFLOW ==
 _Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_RESET_MALLOC_FAILED ==
                    (uint32_t)FAULT_RESET_MALLOC_FAILED,
                "FaultMostRecent: RESET_MALLOC_FAILED");
-_Static_assert((uint32_t)FAULT_EVENTS == 16U, "every fault has its entry above");
+_Static_assert(CAN_DB_BMS_FAULT_FAULT_MOST_RECENT_UPDATE_ROLLBACK ==
+                   (uint32_t)FAULT_UPDATE_ROLLBACK,
+               "FaultMostRecent: UPDATE_ROLLBACK");
+_Static_assert((uint32_t)FAULT_EVENTS == 17U, "every fault has its entry above");
+
+/* BMS_NodeInfo's ActiveSlot and BMS_BootInfo carry the slots, the modes, the events of the
+ * hand-off (plat_retained.h) and the confirm states (update.h) by their own numbers. */
+_Static_assert(CAN_DB_BMS_NODE_INFO_ACTIVE_SLOT_A == 0U, "ActiveSlot: A is slot 0");
+_Static_assert(CAN_DB_BMS_NODE_INFO_ACTIVE_SLOT_B == 1U, "ActiveSlot: B is slot 1");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_E2E_PROTECTED == 0U, "BMS_BootInfo is not protected");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_BOOT_MODE_CONFIRMED == (uint32_t)PLAT_BOOT_CONFIRMED,
+               "BootMode: CONFIRMED");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_BOOT_MODE_TRIAL == (uint32_t)PLAT_BOOT_TRIAL,
+               "BootMode: TRIAL");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_BOOT_ATTEMPT_RAW_MAX == PLAT_HANDOFF_MAX_ATTEMPT,
+               "BootAttempt: 0 to 3");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_NONE == (uint32_t)PLAT_BOOT_EVENT_NONE,
+               "BootEvent: NONE");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_ADOPT == (uint32_t)PLAT_BOOT_EVENT_ADOPT,
+               "BootEvent: ADOPT");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_ROLLBACK == (uint32_t)PLAT_BOOT_EVENT_ROLLBACK,
+               "BootEvent: ROLLBACK");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_REJECT == (uint32_t)PLAT_BOOT_EVENT_REJECT,
+               "BootEvent: REJECT");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_FALLBACK == (uint32_t)PLAT_BOOT_EVENT_FALLBACK,
+               "BootEvent: FALLBACK");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_A == 0U, "BootEventSlot: A is slot 0");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_B == 1U, "BootEventSlot: B is slot 1");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_NOT_NEEDED == (uint32_t)UPDATE_CONFIRM_NOT_NEEDED,
+               "ConfirmState: NOT_NEEDED");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_WAITING == (uint32_t)UPDATE_CONFIRM_WAITING,
+               "ConfirmState: WAITING");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_CONFIRMING == (uint32_t)UPDATE_CONFIRM_CONFIRMING,
+               "ConfirmState: CONFIRMING");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_CONFIRMED == (uint32_t)UPDATE_CONFIRM_CONFIRMED,
+               "ConfirmState: CONFIRMED");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_CONFIRM_STATE_FAILED == (uint32_t)UPDATE_CONFIRM_FAILED,
+               "ConfirmState: FAILED");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_CONFIRM_SECONDS_RAW_MAX == 255U, "ConfirmSeconds: 8 bits");
+_Static_assert(CAN_DB_BMS_BOOT_INFO_IMAGE_VERSION_PATCH_LENGTH == 16U,
+               "ImageVersionPatch: the 16 bits of lib/image's patch");
 
 /* The E2E configuration of BMS_Fault, as s_e2e_config below for the other four. */
 static const e2e_p11_config_t s_fault_e2e_config = {.data_id = CAN_DB_BMS_FAULT_E2E_DATA_ID,
@@ -364,20 +406,73 @@ static uint8_t reset_cause_raw(plat_reset_reason_t cause)
     return raw;
 }
 
-bool telemetry_node_info(uint8_t sw_major, uint8_t sw_minor, uint8_t sw_patch,
+/* A slot of the hand-off as the DBC's slot signals carry it: 0 and 1 as they are, SNA else. */
+static uint8_t slot_raw(uint8_t slot, uint8_t sna)
+{
+    return (slot <= 1U) ? slot : sna;
+}
+
+bool telemetry_node_info(uint8_t sw_major, uint8_t sw_minor, uint8_t sw_patch, uint8_t active_slot,
                          plat_reset_reason_t reset_cause, uint32_t uptime_s, can_frame_t *frame)
 {
-    const can_db_bms_node_info_t msg = {.sw_major = sw_major,
-                                        .sw_minor = sw_minor,
-                                        .sw_patch = sw_patch,
-                                        .active_slot =
-                                            (uint8_t)CAN_DB_BMS_NODE_INFO_ACTIVE_SLOT_SNA,
-                                        .reset_cause = reset_cause_raw(reset_cause),
-                                        .uptime_seconds = uptime_s};
+    const can_db_bms_node_info_t msg = {
+        .sw_major = sw_major,
+        .sw_minor = sw_minor,
+        .sw_patch = sw_patch,
+        .active_slot = slot_raw(active_slot, (uint8_t)CAN_DB_BMS_NODE_INFO_ACTIVE_SLOT_SNA),
+        .reset_cause = reset_cause_raw(reset_cause),
+        .uptime_seconds = uptime_s};
 
     start_frame(frame, CAN_DB_BMS_NODE_INFO_ID, CAN_DB_BMS_NODE_INFO_DLC);
 
     return can_db_bms_node_info_pack(&msg, frame->data, sizeof(frame->data));
+}
+
+/* The hand-off's event, mode and attempt are values BMS_BootInfo has. */
+static bool handoff_encodable(const plat_boot_handoff_t *h)
+{
+    const bool event = (h->event == PLAT_BOOT_EVENT_NONE) || (h->event == PLAT_BOOT_EVENT_ADOPT) ||
+                       (h->event == PLAT_BOOT_EVENT_ROLLBACK) ||
+                       (h->event == PLAT_BOOT_EVENT_REJECT) ||
+                       (h->event == PLAT_BOOT_EVENT_FALLBACK);
+    const bool mode = (h->mode == PLAT_BOOT_CONFIRMED) || (h->mode == PLAT_BOOT_TRIAL);
+
+    return event && mode && (h->slot <= 1U) && (h->attempt <= PLAT_HANDOFF_MAX_ATTEMPT);
+}
+
+bool telemetry_boot_info(const plat_boot_handoff_t *handoff, update_confirm_state_t confirm,
+                         uint32_t confirm_seconds, can_frame_t *frame)
+{
+    can_db_bms_boot_info_t msg;
+    bool built = (uint32_t)confirm <= (uint32_t)UPDATE_CONFIRM_FAILED;
+
+    (void)memset(&msg, 0, sizeof(msg));
+    msg.boot_mode = (uint8_t)CAN_DB_BMS_BOOT_INFO_BOOT_MODE_NONE;
+    msg.boot_event_slot = (uint8_t)CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_SNA;
+    msg.confirm_state = (uint8_t)confirm;
+    msg.confirm_seconds = (uint8_t)((confirm_seconds > CAN_DB_BMS_BOOT_INFO_CONFIRM_SECONDS_RAW_MAX)
+                                        ? CAN_DB_BMS_BOOT_INFO_CONFIRM_SECONDS_RAW_MAX
+                                        : confirm_seconds);
+
+    if (built && (handoff != NULL)) {
+        built = handoff_encodable(handoff);
+        msg.boot_mode = (uint8_t)handoff->mode;
+        msg.boot_attempt = handoff->attempt;
+        msg.boot_event = (uint8_t)handoff->event;
+        msg.boot_event_slot =
+            slot_raw(handoff->event_slot, (uint8_t)CAN_DB_BMS_BOOT_INFO_BOOT_EVENT_SLOT_SNA);
+        msg.image_version_major = (uint8_t)(handoff->image_version >> 24U);
+        msg.image_version_minor = (uint8_t)((handoff->image_version >> 16U) & 0xFFU);
+        msg.image_version_patch = (uint16_t)(handoff->image_version & 0xFFFFU);
+    }
+
+    start_frame(frame, CAN_DB_BMS_BOOT_INFO_ID, CAN_DB_BMS_BOOT_INFO_DLC);
+
+    if (built) {
+        built = can_db_bms_boot_info_pack(&msg, frame->data, sizeof(frame->data));
+    }
+
+    return built;
 }
 
 bool telemetry_uptime_period(telemetry_uptime_t *uptime, uint32_t periods_per_second)

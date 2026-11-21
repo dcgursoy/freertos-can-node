@@ -30,6 +30,13 @@
  *   13  RESET_ASSERT             0x1B0300   P1B03-00   fault_init()    once, at the start
  *   14  RESET_STACK_OVERFLOW     0x1B0400   P1B04-00   fault_init()    once, at the start
  *   15  RESET_MALLOC_FAILED      0x1B0500   P1B05-00   fault_init()    once, at the start
+ *   16  UPDATE_ROLLBACK          0x1B0600   P1B06-00   fault_init()    once, at the start
+ *
+ * UPDATE_ROLLBACK comes from the bootloader's hand-off (plat_retained.h): the bootloader
+ * rolled back before this start, so the node runs an image other than the one it was to run
+ * (a trial that used its attempts or did not validate, or a confirmed image that stopped
+ * validating). The hand-off says so only to the start right after the rollback, as the reset
+ * cause speaks only to the start after the reset.
  *
  * Not a fault of the node, and so no DTC: a TESTER_Command stream that times out. The tester is
  * another node; that it went silent says nothing about this one, which keeps the last command
@@ -106,14 +113,17 @@ typedef enum {
     FAULT_RESET_ASSERT,
     FAULT_RESET_STACK_OVERFLOW,
     FAULT_RESET_MALLOC_FAILED,
+    FAULT_UPDATE_ROLLBACK,
     FAULT_EVENTS
 } fault_event_t;
 
 /** fault_summary_t.most_recent when no DTC went to testFailed since the start or a clear. */
 #define FAULT_NONE 31U
 
-/** One bit per fault in a 16-bit mask, as in BMS_Fault. */
-_Static_assert((uint32_t)FAULT_EVENTS <= 16U, "a 16-bit mask holds every fault");
+/** One bit per fault in a 32-bit mask (BMS_Fault's masks have a bit for each of the 17). The
+ *  verdicts of the processing task hold only its own faults, 0..FAULT_SAMPLE_TIMEOUT, in 16 bits. */
+_Static_assert((uint32_t)FAULT_EVENTS <= 32U, "a 32-bit mask holds every fault");
+_Static_assert((uint32_t)FAULT_SAMPLE_TIMEOUT < 16U, "a verdict's 16-bit masks hold its faults");
 _Static_assert((uint32_t)FAULT_EVENTS <= DTC_EVENTS_MAX, "lib/dtc has room for every fault");
 _Static_assert((uint32_t)FAULT_EVENTS < FAULT_NONE, "FAULT_NONE is no fault");
 
@@ -163,9 +173,9 @@ typedef struct {
 /** What BMS_Fault reports: a picture of the DTCs at the end of a period (THE SUMMARY OF A
  *  PERIOD). */
 typedef struct {
-    uint16_t active;     /**< bit n: the DTC of fault n has testFailed, or its testFailed rose
+    uint32_t active;     /**< bit n: the DTC of fault n has testFailed, or its testFailed rose
                               in the period (after its clear, if the period had one) */
-    uint16_t confirmed;  /**< bit n: the DTC of fault n has confirmedDTC */
+    uint32_t confirmed;  /**< bit n: the DTC of fault n has confirmedDTC */
     uint8_t most_recent; /**< the fault of DTC_RECORD_MOST_RECENT_FAILED, or FAULT_NONE */
     uint8_t clears;      /**< clears carried out since the start, modulo 256 */
     bool warning;        /**< a DTC has warningIndicatorRequested */
@@ -174,9 +184,9 @@ typedef struct {
 /** The changes of testFailed in a period, for a log: a fault in both `rose` and `fell` changed
  *  both ways, and `failed` tells in which order it ended (set: it fell, then rose). */
 typedef struct {
-    uint16_t rose;   /**< bit n: testFailed of fault n went from 0 to 1 */
-    uint16_t fell;   /**< bit n: it went from 1 to 0, by a pass or by a clear */
-    uint16_t failed; /**< bit n: the DTC of fault n has testFailed at the end of the period */
+    uint32_t rose;   /**< bit n: testFailed of fault n went from 0 to 1 */
+    uint32_t fell;   /**< bit n: it went from 1 to 0, by a pass or by a clear */
+    uint32_t failed; /**< bit n: the DTC of fault n has testFailed at the end of the period */
 } fault_changes_t;
 
 /** The monitor: the DTC state and what the monitors remember. Set up with fault_init(); read
@@ -190,21 +200,25 @@ typedef struct {
     uint32_t clear_requests;         /**< the receiver's count of clear requests carried out */
     uint32_t clears;                 /**< clears carried out */
     plat_reset_reason_t reset_cause; /**< the cause given to fault_init() */
-    uint16_t failed;                 /**< bit n: the DTC of fault n has testFailed */
-    uint16_t rose;                   /**< testFailed rose since the last summary */
-    uint16_t fell;                   /**< testFailed fell since the last summary (a clear too) */
-    uint16_t latched; /**< of `rose`, those that rose after the last clear: active in the next
+    uint32_t failed;                 /**< bit n: the DTC of fault n has testFailed */
+    uint32_t rose;                   /**< testFailed rose since the last summary */
+    uint32_t fell;                   /**< testFailed fell since the last summary (a clear too) */
+    uint32_t latched; /**< of `rose`, those that rose after the last clear: active in the next
                            summary even if they have passed again */
+    bool rolled_back; /**< the `rolled_back` given to fault_init() */
 } fault_monitor_t;
 
 /**
- * Set up the monitor at the start of a run: every DTC as after a clear (lib/dtc), and the
- * four reset faults judged once from the reset cause of this start, `cause`
- * (plat_reset_cause()): the fault of the cause FAILED, the other three PASSED. Every other
- * fault waits for its monitor. Returns false if lib/dtc refuses the table of fault.c, which
- * only a wrong build can make it do. Before the scheduler starts (the node: app_start()).
+ * Set up the monitor at the start of a run: every DTC as after a clear (lib/dtc), the four
+ * reset faults judged once from the reset cause of this start, `cause` (plat_reset_cause()):
+ * the fault of the cause FAILED, the other three PASSED; and UPDATE_ROLLBACK judged once from
+ * `rolled_back`, whether the bootloader's hand-off reports a rollback, a rejected trial or a
+ * fallback (update_rolled_back(), update.h): FAILED if so, PASSED otherwise, also for a start
+ * without the bootloader. Every other fault waits for its monitor. Returns false if lib/dtc
+ * refuses the table of fault.c, which only a wrong build can make it do. Before the scheduler
+ * starts (the node: app_start()).
  */
-bool fault_init(fault_monitor_t *monitor, plat_reset_reason_t cause);
+bool fault_init(fault_monitor_t *monitor, plat_reset_reason_t cause, bool rolled_back);
 
 /**
  * The verdict on one sample: `sample` as the sensor task took it, `unanswered` the groups of it

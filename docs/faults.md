@@ -71,6 +71,7 @@ from the DBC at compile time.
 | 13 | RESET_ASSERT | 0x1B0300 | P1B03-00 | the reset cause is a failed assertion | once, at the start | `fault_init()` |
 | 14 | RESET_STACK_OVERFLOW | 0x1B0400 | P1B04-00 | the reset cause is a stack overflow | once, at the start | `fault_init()` |
 | 15 | RESET_MALLOC_FAILED | 0x1B0500 | P1B05-00 | the reset cause is a failed allocation | once, at the start | `fault_init()` |
+| 16 | UPDATE_ROLLBACK | 0x1B0600 | P1B06-00 | the bootloader's hand-off reports a rollback (ROLLBACK: a trial used its 3 attempts; REJECT: a trial did not validate; FALLBACK: the confirmed image did not validate) | once, at the start | `fault_init()`, from the hand-off (app/update.h) |
 
 - **The limits** are those typical of NMC/graphite Li-ion cells of about 50 Ah, the cells the
   sensor model's load profile stands for ([sensor-model.md](sensor-model.md)): 4.20 V end of
@@ -95,6 +96,21 @@ from the DBC at compile time.
 - Every DTC has a confirmation threshold of 1 (see [the operation cycle](#operation-cycle-clear-records)),
   so FaultConfirmed means "occurred since the start or the last clear".
 - Faults 0 to 8, those of the pack's limits and its measurement, request the warning indicator.
+- **UPDATE_ROLLBACK** (phase 4) is judged like the reset faults: the hand-off that the
+  bootloader writes into the retained cell before it starts the image
+  ([plat_retained.h](../platform/include/plat_retained.h), THE HAND-OFF) speaks to the start right
+  after the rollback only, so the one report decides and the DTC stands for the run until a
+  tester clears it. A start without the bootloader, or one that made no rollback, passes it. Its
+  reason is in its entry of app/fault.c; [update.md](update.md) describes the rollback itself.
+  It requests no warning indicator: it is a fault of the software, not of the module. **A
+  stated limitation:** the report exists only in the start right after the rollback. A start
+  that never gets as far as its first BMS_Fault (a loss of supply after the bootloader has
+  written its rollback record and before the image runs, or a reset before the first health
+  period) loses it, and the next start's hand-off has no rollback to report; the flash still
+  shows it (the newest record's event in `fcn_flash info`), but the node does not read it from
+  there. tests/system/test_update_cuts.py shows both sides: a cut that tears the rollback record
+  leaves the next start to write it again and report it, one that completes it leaves nothing to
+  report.
 - A TESTER_Command stream that times out is no DTC: the tester is another node, and the node
   keeps the command it carried out last and goes on working. The state machine of the stream is
   in the statistics (`command.sm_state`).
@@ -167,7 +183,8 @@ and begins the next. In phase 3 the whole state is in RAM and a reset loses it, 
 starts with every DTC at 0x50, is a single operation cycle, and the node never calls
 `dtc_start_operation_cycle()`. A confirmation threshold above 1 could therefore never be
 reached in the running node, which is why every DTC of app/fault.c has 1. Thresholds above 1,
-and a pendingDTC that outlives a cycle, become meaningful with phase 4's flash.
+and a pendingDTC that outlives a cycle, become meaningful only once the DTCs are kept in
+non-volatile memory, which this project does not do (see the end of this page).
 
 **Clear.** `dtc_clear_all()` is ClearDiagnosticInformation for all groups (0xFFFFFF): every DTC
 goes back to its state after `dtc_init()`. A fault that is still present comes back as soon as
@@ -261,10 +278,10 @@ slot 7.
 | Signal | Bits | Meaning |
 |---|---|---|
 | E2E_Crc, E2E_Counter | 0..7, 8..11 | Profile 11A |
-| FaultActive | 16..31 | bit n: the DTC of fault n has testFailed at the end of the period, or its testFailed rose during it (after the clear, in the period of a clear) |
-| FaultConfirmed | 32..47 | bit n: the DTC of fault n has confirmedDTC: the fault occurred since the start or the last clear |
-| FaultMostRecent | 48..52 | the fault whose testFailed rose most recently since the start or the last clear; 31 NONE |
-| FaultWarning | 53 | a DTC requests the warning indicator |
+| FaultActive | 16..32 | bit n: the DTC of fault n has testFailed at the end of the period, or its testFailed rose during it (after the clear, in the period of a clear) |
+| FaultConfirmed | 33..49 | bit n: the DTC of fault n has confirmedDTC: the fault occurred since the start or the last clear |
+| FaultMostRecent | 50..54 | the fault whose testFailed rose most recently since the start or the last clear; 31 NONE |
+| FaultWarning | 55 | a DTC requests the warning indicator |
 | FaultClearCount | 56..63 | clears carried out since the start, modulo 256 |
 
 [can-protocol.md](can-protocol.md#0x010-bms_fault) has the full signal table.
@@ -513,7 +530,7 @@ struct, and `plat_reset_cause()` the reset cause of this start, read from it.
 | 6 | 2 | `size` | 36, the size of the cell |
 | 8 | 4 | `reset_reason` | what the next start reports: a `plat_reset_reason_t` |
 | 12 | 4 | `resets` | `plat_reset()` calls since power-on |
-| 16 | 16 | `reserved[4]` | kept for phase 4; `reserved[PLAT_RETAINED_BOOT_ATTEMPTS_WORD]` (0) will hold the bootloader's boot attempts |
+| 16 | 16 | `reserved[4]` | the bootloader's hand-off to the image (phase 4): the slot, trial or confirmed, the attempt, the image version, the state change it made (plat_retained.h, THE HAND-OFF); 0 when there is none |
 | 32 | 4 | `crc` | CRC-32/ISO-HDLC (lib/crc, equal to `zlib.crc32`) over bytes 0 to 31 |
 
 Native byte order, little-endian on every machine the project builds for, no padding
@@ -531,7 +548,18 @@ Native byte order, little-endian on every machine the project builds for, no pad
 | bad CRC | `PLAT_RESET_POWER_ON` | `crc` | written afresh |
 | a reason `plat_reset()` does not record (POWER_LOSS, any other value) | `PLAT_RESET_POWER_ON` | `reason` | written afresh |
 | reason `PLAT_RESET_POWER_ON` | `PLAT_RESET_POWER_ON` | `no reset` | written afresh |
-| reason REQUESTED, WATCHDOG, IMAGE_FAULT, ASSERT, STACK_OVERFLOW or MALLOC_FAILED | that reason | `reset` | the reason is set back to POWER_ON; `resets` and the reserved words are kept |
+| reason REQUESTED, WATCHDOG, IMAGE_FAULT, ASSERT, STACK_OVERFLOW or MALLOC_FAILED | that reason | `reset` | the reason is set back to POWER_ON; `resets` and the reserved words are kept (but for a hand-off, below) |
+
+**The hand-off (phase 4).** In every cell whose magic, version, size and CRC are right, whatever
+its reason, the platform first reads the reserved words as the bootloader's hand-off: if
+`reserved[0]` is `PLAT_HANDOFF_MAGIC` (`FCNH`) and the other words keep the rules of
+plat_retained.h, `plat_boot_handoff()` returns it for the run (the statistics' `handoff.verdict`
+is `taken`; `invalid` for one that breaks a rule, `none` without one), and the four words are
+zeroed, so that a later start without the bootloader finds none. The bootloader (fcn_boot) opens
+the cell before the image does with `posix_retained_open_boot()`, which leaves the recorded
+reason in it for the image, and writes the hand-off with `posix_retained_set_handoff()`. A cell
+that is not valid it writes afresh first, as after power-on, so the image of a start after
+power-on finds a valid cell with no reset and its hand-off (verdict `no reset`).
 
 "Written afresh" means every word 0 (reason POWER_ON) with a valid header and CRC. Because the
 start spends the reason, a run that ends without `plat_reset()` (on the host an orderly stop or a
@@ -592,10 +620,11 @@ simulation control command `sensor.hang on|spin|off` makes every read of the fro
 - **The retained cell: a `.noinit` section.** `plat_retained_cell_t` placed with
   `__attribute__((section(".noinit")))` in an output section of type NOLOAD outside `.bss` and
   `.data`, so that neither the start-up code's zeroing nor its copying from flash touches it. The
-  same magic, version and CRC tell a cell from the garbage of a power-on. A bootloader that
-  shares the cell with the application (phase 4) needs the same address in both linker scripts.
-- **The DTCs** would move to flash (phase 4) and be read and cleared over UDS (phase 5); the
-  module needs no change for either, only a function that restores a saved state.
+  same magic, version and CRC tell a cell from the garbage of a power-on. The bootloader shares
+  the cell with the application (the hand-off, phase 4), so both linker scripts need it at the
+  same address (phase 7).
+- **The DTCs** would be read and cleared over UDS (phase 5) as they are; keeping them across a
+  reset would need a function that restores a saved state, which this project does not add.
 
 ## Measured on the development laptop
 
@@ -672,6 +701,7 @@ The size of the DTC state, with `sizeof` on the host and `arm-none-eabi-gcc -mcp
 | [tests/unit/test_telemetry.c](../tests/unit/test_telemetry.c), [test_command.c](../tests/unit/test_command.c) | BMS_Fault byte by byte and through the E2E check, PackState and PackFaultActive, ResetCause for every cause, the clear requests, none by a tester that starts after another went away or comes back with a changed value |
 | [tests/platform/test_posix_retained.c](../tests/platform/test_posix_retained.c), [wdg_selftest.c](../tests/platform/wdg_selftest.c) | every verdict of the cell at start, what a reset writes; the watchdog model in FreeRTOS programs run as children: expiry never before the timeout, a kicked watchdog that never resets, the start rules, the cell across real resets, `hang on` and `hang spin` |
 | [tests/system/test_retained.py](../tests/system/test_retained.py) | the node with `--retained-file`: every verdict, every reason reported by name and value, a killed node, two nodes on one cell, an unusable path, and a watchdog reset of `wdg_selftest expire` that the node then reports |
+| [tests/system/test_boot.py](../tests/system/test_boot.py), [test_update.py](../tests/system/test_update.py), [test_update_cuts.py](../tests/system/test_update_cuts.py) (phase 4) | the reset cause through the bootloader: a watchdog reset of the node started through fcn_boot is reported by the next start (BMS_NodeInfo, RESET_WATCHDOG) next to the hand-off; UPDATE_ROLLBACK active and confirmed in the first BMS_Fault after a ROLLBACK (a trial that crashes, one that hangs), a REJECT (a trial with a flipped bit) and a FALLBACK (a confirmed image with a flipped bit), and not in the start after that; after a cut in the rollback record, reported by the start that writes it again, and lost when the cut completed it ([update.md](update.md)) |
 | [tests/system/test_faults.py](../tests/system/test_faults.py) | every fault of the table applied from outside: the right DTC in BMS_Fault, and only it, while it lasts, PackFaultActive and FAULT meanwhile, testFailed cleared and confirmedDTC kept after it, and the status byte, counter and fault detection counter in the statistics, both while the fault is active and after it, with two exceptions: SAMPLE_TIMEOUT, during which no sample and so no BMS_PackStatus comes, in BMS_PackStatus and in the statistics only once a stall the node survived has ended, and SUPERVISION_EXPIRED, which ends in a reset, which writes no statistics and leaves no after; a fault that comes and goes within one health period, active in its frame and logged; the clear while a fault is there and after it, a failure detected after the request surviving it and nothing from before the request in its frame; a shorted bus until bus off and the 5 s until its DTC heals; every reset cause a cell can record; `sensor.hang on` ending in a reset with status 11 and nothing else, then the start on the same cell (WATCHDOG, RESET_WATCHDOG until a clear) and after a power loss (POWER_ON); the supervision configuration of the design; one BMS_Fault per health period and every change of the DTCs in the frame of the period that made it, the frames counted exactly against the statistics and every one checked with the independent Profile 11 implementation; and, as timing tolerances, the time from a fault to its frame, from a hang to the reset, and from a change's log line to the frame that shows it, a stall of the sensor task that leaves two examinations without an alive indication survived (SAMPLE_TIMEOUT healed), and one that leaves three ending in a reset |
 | every system test | the test harness fails any test whose node was reset without the test waiting for that reset with `wait_for_reset()`, and any test with a run that ended in order whose statistics show a kick missing: the hardware watchdog not started, kicks and withheld kicks that do not add up to the supervision cycles, or kicks the health task decided on that the watchdog did not count (`NodeProcess.lost_kicks()`); at the end of a test it stops the nodes that still run in order (SIGTERM), so that their kicks are checked too ([tests/conftest.py](../tests/conftest.py), for the nodes started through its fixtures; the few tests that start the node themselves assert its exit status and, after an orderly end, its kicks). So no node was reset without the test waiting for it, and in every run that ended in order every kick the health task decided on reached the hardware watchdog; neither shows that the kicks came often enough in a run shorter than the watchdog's 500 ms timeout or in the last 500 ms before an orderly stop, which switches the watchdog off |
 
@@ -702,16 +732,23 @@ the same way. 22 defects, each planted alone in a scratch copy, and every one ca
 | the harness does not report a reset nobody waited for (three ways: in `unexpected_reset()`, in the fixture, in `wait_for_reset()`) | tests/python/test_node.py and test_harness.py |
 | the health task never kicks the hardware watchdog | the harness's kick check (`NodeProcess.lost_kicks()`): of the 91 tests of test_smoke.py, test_retained.py, test_can_link.py, test_application.py and test_sensor_control.py outside the timing run, 66 pass against it with the harness of before this check, and 40 of those 66 now fail, each on its lost kicks |
 
-## What phase 3 does not do, and what phases 4 and 5 add
+## What phase 3 does not do, and what phases 4 and 5 add or leave out
 
 - **Aging.** confirmedDTC and testFailedSinceLastClear stay set until a clear.
-- **Storage in non-volatile memory (phase 4).** A reset loses every DTC, confirmed ones
-  included. Phase 4's flash will keep the status byte and the count of failing cycles per DTC
-  number (not the `dtc_state_t`, which holds a pointer to the table), restore them at the start
-  and then call `dtc_start_operation_cycle()`; confirmation thresholds above 1 become meaningful
-  then.
-- **Boot attempts (phase 4).** The reserved words of the retained cell are unused: phase 4's
-  bootloader will count boot attempts in `reserved[0]` and roll back when they run out.
+- **No storage in non-volatile memory: a limitation.** A reset loses every DTC, confirmed ones
+  included, and every run is one operation cycle. The flash of phase 4 holds the images and the
+  boot control metadata only. A product keeps at least the status byte and the count of failing
+  cycles per DTC number in non-volatile memory (not the `dtc_state_t`, which holds a pointer to
+  the table), restores them at the start and calls `dtc_start_operation_cycle()`; only then do
+  confirmation thresholds above 1, a pendingDTC that outlives a cycle and the aging of
+  confirmedDTC mean something. The faults of a start (the reset faults, UPDATE_ROLLBACK) are
+  judged again at each start from the retained cell instead, and a tester sees them only in the
+  run right after the reset or rollback that caused them (and not at all if that run never
+  reaches its first BMS_Fault, see UPDATE_ROLLBACK above).
+- **Boot attempts (phase 4)** are not counted in the retained cell, which a loss of supply
+  erases: a trial that cuts its own supply would then never run out of attempts. lib/boot counts
+  them in the flash, one program unit per attempt written before the trial starts
+  ([update.md](update.md)); the cell's reserved words carry the bootloader's hand-off instead.
 - **UDS (phase 5).** ReadDTCInformation (0x19) and ClearDiagnosticInformation (0x14) over
   ISO-TP will expose the DTCs through the read functions above; until then BMS_Fault and the
   statistics are the only views, and CmdClearFaultsSeq the only clear.

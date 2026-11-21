@@ -42,7 +42,9 @@
 #include "can/can_frame.h"
 #include "e2e/e2e_p11.h"
 #include "fault.h"
+#include "plat_retained.h"
 #include "platform.h"
+#include "update.h"
 
 /** The protected messages, in the order of their counters in telemetry_sender_t. */
 typedef enum {
@@ -130,12 +132,24 @@ bool telemetry_heartbeat(uint32_t period_counter, uint32_t tick_count, can_frame
  *  largest values. Returns false only if packing refused. */
 bool telemetry_task_stats(const telemetry_task_t *task, can_frame_t *frame);
 
-/** BMS_NodeInfo: the software version, ActiveSlot SNA (the node has no A/B slots before
- *  phase 4), ResetCause the value of `reset_cause` (plat_reset_cause(): POWER_ON or a reset
- *  reason; SNA for a value that is neither), the uptime in seconds. Returns false only if
- *  packing refused. */
-bool telemetry_node_info(uint8_t sw_major, uint8_t sw_minor, uint8_t sw_patch,
+/** BMS_NodeInfo: the software version, ActiveSlot from `active_slot` (0 A, 1 B, the slot the
+ *  bootloader's hand-off names; any other value, PLAT_HANDOFF_NO_SLOT for a start without the
+ *  bootloader, is SNA), ResetCause the value of `reset_cause` (plat_reset_cause(): POWER_ON or a
+ *  reset reason; SNA for a value that is neither), the uptime in seconds. Returns false only
+ *  if packing refused. */
+bool telemetry_node_info(uint8_t sw_major, uint8_t sw_minor, uint8_t sw_patch, uint8_t active_slot,
                          plat_reset_reason_t reset_cause, uint32_t uptime_s, can_frame_t *frame);
+
+/**
+ * BMS_BootInfo: the bootloader's hand-off `handoff` (NULL: none, BootMode NONE and every signal
+ * but ConfirmState 0, BootEventSlot SNA) as BootMode, BootAttempt, BootEvent, BootEventSlot and
+ * ImageVersionMajor/Minor/Patch, and the confirm as ConfirmState (`confirm`) and ConfirmSeconds
+ * (`confirm_seconds`, saturated at 255). Returns false, building nothing, for a hand-off whose
+ * event, slot, mode or attempt the DBC has no value for, or for a confirm state outside the
+ * enumeration; otherwise false only if packing refused. Any context.
+ */
+bool telemetry_boot_info(const plat_boot_handoff_t *handoff, update_confirm_state_t confirm,
+                         uint32_t confirm_seconds, can_frame_t *frame);
 
 /** One period of the counting task has ended; `periods_per_second` of them (at least 1) make a
  *  second. Returns true if this period completed a second, which uptime->seconds then

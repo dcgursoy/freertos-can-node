@@ -225,7 +225,24 @@ static const dtc_event_config_t s_events[FAULT_EVENTS] = {
                                    .step_down = 1U,
                                    .confirmation_threshold = 1U,
                                    .jump_down = true,
-                                   .warning_indicator = false}};
+                                   .warning_indicator = false},
+    /* The bootloader rolled back before this start (its hand-off, plat_retained.h): a trial
+     * that used its three attempts without confirming itself, a trial that did not validate, or
+     * a confirmed image that stopped validating. The node now runs the image it was meant to
+     * replace, or the one before it, and the update that was tried has failed: the tester has
+     * to know, and the pack's master too (the image may be an old one). Judged once per run, at
+     * its start, like the reset faults and for the same reason: the hand-off speaks only to the
+     * start right after the rollback, so the one report decides, and the DTC stands for the run
+     * until a tester clears it. It is a fault of the node's software, not of the module: no
+     * warning indicator. */
+    [FAULT_UPDATE_ROLLBACK] = {.dtc = 0x1B0600U,
+                               .failed_threshold = 1,
+                               .passed_threshold = -1,
+                               .step_up = 1U,
+                               .step_down = 1U,
+                               .confirmation_threshold = 1U,
+                               .jump_down = true,
+                               .warning_indicator = false}};
 
 static const char *const s_names[FAULT_EVENTS] = {
     [FAULT_CELL_OVERVOLTAGE] = "CELL_OVERVOLTAGE",
@@ -243,7 +260,8 @@ static const char *const s_names[FAULT_EVENTS] = {
     [FAULT_RESET_WATCHDOG] = "RESET_WATCHDOG",
     [FAULT_RESET_ASSERT] = "RESET_ASSERT",
     [FAULT_RESET_STACK_OVERFLOW] = "RESET_STACK_OVERFLOW",
-    [FAULT_RESET_MALLOC_FAILED] = "RESET_MALLOC_FAILED"};
+    [FAULT_RESET_MALLOC_FAILED] = "RESET_MALLOC_FAILED",
+    [FAULT_UPDATE_ROLLBACK] = "UPDATE_ROLLBACK"};
 
 /* The faults the processing task judges are the first ones, up to SAMPLE_TIMEOUT: the masks
  * of a verdict hold exactly those. */
@@ -270,7 +288,14 @@ _Static_assert(FAULT_CURRENT_OCC_MA > -BMS_CURRENT_SENSOR_MAX_MA, "charge: insid
 _Static_assert((sizeof(s_events) / sizeof(s_events[0])) == (size_t)FAULT_EVENTS, "one per fault");
 _Static_assert((sizeof(s_names) / sizeof(s_names[0])) == (size_t)FAULT_EVENTS, "one name each");
 
-static uint16_t bit_of(fault_event_t event)
+/* The bit of a fault in the monitor's and the summary's masks. */
+static uint32_t bit_of(fault_event_t event)
+{
+    return (uint32_t)(1UL << (uint32_t)event);
+}
+
+/* The bit of one of the processing task's faults (0..FAULT_SAMPLE_TIMEOUT) in a verdict. */
+static uint16_t sample_bit(fault_event_t event)
 {
     return (uint16_t)(1UL << (uint32_t)event);
 }
@@ -286,9 +311,9 @@ static void evidence(fault_event_t event, bool beyond, bool within, bool all_val
                      fault_verdict_t *verdict)
 {
     if (beyond) {
-        verdict->failing = (uint16_t)(verdict->failing | bit_of(event));
+        verdict->failing = (uint16_t)(verdict->failing | sample_bit(event));
     } else if (all_valid && within) {
-        verdict->passing = (uint16_t)(verdict->passing | bit_of(event));
+        verdict->passing = (uint16_t)(verdict->passing | sample_bit(event));
     } else {
         /* not judged */
     }
@@ -382,7 +407,7 @@ void fault_judge_sample(const bms_sample_t *sample, uint8_t unanswered, const bm
     const uint8_t answered = (uint8_t)(groups & (uint8_t)~unanswered);
 
     verdict->failing = 0U;
-    verdict->passing = bit_of(FAULT_SAMPLE_TIMEOUT);
+    verdict->passing = sample_bit(FAULT_SAMPLE_TIMEOUT);
     verdict->clear_requests = 0U;
 
     if ((groups & BMS_SAMPLE_CELLS) != 0U) {
@@ -404,7 +429,7 @@ void fault_judge_sample(const bms_sample_t *sample, uint8_t unanswered, const bm
 
 void fault_judge_timeout(fault_verdict_t *verdict)
 {
-    verdict->failing = bit_of(FAULT_SAMPLE_TIMEOUT);
+    verdict->failing = sample_bit(FAULT_SAMPLE_TIMEOUT);
     verdict->passing = 0U;
     verdict->clear_requests = 0U;
 }
@@ -413,7 +438,7 @@ void fault_judge_timeout(fault_verdict_t *verdict)
  * the summary of the period (fault.h, THE SUMMARY OF A PERIOD). */
 static void note_test_failed(fault_monitor_t *monitor, fault_event_t event)
 {
-    const uint16_t mask = bit_of(event);
+    const uint32_t mask = bit_of(event);
     const bool was = (monitor->failed & mask) != 0U;
     dtc_entry_t entry;
     bool is = false;
@@ -423,12 +448,12 @@ static void note_test_failed(fault_monitor_t *monitor, fault_event_t event)
     }
 
     if (is && !was) {
-        monitor->failed = (uint16_t)(monitor->failed | mask);
-        monitor->rose = (uint16_t)(monitor->rose | mask);
-        monitor->latched = (uint16_t)(monitor->latched | mask);
+        monitor->failed |= mask;
+        monitor->rose |= mask;
+        monitor->latched |= mask;
     } else if (was && !is) {
-        monitor->failed = (uint16_t)(monitor->failed & (uint16_t)~mask);
-        monitor->fell = (uint16_t)(monitor->fell | mask);
+        monitor->failed &= ~mask;
+        monitor->fell |= mask;
     } else {
         /* no change of testFailed */
     }
@@ -466,7 +491,7 @@ static bool newer_requests(uint32_t requests, uint32_t carried_out)
     return (ahead != 0U) && (ahead < 0x80000000UL);
 }
 
-bool fault_init(fault_monitor_t *monitor, plat_reset_reason_t cause)
+bool fault_init(fault_monitor_t *monitor, plat_reset_reason_t cause, bool rolled_back)
 {
     static const struct {
         fault_event_t event;
@@ -479,12 +504,17 @@ bool fault_init(fault_monitor_t *monitor, plat_reset_reason_t cause)
 
     (void)memset(monitor, 0, sizeof(*monitor));
     monitor->reset_cause = cause;
+    monitor->rolled_back = rolled_back;
     ok = dtc_init(&monitor->dtc, s_events, (uint16_t)FAULT_EVENTS);
 
     for (size_t i = 0U; ok && (i < (sizeof(resets) / sizeof(resets[0]))); i++) {
         const bool this_one = (cause == resets[i].reason);
 
         report(monitor, resets[i].event, this_one, !this_one);
+    }
+
+    if (ok) {
+        report(monitor, FAULT_UPDATE_ROLLBACK, rolled_back, !rolled_back);
     }
 
     return ok;
@@ -540,7 +570,7 @@ bool fault_clear_if_requested(fault_monitor_t *monitor, uint32_t requests)
         if (cleared) {
             /* Every testFailed ends here; the rises before the clear stay in the log's edges
              * but no longer count for the summary. */
-            monitor->fell = (uint16_t)(monitor->fell | monitor->failed);
+            monitor->fell |= monitor->failed;
             monitor->failed = 0U;
             monitor->latched = 0U;
             monitor->clears++;
@@ -558,14 +588,14 @@ void fault_summary(fault_monitor_t *monitor, fault_summary_t *summary, fault_cha
 
     for (uint32_t event = 0U; event < (uint32_t)FAULT_EVENTS; event++) {
         if (dtc_get(&monitor->dtc, (uint16_t)event, &entry)) {
-            const uint16_t mask = bit_of((fault_event_t)event);
+            const uint32_t mask = bit_of((fault_event_t)event);
 
             if (((entry.status & DTC_STATUS_TF) != 0U) || ((monitor->latched & mask) != 0U)) {
-                summary->active = (uint16_t)(summary->active | mask);
+                summary->active |= mask;
             }
 
             if ((entry.status & DTC_STATUS_CDTC) != 0U) {
-                summary->confirmed = (uint16_t)(summary->confirmed | mask);
+                summary->confirmed |= mask;
             }
 
             if ((entry.status & DTC_STATUS_WIR) != 0U) {

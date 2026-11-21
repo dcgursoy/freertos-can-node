@@ -38,7 +38,8 @@ against the DBC by `tests/python/test_gen_can_db.py`, so they cannot drift from 
 | 0x050 | BMS_Temperatures | BMS | 8 | 100 ms | 0x0150 | four temperatures |
 | 0x100 | TESTER_Command | TESTER | 8 | 100 ms | 0x0200 | telemetry on/off, clear-faults sequence |
 | 0x600 | BMS_TaskStats | BMS | 8 | 200 ms | none | statistics of one task per frame, round robin |
-| 0x610 | BMS_NodeInfo | BMS | 8 | 1000 ms | none | software version, active slot (phase 4), reset cause, uptime |
+| 0x610 | BMS_NodeInfo | BMS | 8 | 1000 ms | none | software version, active slot, reset cause, uptime |
+| 0x611 | BMS_BootInfo | BMS | 8 | 1000 ms | none | how the bootloader started the image (confirmed or trial, attempt, the state change it made), the image's version, the confirm of a trial |
 | 0x6F0 | TESTER_Ping | TESTER | 8 | event | none | any payload of 0 to 8 bytes, no signals |
 | 0x6F1 | BMS_Pong | BMS | 8 | event | none | the payload of the ping, no signals |
 | 0x7E0 | UDS_Request | TESTER | 8 | event | none | ISO 15765-2 frames (phase 5), no signals |
@@ -48,7 +49,7 @@ The DBC gives ping and pong a DLC of 8, the most they carry; the frames themselv
 shorter. `TESTER_Command` is sent cyclically although it carries commands, so that the node can
 tell a tester that has gone silent from one that has nothing new to say.
 
-**Bus load.** The node sends 326 cyclic frames per second, and they occupy at most 8.80 % of
+**Bus load.** The node sends 327 cyclic frames per second, and they occupy at most 8.83 % of
 the 500 kbit/s bus (the worst case of bit stuffing for 8-byte frames, plus the intermission);
 the tester's command adds 10 frames per second, at most 0.27 %. From the DBC with:
 
@@ -69,7 +70,7 @@ EOF
 ```
 
 ```
-BMS: 8 cyclic messages, 326 frames/s, at most 44010 bit/s = 8.80 % of 500000 bit/s
+BMS: 9 cyclic messages, 327 frames/s, at most 44145 bit/s = 8.83 % of 500000 bit/s
 TESTER: 1 cyclic messages, 10 frames/s, at most 1350 bit/s = 0.27 % of 500000 bit/s
 ```
 
@@ -84,15 +85,18 @@ are the entries of the signal's value table as raw value and name.
 |---|---|---|---|---|---|---|---|---|---|
 | E2E_Crc | 0 | 8 | unsigned | 1 | 0 |  | 0..255 |  | E2E CRC |
 | E2E_Counter | 8 | 4 | unsigned | 1 | 0 |  | 0..14 |  | E2E counter |
-| FaultActive | 16 | 16 | unsigned | 1 | 0 |  | 0..65535 |  | bit n: the DTC of fault n has testFailed at the end of the period, or its testFailed rose during it (after the clear, in the period of a clear): the fault is present, or was since the last frame |
-| FaultConfirmed | 32 | 16 | unsigned | 1 | 0 |  | 0..65535 |  | bit n: the DTC of fault n has confirmedDTC, the fault occurred since the start or the last clear |
-| FaultMostRecent | 48 | 5 | unsigned | 1 | 0 |  | 0..15 | 0 CELL_OVERVOLTAGE, 1 CELL_UNDERVOLTAGE, 2 OVERTEMPERATURE, 3 UNDERTEMPERATURE, 4 OVERCURRENT_DISCHARGE, 5 OVERCURRENT_CHARGE, 6 SENSOR_CHANNEL_INVALID, 7 FRONT_END_NO_ANSWER, 8 SAMPLE_TIMEOUT, 9 CAN_BUS_OFF, 10 CAN_ERROR_PASSIVE, 11 SUPERVISION_EXPIRED, 12 RESET_WATCHDOG, 13 RESET_ASSERT, 14 RESET_STACK_OVERFLOW, 15 RESET_MALLOC_FAILED, 31 NONE | the fault whose DTC went to testFailed most recently since the start or the last clear |
-| FaultWarning | 53 | 1 | unsigned | 1 | 0 |  | 0..1 |  | a DTC requests the warning indicator: a fault of the pack's limits or its measurement occurred |
+| FaultActive | 16 | 17 | unsigned | 1 | 0 |  | 0..131071 |  | bit n: the DTC of fault n has testFailed at the end of the period, or its testFailed rose during it (after the clear, in the period of a clear): the fault is present, or was since the last frame |
+| FaultConfirmed | 33 | 17 | unsigned | 1 | 0 |  | 0..131071 |  | bit n: the DTC of fault n has confirmedDTC, the fault occurred since the start or the last clear |
+| FaultMostRecent | 50 | 5 | unsigned | 1 | 0 |  | 0..16 | 0 CELL_OVERVOLTAGE, 1 CELL_UNDERVOLTAGE, 2 OVERTEMPERATURE, 3 UNDERTEMPERATURE, 4 OVERCURRENT_DISCHARGE, 5 OVERCURRENT_CHARGE, 6 SENSOR_CHANNEL_INVALID, 7 FRONT_END_NO_ANSWER, 8 SAMPLE_TIMEOUT, 9 CAN_BUS_OFF, 10 CAN_ERROR_PASSIVE, 11 SUPERVISION_EXPIRED, 12 RESET_WATCHDOG, 13 RESET_ASSERT, 14 RESET_STACK_OVERFLOW, 15 RESET_MALLOC_FAILED, 16 UPDATE_ROLLBACK, 31 NONE | the fault whose DTC went to testFailed most recently since the start or the last clear |
+| FaultWarning | 55 | 1 | unsigned | 1 | 0 |  | 0..1 |  | a DTC requests the warning indicator: a fault of the pack's limits or its measurement occurred |
 | FaultClearCount | 56 | 8 | unsigned | 1 | 0 |  | 0..255 |  | clears carried out since the start, modulo 256 |
 
 Fault *n* is entry *n* of FaultMostRecent's value table; [app/fault.h](../app/fault.h) gives the
 DTC number of each, and the application checks every entry against its own numbering at compile
-time. Bits 12 to 15, 54 and 55 are unused. The node's health task, the one task that changes
+time. Bits 12 to 15 are unused. Phase 4 added fault 16, UPDATE_ROLLBACK, which made the two
+masks 17 bits wide: FaultActive keeps its start bit (its bits 0 to 15 are where they were in
+phase 3), and FaultConfirmed, FaultMostRecent and FaultWarning moved up by one, two and two
+bits, into the bits that were unused (54 and 55). The node's health task, the one task that changes
 the DTCs, sends the message once in each of its 100 ms periods, after the last change it made in
 the period: every change of the DTCs goes out in the frame of the period that made it, and a
 fault that became active and passed again within the period is active in that frame. It is
@@ -194,9 +198,33 @@ of them every n * 200 ms.
 | SwMajor | 0 | 8 | unsigned | 1 | 0 |  | 0..255 |  | software version |
 | SwMinor | 8 | 8 | unsigned | 1 | 0 |  | 0..255 |  | |
 | SwPatch | 16 | 8 | unsigned | 1 | 0 |  | 0..255 |  | |
-| ActiveSlot | 24 | 2 | unsigned | 1 | 0 |  | 0..1 | 0 A, 1 B, 3 SNA | the firmware slot the node runs from; SNA until phase 4 |
+| ActiveSlot | 24 | 2 | unsigned | 1 | 0 |  | 0..1 | 0 A, 1 B, 3 SNA | the firmware slot the node runs from, as the bootloader's hand-off names it; SNA for a node started without the bootloader |
 | ResetCause | 26 | 6 | unsigned | 1 | 0 |  | 0..62 | 0 POWER_ON, 10 REQUESTED, 11 WATCHDOG, 12 POWER_LOSS, 13 IMAGE_FAULT, 20 ASSERT, 21 STACK_OVERFLOW, 22 MALLOC_FAILED, 63 SNA | the values of `plat_reset_reason_t` (platform/include/platform.h): the reset cause of this start, read from the retained-RAM cell (`plat_reset_cause()`); POWER_ON for a start without a reset before it; SNA for a value that is none of these |
 | UptimeSeconds | 32 | 32 | unsigned | 1 | 0 | s | 0..4294967295 |  | seconds since the start |
+
+Every bit of BMS_NodeInfo is in use, so what phase 4 adds about the running image is in a
+message of its own, BMS_BootInfo.
+
+### 0x611 BMS_BootInfo
+
+| Signal | Start bit | Length | Type | Factor | Offset | Unit | Range | Values | Meaning |
+|---|---|---|---|---|---|---|---|---|---|
+| BootMode | 0 | 2 | unsigned | 1 | 0 |  | 0..2 | 0 NONE, 1 CONFIRMED, 2 TRIAL | how the bootloader started the image; NONE: started without the bootloader (no hand-off), every other signal but ConfirmState then 0 and BootEventSlot SNA |
+| BootAttempt | 2 | 2 | unsigned | 1 | 0 |  | 0..3 |  | for a TRIAL the attempt this start is, 1 to 3; 0 otherwise |
+| BootEvent | 4 | 3 | unsigned | 1 | 0 |  | 0..7 | 0 NONE, 1 ADOPT, 5 ROLLBACK, 6 REJECT, 7 FALLBACK | the state change the bootloader made before this start (the values of lib/boot's events); ROLLBACK, REJECT and FALLBACK are the DTC UPDATE_ROLLBACK |
+| ConfirmState | 8 | 3 | unsigned | 1 | 0 |  | 0..4 | 0 NOT_NEEDED, 1 WAITING, 2 CONFIRMING, 3 CONFIRMED, 4 FAILED | the confirm of a trial: not needed (no trial), waiting for its 5 s of good health, being written, written (the trial is the active image), or failed (it will be rolled back after its attempts) |
+| BootEventSlot | 11 | 2 | unsigned | 1 | 0 |  | 0..1 | 0 A, 1 B, 3 SNA | the slot BootEvent acted on: the adopted slot (ADOPT), the rejected trial's (ROLLBACK, REJECT), or the slot fallen back to, whose image is the confirmed one again (FALLBACK; the other slot's image is rejected); SNA for none |
+| ImageVersionMajor | 16 | 8 | unsigned | 1 | 0 |  | 0..255 |  | the version of the running image from its header (lib/image: major.minor.patch); 0 without the bootloader |
+| ImageVersionMinor | 24 | 8 | unsigned | 1 | 0 |  | 0..255 |  | |
+| ImageVersionPatch | 32 | 16 | unsigned | 1 | 0 |  | 0..65535 |  | |
+| ConfirmSeconds | 48 | 8 | unsigned | 1 | 0 | s | 0..255 |  | the seconds of good health a trial has counted towards its confirm (the confirm is made at 5), saturated |
+
+The health task sends it once a second, in its periods 2, 12, 22, ... (200 ms after each
+BMS_NodeInfo period, in an even period without BMS_TaskStats: a period still sends at most two
+frames, app/app_tasks.h). Everything but ConfirmState and ConfirmSeconds comes from the
+bootloader's hand-off at the start (platform/include/plat_retained.h) and stays as it is for the
+run. Bits 7, 13 to 15 and 56 to 63 are unused. Not protected end to end, like the other
+diagnostic messages of the node. [app/update.h](../app/update.h) describes the confirm.
 
 ## End-to-end protection
 

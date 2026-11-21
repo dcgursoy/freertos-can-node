@@ -5,7 +5,7 @@
  * for every signal alike.
  *
  * GENERATED FILE, DO NOT EDIT. The implementation of the codec. Made by tools/gen_can_db.py from
- * dbc/fcn.dbc, SHA-256 3da8310bc4c08d0cda27c7ed24a837228262a8bab37b153ed4b11f5c754144a9.
+ * dbc/fcn.dbc, SHA-256 a02487f999c9af5ca8814dcb829ef8b55573747bccf6df43a8f86e9873228d40.
  *
  * After a change of the DBC, run scripts/codegen-check.sh --update. Without --update the script
  * fails while this file is out of date; CI and scripts/check.sh run it.
@@ -94,10 +94,10 @@ bool can_db_bms_fault_pack(const can_db_bms_fault_t *msg, uint8_t *data, size_t 
         (void)memset(data, 0, CAN_DB_BMS_FAULT_DLC);
         put_bits(data, 0U, 8U, msg->e2e_crc);
         put_bits(data, 8U, 4U, msg->e2e_counter);
-        put_bits(data, 16U, 16U, msg->fault_active);
-        put_bits(data, 32U, 16U, msg->fault_confirmed);
-        put_bits(data, 48U, 5U, msg->fault_most_recent);
-        put_bits(data, 53U, 1U, msg->fault_warning);
+        put_bits(data, 16U, 17U, msg->fault_active);
+        put_bits(data, 33U, 17U, msg->fault_confirmed);
+        put_bits(data, 50U, 5U, msg->fault_most_recent);
+        put_bits(data, 55U, 1U, msg->fault_warning);
         put_bits(data, 56U, 8U, msg->fault_clear_count);
         packed = true;
     }
@@ -112,10 +112,10 @@ bool can_db_bms_fault_unpack(can_db_bms_fault_t *msg, const uint8_t *data, size_
     if ((msg != NULL) && (data != NULL) && (len == CAN_DB_BMS_FAULT_DLC)) {
         msg->e2e_crc = (uint8_t)get_bits(data, 0U, 8U);
         msg->e2e_counter = (uint8_t)get_bits(data, 8U, 4U);
-        msg->fault_active = (uint16_t)get_bits(data, 16U, 16U);
-        msg->fault_confirmed = (uint16_t)get_bits(data, 32U, 16U);
-        msg->fault_most_recent = (uint8_t)get_bits(data, 48U, 5U);
-        msg->fault_warning = (uint8_t)get_bits(data, 53U, 1U);
+        msg->fault_active = get_bits(data, 16U, 17U);
+        msg->fault_confirmed = get_bits(data, 33U, 17U);
+        msg->fault_most_recent = (uint8_t)get_bits(data, 50U, 5U);
+        msg->fault_warning = (uint8_t)get_bits(data, 55U, 1U);
         msg->fault_clear_count = (uint8_t)get_bits(data, 56U, 8U);
         unpacked = true;
     }
@@ -393,6 +393,47 @@ bool can_db_bms_node_info_unpack(can_db_bms_node_info_t *msg, const uint8_t *dat
         msg->active_slot = (uint8_t)get_bits(data, 24U, 2U);
         msg->reset_cause = (uint8_t)get_bits(data, 26U, 6U);
         msg->uptime_seconds = get_bits(data, 32U, 32U);
+        unpacked = true;
+    }
+
+    return unpacked;
+}
+
+bool can_db_bms_boot_info_pack(const can_db_bms_boot_info_t *msg, uint8_t *data, size_t capacity)
+{
+    bool packed = false;
+
+    if ((msg != NULL) && (data != NULL) && (capacity >= CAN_DB_BMS_BOOT_INFO_DLC)) {
+        (void)memset(data, 0, CAN_DB_BMS_BOOT_INFO_DLC);
+        put_bits(data, 0U, 2U, msg->boot_mode);
+        put_bits(data, 2U, 2U, msg->boot_attempt);
+        put_bits(data, 4U, 3U, msg->boot_event);
+        put_bits(data, 8U, 3U, msg->confirm_state);
+        put_bits(data, 11U, 2U, msg->boot_event_slot);
+        put_bits(data, 16U, 8U, msg->image_version_major);
+        put_bits(data, 24U, 8U, msg->image_version_minor);
+        put_bits(data, 32U, 16U, msg->image_version_patch);
+        put_bits(data, 48U, 8U, msg->confirm_seconds);
+        packed = true;
+    }
+
+    return packed;
+}
+
+bool can_db_bms_boot_info_unpack(can_db_bms_boot_info_t *msg, const uint8_t *data, size_t len)
+{
+    bool unpacked = false;
+
+    if ((msg != NULL) && (data != NULL) && (len == CAN_DB_BMS_BOOT_INFO_DLC)) {
+        msg->boot_mode = (uint8_t)get_bits(data, 0U, 2U);
+        msg->boot_attempt = (uint8_t)get_bits(data, 2U, 2U);
+        msg->boot_event = (uint8_t)get_bits(data, 4U, 3U);
+        msg->confirm_state = (uint8_t)get_bits(data, 8U, 3U);
+        msg->boot_event_slot = (uint8_t)get_bits(data, 11U, 2U);
+        msg->image_version_major = (uint8_t)get_bits(data, 16U, 8U);
+        msg->image_version_minor = (uint8_t)get_bits(data, 24U, 8U);
+        msg->image_version_patch = (uint16_t)get_bits(data, 32U, 16U);
+        msg->confirm_seconds = (uint8_t)get_bits(data, 48U, 8U);
         unpacked = true;
     }
 
