@@ -142,6 +142,9 @@ static uint64_t s_pass_ns;   /* hardware thread only: the time of the current pa
 static uint64_t s_due_ns;    /* hardware thread only: the deadline its last sleep was for */
 static uint8_t s_told_state; /* hardware thread only: the error state the driver was last sent */
 static uint32_t s_bitrate;
+/* The bus fault in force from the start (the node's --can-fault, posix_can_set_start_fault()):
+ * set before posix_can_start(), which puts it into the model. */
+static can_bus_fault_t s_start_fault = CAN_BUS_FAULT_NONE;
 
 /* Hardware thread only: the transmit request taken from the ring and not yet loaded into a
  * mailbox, if any. The ring can only be popped, and the loops in serve_driver() have to see a
@@ -612,6 +615,41 @@ static const char *fault_name(can_bus_fault_t fault)
     return ((unsigned int)fault < 4U) ? names[fault] : "?";
 }
 
+/* The bus fault named `name` in can.fault and in the node's --can-fault, into `out`; false for
+ * a name that is none of them. */
+static bool fault_from_name(const char *name, can_bus_fault_t *out)
+{
+    static const struct {
+        const char *name;
+        can_bus_fault_t fault;
+    } table[] = {{"none", CAN_BUS_FAULT_NONE},
+                 {"short", CAN_BUS_FAULT_SHORT},
+                 {"dominant", CAN_BUS_FAULT_STUCK_DOMINANT},
+                 {"noack", CAN_BUS_FAULT_NO_ACK}};
+    bool found = false;
+
+    for (size_t i = 0U; i < (sizeof(table) / sizeof(table[0])); i++) {
+        if (strcmp(name, table[i].name) == 0) {
+            *out = table[i].fault;
+            found = true;
+        }
+    }
+
+    return found;
+}
+
+bool posix_can_set_start_fault(const char *name)
+{
+    can_bus_fault_t fault = CAN_BUS_FAULT_NONE;
+    const bool known = (name != NULL) && fault_from_name(name, &fault);
+
+    if (known) {
+        s_start_fault = fault;
+    }
+
+    return known;
+}
+
 /* Commands under "can.": status | fault <none|short|dominant|noack> | inject <tx|rx> <count>.
  * Runs in the hardware thread, within a pass of its loop. */
 static bool sim_can_handler(const char *verb, const char *args, char *reply, size_t reply_len)
@@ -663,21 +701,13 @@ static bool sim_can_handler(const char *verb, const char *args, char *reply, siz
     }
 
     if (strcmp(verb, "fault") == 0) {
-        static const struct {
-            const char *name;
-            can_bus_fault_t fault;
-        } table[] = {{"none", CAN_BUS_FAULT_NONE},
-                     {"short", CAN_BUS_FAULT_SHORT},
-                     {"dominant", CAN_BUS_FAULT_STUCK_DOMINANT},
-                     {"noack", CAN_BUS_FAULT_NO_ACK}};
+        can_bus_fault_t fault = CAN_BUS_FAULT_NONE;
 
-        for (size_t i = 0U; i < (sizeof(table) / sizeof(table[0])); i++) {
-            if (strcmp(args, table[i].name) == 0) {
-                can_ctrl_set_fault(&s_ctrl, table[i].fault, now_ns);
-                (void)snprintf(reply, reply_len, "fault=%s t_ns=%llu", table[i].name,
-                               (unsigned long long)now_ns);
-                return true;
-            }
+        if (fault_from_name(args, &fault)) {
+            can_ctrl_set_fault(&s_ctrl, fault, now_ns);
+            (void)snprintf(reply, reply_len, "fault=%s t_ns=%llu", fault_name(fault),
+                           (unsigned long long)now_ns);
+            return true;
         }
 
         (void)snprintf(reply, reply_len, "unknown fault '%s' (none, short, dominant, noack)", args);
@@ -849,6 +879,11 @@ bool posix_can_start(const char *backend_spec, uint32_t bitrate, char *error, si
     s_pass_ns = s_started_ns;
     s_due_ns = CAN_CTRL_NO_WAKEUP;
     can_ctrl_init(&s_ctrl, &config, s_started_ns);
+
+    if (s_start_fault != CAN_BUS_FAULT_NONE) {
+        can_ctrl_set_fault(&s_ctrl, s_start_fault, s_started_ns);
+    }
+
     s_told_state = (uint8_t)can_ctrl_state(&s_ctrl);
     s_stopped_ns = 0U;
     s_next_request_held = false;

@@ -5,7 +5,7 @@
  * for every signal alike.
  *
  * GENERATED FILE, DO NOT EDIT. The implementation of the codec. Made by tools/gen_can_db.py from
- * dbc/fcn.dbc, SHA-256 a02487f999c9af5ca8814dcb829ef8b55573747bccf6df43a8f86e9873228d40.
+ * dbc/fcn.dbc, SHA-256 ee5a3fa516d3029851805544da6004843add051153e5492607e90ef8e1881e18.
  *
  * After a change of the DBC, run scripts/codegen-check.sh --update. Without --update the script
  * fails while this file is out of date; CI and scripts/check.sh run it.

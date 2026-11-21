@@ -57,6 +57,7 @@ typedef struct {
     bool flash_cut_given;      /* --flash-cut: flash_cut is armed for this run */
     posix_flash_cut_t flash_cut;
     const char *can_spec;
+    const char *can_fault; /* --can-fault: the bus fault in force from the start; NULL: none */
     uint32_t bitrate;
     uint32_t sensor_seed;
     uint16_t sim_port;
@@ -71,6 +72,9 @@ static void print_usage(const char *program)
                  "                         0 switches the bus model's pacing off\n"
                  "  --sim-port N           serve simulation control (fault injection) on UDP\n"
                  "                         port N of the loopback interface (default: off)\n"
+                 "  --can-fault FAULT      a fault of the bus in force from the start, as\n"
+                 "                         simulation control's can.fault applies one: none\n"
+                 "                         (default), short, dominant or noack\n"
                  "  --sensor-seed N        seed of the sensor model's noise, 0 to 4294967295\n"
                  "                         (default %u); the same seed gives the same readings\n"
                  "  --duration-s N         stop after N seconds of tick time (default and 0: run\n"
@@ -153,6 +157,7 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         OPT_CAN,
         OPT_BITRATE,
         OPT_SIM_PORT,
+        OPT_CAN_FAULT,
         OPT_SENSOR_SEED,
         OPT_RETAINED,
         OPT_FLASH,
@@ -170,6 +175,7 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         {"can", required_argument, NULL, OPT_CAN},
         {"bitrate", required_argument, NULL, OPT_BITRATE},
         {"sim-port", required_argument, NULL, OPT_SIM_PORT},
+        {"can-fault", required_argument, NULL, OPT_CAN_FAULT},
         {"sensor-seed", required_argument, NULL, OPT_SENSOR_SEED},
         {"retained-file", required_argument, NULL, OPT_RETAINED},
         {"flash-file", required_argument, NULL, OPT_FLASH},
@@ -241,6 +247,15 @@ static int parse_options(int argc, char **argv, node_options_t *options)
                 options->sim_port = (uint16_t)number;
             } else {
                 (void)fprintf(stderr, "invalid --sim-port: %s\n", optarg);
+                result = 2;
+            }
+            break;
+        case OPT_CAN_FAULT:
+            if (posix_can_set_start_fault(optarg)) {
+                options->can_fault = optarg;
+            } else {
+                (void)fprintf(stderr, "invalid --can-fault: %s (none, short, dominant or noack)\n",
+                              optarg);
                 result = 2;
             }
             break;
@@ -691,6 +706,12 @@ static void write_update_stats(FILE *file, const node_stats_t *stats)
     put_u64(file, "healthy_periods", m->healthy_periods, ", ");
     put_u64(file, "window_restarts", m->window_restarts, ", ");
     put_u64(file, "requested_period", m->requested_period, ", ");
+    put_u64(file, "unsupervised_periods", m->unsupervised_periods, ", ");
+    put_u64(file, "not_active_periods", m->not_active_periods, ", ");
+    put_u64(file, "bus_off_periods", m->bus_off_periods, ", ");
+    put_u64(file, "unacked_periods", m->unacked_periods, ", ");
+    put_u64(file, "window_acked", m->window_acked, ", ");
+    put_u64(file, "fewest_acked", m->fewest_acked, ", ");
     (void)fprintf(file, "\"status\": \"%s\",\n    \"flash_task\": {",
                   boot_status_name(m->confirm_status));
     put_bool(file, "flash", f->flash, ", ");
@@ -1001,7 +1022,7 @@ static bool output_path_usable(const char *path, const char *option, char *error
 }
 
 /* What can be wrong with a configuration whose options each parsed: checked before anything
- * is started. */
+ * is started but the retained cell, which main() opens first and checks --retained-file for. */
 static bool check_configuration(const node_options_t *options, char *error, size_t error_len)
 {
     can_backend_spec_t spec;
@@ -1028,8 +1049,7 @@ static bool check_configuration(const node_options_t *options, char *error, size
     }
 
     return output_path_usable(options->platform.log_path, "--log-file", error, error_len) &&
-           output_path_usable(options->stats_path, "--stats-json", error, error_len) &&
-           output_path_usable(options->retained_path, "--retained-file", error, error_len);
+           output_path_usable(options->stats_path, "--stats-json", error, error_len);
 }
 
 /* "sensor.hang on" (posix_sensor.h): the sensor task's read waits as a driver waits for an
@@ -1074,6 +1094,18 @@ int main(int argc, char **argv)
         return (status == 1) ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
+    /* The retained cell is read first, as a target's start-up code reads its no-init RAM
+     * before anything else runs, so that even a reset during start-up is recorded. First also
+     * before the checks below: a node that ends at one of them has still taken the
+     * bootloader's hand-off out of the cell, where a later start without the bootloader would
+     * find it (plat_retained.h, THE REMAINING WINDOW). Only a command line that does not parse
+     * (which may not even name the cell) ends the node before the open. */
+    if (!output_path_usable(options.retained_path, "--retained-file", error, sizeof(error)) ||
+        !posix_retained_open(options.retained_path, error, sizeof(error))) {
+        (void)fprintf(stderr, "fcn_node: %s\n", error);
+        return EXIT_FAILURE;
+    }
+
     /* A test harness passes its process id here so that no node is left behind when the
      * harness dies: the kernel is asked to kill the node when its parent exits. The request
      * only covers a parent that is still alive when it is made, hence the check after it: if
@@ -1084,19 +1116,14 @@ int main(int argc, char **argv)
         (void)prctl(PR_SET_PDEATHSIG, SIGKILL);
 
         if ((long)getppid() != strtol(harness, NULL, 10)) {
+            posix_retained_close();
             return EXIT_FAILURE;
         }
     }
 
     if (!check_configuration(&options, error, sizeof(error))) {
         (void)fprintf(stderr, "fcn_node: %s\n", error);
-        return EXIT_FAILURE;
-    }
-
-    /* The retained cell is read first, as a target's start-up code reads its no-init RAM
-     * before anything else runs, so that even a reset during start-up is recorded. */
-    if (!posix_retained_open(options.retained_path, error, sizeof(error))) {
-        (void)fprintf(stderr, "fcn_node: %s\n", error);
+        posix_retained_close();
         return EXIT_FAILURE;
     }
 
@@ -1167,6 +1194,10 @@ int main(int argc, char **argv)
     LOG_INF("main", "CAN on %s at %lu bit/s, simulation control %s, sensor seed %lu",
             options.can_spec, (unsigned long)options.bitrate,
             (options.sim_port != 0U) ? "on" : "off", (unsigned long)options.sensor_seed);
+
+    if ((options.can_fault != NULL) && (strcmp(options.can_fault, "none") != 0)) {
+        LOG_INF("main", "bus fault %s from the start (--can-fault)", options.can_fault);
+    }
     app_start(&options.app);
 
     const uint64_t start_ns = plat_time_ns();

@@ -3,7 +3,8 @@
  * app/update.c: what the hand-off means for the node, and the confirm of a trial (update.h).
  * Every test drives the monitor as the health task does, one period at a time, with 10 periods
  * a second (APP_HEALTH_PERIOD_MS 100), so that the window is UPDATE_CONFIRM_AFTER_S * 10
- * periods.
+ * periods. The count of acknowledged frames goes on from period to period as the transmit
+ * queue's does: run() adds a period's frames to it, run_acked() as many as a test says.
  */
 #include <string.h>
 
@@ -13,11 +14,20 @@
 #define PER_SECOND 10U
 #define WINDOW     (UPDATE_CONFIRM_AFTER_S * PER_SECOND)
 
+/* Frames acknowledged in a period of run(): what the DBC's cycle times give a node with its
+ * telemetry on (32.7 frames in 100 ms, rounded up); the rule asks for one. */
+#define FRAMES_PER_PERIOD 33U
+
 static update_monitor_t s_monitor;
+
+/* The count of acknowledged frames as the last period read it. It never goes back, also not
+ * when a test sets the monitor up again (update_init() starts its own copy from 0). */
+static uint64_t s_tx_acked;
 
 void setUp(void)
 {
     (void)memset(&s_monitor, 0xA5, sizeof(s_monitor));
+    s_tx_acked = 0U;
 }
 
 void tearDown(void)
@@ -38,27 +48,52 @@ static plat_boot_handoff_t handoff(plat_boot_mode_t mode, uint8_t attempt, plat_
     return h;
 }
 
+/* A period in good health, but for the count of acknowledged frames, which the run fills in. */
 static update_health_t healthy(void)
 {
     const update_health_t h = {.supervision = WDGM_GLOBAL_STATUS_OK,
                                .can_state = CAN_FC_ERROR_ACTIVE,
-                               .bus_off_count = 0U};
+                               .bus_off_count = 0U,
+                               .tx_acked = 0U};
 
     return h;
 }
 
-/* `count` periods of `health`; returns how many of them asked for the confirm. */
-static uint32_t run(const update_health_t *health, uint32_t count)
+/* `count` periods of `health`, each with `acked` frames acknowledged since the period before
+ * (0: none); returns how many of them asked for the confirm. */
+static uint32_t run_acked(const update_health_t *health, uint64_t acked, uint32_t count)
 {
     uint32_t requests = 0U;
 
     for (uint32_t i = 0U; i < count; i++) {
-        if (update_health_period(&s_monitor, health)) {
+        update_health_t period = *health;
+
+        s_tx_acked += acked;
+        period.tx_acked = s_tx_acked;
+
+        if (update_health_period(&s_monitor, &period)) {
             requests++;
         }
     }
 
     return requests;
+}
+
+/* `count` periods of `health` with FRAMES_PER_PERIOD frames acknowledged in each. */
+static uint32_t run(const update_health_t *health, uint32_t count)
+{
+    return run_acked(health, FRAMES_PER_PERIOD, count);
+}
+
+/* The counts of the periods that failed a condition of good health: the supervision, the
+ * controller's state, a bus-off, the acknowledgement. */
+static void check_failed(uint32_t unsupervised, uint32_t not_active, uint32_t bus_off,
+                         uint32_t unacked)
+{
+    TEST_ASSERT_EQUAL_UINT32(unsupervised, s_monitor.unsupervised_periods);
+    TEST_ASSERT_EQUAL_UINT32(not_active, s_monitor.not_active_periods);
+    TEST_ASSERT_EQUAL_UINT32(bus_off, s_monitor.bus_off_periods);
+    TEST_ASSERT_EQUAL_UINT32(unacked, s_monitor.unacked_periods);
 }
 
 /* No hand-off, or the CONFIRMED image: nothing to confirm, ever, however healthy the node. */
@@ -99,64 +134,169 @@ static void test_a_healthy_trial_asks_once_when_the_window_is_full(void)
     TEST_ASSERT_EQUAL_UINT32(UPDATE_CONFIRM_AFTER_S - 1U,
                              update_healthy_seconds(&s_monitor, PER_SECOND));
 
-    TEST_ASSERT_TRUE(update_health_period(&s_monitor, &good));
+    TEST_ASSERT_EQUAL_UINT32(1U, run(&good, 1U));
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_CONFIRMING, s_monitor.state);
     TEST_ASSERT_EQUAL_UINT32(WINDOW, s_monitor.requested_period);
     TEST_ASSERT_EQUAL_UINT32(UPDATE_CONFIRM_AFTER_S,
                              update_healthy_seconds(&s_monitor, PER_SECOND));
+    /* The first period counts the frames acknowledged since the start. */
+    TEST_ASSERT_EQUAL_UINT64((uint64_t)WINDOW * FRAMES_PER_PERIOD, s_monitor.window_acked);
+    TEST_ASSERT_EQUAL_UINT64(FRAMES_PER_PERIOD, s_monitor.fewest_acked);
+    TEST_ASSERT_EQUAL_UINT32(0U, s_monitor.window_restarts);
+    check_failed(0U, 0U, 0U, 0U);
 
     /* Never again, whatever follows. */
     TEST_ASSERT_EQUAL_UINT32(0U, run(&good, 10U * WINDOW));
     TEST_ASSERT_EQUAL_UINT32(WINDOW, s_monitor.periods);
 }
 
-/* Each kind of bad period starts the window again: the supervision FAILED, EXPIRED, STOPPED
- * or DEACTIVATED, the controller bus off now, or a bus-off since the last period (the count
- * went up although the controller has recovered). */
-static void test_a_period_in_bad_health_starts_the_window_again(void)
+/* One frame acknowledged in a period is enough (update.h, WHY EVERY PERIOD NEEDS AN
+ * ACKNOWLEDGED FRAME): a node with its telemetry switched off sends fewer frames than one with
+ * it on, and frames that wait behind other nodes' traffic are acknowledged later, but however
+ * few a period has, the window goes on. The window's counts are those of its own periods. */
+static void test_one_acknowledged_frame_a_period_keeps_the_window(void)
 {
     const update_health_t good = healthy();
+    const plat_boot_handoff_t trial = handoff(PLAT_BOOT_TRIAL, 1U, PLAT_BOOT_EVENT_NONE);
+    update_health_t failed = good;
+
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_EQUAL_UINT32(0U, run(&good, WINDOW / 2U));
+    TEST_ASSERT_EQUAL_UINT32(0U, run_acked(&good, 1U, (WINDOW / 2U) - 1U));
+    TEST_ASSERT_EQUAL_UINT64(1U, s_monitor.fewest_acked);
+    TEST_ASSERT_EQUAL_UINT32(1U, run_acked(&good, 11U, 1U));
+    TEST_ASSERT_EQUAL_UINT32(WINDOW, s_monitor.requested_period);
+    /* Half the window with FRAMES_PER_PERIOD each, the other half with one each but the last,
+     * which had 11. */
+    const uint64_t half = WINDOW / 2U;
+    const uint64_t window_frames = (half * FRAMES_PER_PERIOD) + half + 10U;
+
+    TEST_ASSERT_EQUAL_UINT64(window_frames, s_monitor.window_acked);
+    TEST_ASSERT_EQUAL_UINT64(1U, s_monitor.fewest_acked);
+    TEST_ASSERT_EQUAL_UINT32(0U, s_monitor.window_restarts);
+    check_failed(0U, 0U, 0U, 0U);
+
+    /* After a restart the window's counts start again with it. */
+    failed.supervision = WDGM_GLOBAL_STATUS_FAILED;
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_EQUAL_UINT32(0U, run_acked(&good, 1U, 3U));
+    TEST_ASSERT_EQUAL_UINT32(0U, run(&failed, 1U));
+    TEST_ASSERT_EQUAL_UINT64(0U, s_monitor.window_acked);
+    TEST_ASSERT_EQUAL_UINT64(0U, s_monitor.fewest_acked);
+    TEST_ASSERT_EQUAL_UINT32(1U, run(&good, WINDOW));
+    TEST_ASSERT_EQUAL_UINT64((uint64_t)WINDOW * FRAMES_PER_PERIOD, s_monitor.window_acked);
+    TEST_ASSERT_EQUAL_UINT64(FRAMES_PER_PERIOD, s_monitor.fewest_acked);
+    TEST_ASSERT_EQUAL_UINT32(WINDOW + 4U, s_monitor.requested_period);
+}
+
+/* The last period of a window is `bad`, with `acked` frames acknowledged since the period
+ * before, instead of a healthy one: it asks for nothing and starts the window again, counted
+ * once, and the window that follows it is a whole new one. From the bad period on, the count
+ * of bus-offs stays where it went. */
+static void check_bad_period_restarts(const update_health_t *bad, uint64_t acked)
+{
     const plat_boot_handoff_t trial = handoff(PLAT_BOOT_TRIAL, 2U, PLAT_BOOT_EVENT_NONE);
-    update_health_t bad[6];
+    update_health_t after = healthy();
 
-    for (size_t i = 0U; i < 6U; i++) {
-        bad[i] = good;
-    }
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_EQUAL_UINT32(0U, run(&after, WINDOW - 1U));
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0U, run_acked(bad, acked, 1U), "a bad period");
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_WAITING, s_monitor.state);
+    TEST_ASSERT_EQUAL_UINT32(0U, s_monitor.healthy_periods);
+    TEST_ASSERT_EQUAL_UINT32(1U, s_monitor.window_restarts);
 
-    bad[0].supervision = WDGM_GLOBAL_STATUS_FAILED;
-    bad[1].supervision = WDGM_GLOBAL_STATUS_EXPIRED;
-    bad[2].supervision = WDGM_GLOBAL_STATUS_STOPPED;
-    bad[3].supervision = WDGM_GLOBAL_STATUS_DEACTIVATED;
-    bad[4].can_state = CAN_FC_BUS_OFF;
-    bad[5].bus_off_count = 1U;
+    after.bus_off_count = bad->bus_off_count;
+    TEST_ASSERT_EQUAL_UINT32(0U, run(&after, WINDOW - 1U));
+    TEST_ASSERT_EQUAL_UINT32(1U, run(&after, 1U));
+    TEST_ASSERT_EQUAL_UINT32(2U * WINDOW, s_monitor.requested_period);
+    TEST_ASSERT_EQUAL_UINT32(1U, s_monitor.window_restarts);
+}
 
-    for (size_t i = 0U; i < 6U; i++) {
-        TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
-        TEST_ASSERT_EQUAL_UINT32(0U, run(&good, WINDOW - 1U));
-        TEST_ASSERT_FALSE_MESSAGE(update_health_period(&s_monitor, &bad[i]), "a bad period");
-        TEST_ASSERT_EQUAL_UINT32(0U, s_monitor.healthy_periods);
-        TEST_ASSERT_EQUAL_UINT32(1U, s_monitor.window_restarts);
+/* The watchdog manager FAILED, EXPIRED, STOPPED or DEACTIVATED: the window starts again. */
+static void test_supervision_not_ok_starts_the_window_again(void)
+{
+    static const wdgm_global_status_t statuses[] = {
+        WDGM_GLOBAL_STATUS_FAILED, WDGM_GLOBAL_STATUS_EXPIRED, WDGM_GLOBAL_STATUS_STOPPED,
+        WDGM_GLOBAL_STATUS_DEACTIVATED};
 
-        /* The count of bus-offs stays where it went: from here on the periods are good. */
-        update_health_t after = good;
+    for (size_t i = 0U; i < (sizeof(statuses) / sizeof(statuses[0])); i++) {
+        update_health_t bad = healthy();
 
-        after.bus_off_count = bad[i].bus_off_count;
-        TEST_ASSERT_EQUAL_UINT32(0U, run(&after, WINDOW - 1U));
-        TEST_ASSERT_TRUE(update_health_period(&s_monitor, &after));
-        TEST_ASSERT_EQUAL_UINT32(2U * WINDOW, s_monitor.requested_period);
+        bad.supervision = statuses[i];
+        check_bad_period_restarts(&bad, FRAMES_PER_PERIOD);
+        check_failed(1U, 0U, 0U, 0U);
     }
 }
 
-/* Error passive is not bus off: the controller still sends, and the window goes on. */
-static void test_error_passive_does_not_stop_the_window(void)
+/* Error passive restarts the window, also while frames are still acknowledged (a controller
+ * that is error passive through its receive counter), and a trial whose controller stays error
+ * passive never asks for its confirm. So does a controller that is bus off at the period with
+ * no new bus-off since the period before (still off since the last one). */
+static void test_error_passive_restarts_the_window_and_asks_for_no_confirm(void)
 {
     const plat_boot_handoff_t trial = handoff(PLAT_BOOT_TRIAL, 1U, PLAT_BOOT_EVENT_NONE);
     update_health_t passive = healthy();
+    update_health_t off = healthy();
 
     passive.can_state = CAN_FC_ERROR_PASSIVE;
+    check_bad_period_restarts(&passive, FRAMES_PER_PERIOD);
+    check_failed(0U, 1U, 0U, 0U);
+
+    off.can_state = CAN_FC_BUS_OFF;
+    check_bad_period_restarts(&off, FRAMES_PER_PERIOD);
+    check_failed(0U, 1U, 0U, 0U);
+
     TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
-    TEST_ASSERT_EQUAL_UINT32(1U, run(&passive, WINDOW));
-    TEST_ASSERT_EQUAL_UINT32(0U, s_monitor.window_restarts);
+    TEST_ASSERT_EQUAL_UINT32(0U, run(&passive, 10U * WINDOW));
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_WAITING, s_monitor.state);
+    TEST_ASSERT_EQUAL_UINT32(0U, s_monitor.healthy_periods);
+    TEST_ASSERT_EQUAL_UINT32(0U, s_monitor.requested_period);
+    check_failed(0U, 10U * WINDOW, 0U, 0U);
+}
+
+/* A bus-off between two periods (the count went up) restarts the window although the
+ * controller is error active again by the period. */
+static void test_a_bus_off_between_two_periods_starts_the_window_again(void)
+{
+    update_health_t recovered = healthy();
+
+    recovered.bus_off_count = 1U;
+    check_bad_period_restarts(&recovered, FRAMES_PER_PERIOD);
+    check_failed(0U, 0U, 1U, 0U);
+}
+
+/* A period in which no frame was acknowledged since the period before restarts the window, the
+ * controller error active and the supervision OK notwithstanding. */
+static void test_a_period_without_an_acknowledged_frame_starts_the_window_again(void)
+{
+    const update_health_t good = healthy();
+
+    check_bad_period_restarts(&good, 0U);
+    check_failed(0U, 0U, 0U, 1U);
+}
+
+/* What a node that nobody acknowledges reports, period after period: error passive (at a
+ * transmit error counter of 128), never bus off, no frame acknowledged (update.h, WHY 5
+ * SECONDS). It never asks for its confirm, however long it runs; once it is acknowledged again
+ * it confirms after a whole new window. */
+static void test_a_trial_that_nobody_acknowledges_never_confirms_itself(void)
+{
+    const update_health_t good = healthy();
+    const plat_boot_handoff_t trial = handoff(PLAT_BOOT_TRIAL, 1U, PLAT_BOOT_EVENT_NONE);
+    update_health_t lost = good;
+
+    lost.can_state = CAN_FC_ERROR_PASSIVE;
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_EQUAL_UINT32(0U, run(&good, 10U));
+    TEST_ASSERT_EQUAL_UINT32(0U, run_acked(&lost, 0U, 10U * WINDOW));
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_WAITING, s_monitor.state);
+    TEST_ASSERT_EQUAL_UINT32(0U, s_monitor.healthy_periods);
+    TEST_ASSERT_EQUAL_UINT32(1U, s_monitor.window_restarts);
+    check_failed(0U, 10U * WINDOW, 0U, 10U * WINDOW);
+
+    TEST_ASSERT_EQUAL_UINT32(0U, run(&good, WINDOW - 1U));
+    TEST_ASSERT_EQUAL_UINT32(1U, run(&good, 1U));
+    TEST_ASSERT_EQUAL_UINT32(10U + (10U * WINDOW) + WINDOW, s_monitor.requested_period);
 }
 
 /* Bad periods before the first good one restart nothing (there was no window yet); each run of
@@ -296,8 +436,12 @@ int main(void)
     UNITY_BEGIN();
     RUN_TEST(test_without_a_trial_nothing_is_confirmed);
     RUN_TEST(test_a_healthy_trial_asks_once_when_the_window_is_full);
-    RUN_TEST(test_a_period_in_bad_health_starts_the_window_again);
-    RUN_TEST(test_error_passive_does_not_stop_the_window);
+    RUN_TEST(test_one_acknowledged_frame_a_period_keeps_the_window);
+    RUN_TEST(test_supervision_not_ok_starts_the_window_again);
+    RUN_TEST(test_error_passive_restarts_the_window_and_asks_for_no_confirm);
+    RUN_TEST(test_a_bus_off_between_two_periods_starts_the_window_again);
+    RUN_TEST(test_a_period_without_an_acknowledged_frame_starts_the_window_again);
+    RUN_TEST(test_a_trial_that_nobody_acknowledges_never_confirms_itself);
     RUN_TEST(test_restarts_count_the_windows_that_were_cut_short);
     RUN_TEST(test_the_result_of_the_confirm_decides_its_state);
     RUN_TEST(test_which_events_are_a_rollback);

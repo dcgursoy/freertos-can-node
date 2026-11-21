@@ -61,8 +61,9 @@ bool posix_retained_open(const char *path, char *error, size_t error_len);
  * The bootloader's posix_retained_open(): the same, except that the reason of a valid cell
  * stays recorded in it, for the image the bootloader starts, which reads it as its own reset
  * cause. posix_retained_get_info() reports what was found (cause, resets, verdict, and a
- * hand-off left in the cell, which the bootloader overwrites). A cell that is not valid is
- * written afresh, as after power-on. The rest as posix_retained_open(). Main thread, once.
+ * hand-off left in the cell, whose words are zeroed as posix_retained_open() zeroes them). A
+ * cell that is not valid is written afresh, as after power-on. The rest as
+ * posix_retained_open(). Main thread, once.
  */
 bool posix_retained_open_boot(const char *path, char *error, size_t error_len);
 
@@ -70,9 +71,18 @@ bool posix_retained_open_boot(const char *path, char *error, size_t error_len);
  * Write `handoff` into the reserved words of the open cell (plat_retained.h, THE HAND-OFF) and
  * seal the cell with its CRC. Returns false, changing nothing, without a cell, for a NULL
  * `handoff`, or for one that breaks the rules. The bootloader, after posix_retained_open_boot(),
- * before it starts the image.
+ * directly before it starts the image.
  */
 bool posix_retained_set_handoff(const plat_boot_handoff_t *handoff);
+
+/**
+ * Take the hand-off back out of the open cell: if reserved word 0 is PLAT_HANDOFF_MAGIC, zero
+ * the four reserved words and seal the cell again with its CRC; the reset reason, the count
+ * and the rest of the cell stay as they are. Does nothing without a cell or without the magic
+ * in word 0. The bootloader, when the image it wrote the hand-off for could not be started (a
+ * failed exec), before it closes the cell: a later start then finds no hand-off.
+ */
+void posix_retained_clear_handoff(void);
 
 /** The four reserved words of `handoff` (THE HAND-OFF). Pure; any thread. */
 void posix_handoff_encode(const plat_boot_handoff_t *handoff,

@@ -136,7 +136,10 @@ wrong with the bus and the model derives what a controller would observe:
 | `noack` (no other node acknowledges) | every transmission ends in an acknowledgment error | the transmit counter stops at 128: error passive, never bus off |
 | a number of destroyed transmissions or receptions | a bit error per frame | counters go up by 8 or 1 and come back down with good frames |
 
-Each of these sequences is asserted step by step in the unit tests of the model.
+Each of these sequences is asserted step by step in the unit tests of the model. The bench
+applies and removes the first three at run time (`can.fault`, below), or puts one in force from
+the node's start with `--can-fault short|dominant|noack`, for a test that must not race the
+node to apply it (a trial that nobody acknowledges from its start, [update.md](update.md)).
 
 **What is not modelled.** The model works on whole frames. It does not simulate bit timing or
 sampling, acknowledgement by this node, or the detection of errors: it is told that an error

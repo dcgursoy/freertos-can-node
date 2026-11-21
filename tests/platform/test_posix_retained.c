@@ -649,6 +649,90 @@ static void test_a_hand_off_that_cannot_be_written_changes_nothing(void)
     TEST_ASSERT_EQUAL_MEMORY(&fresh, &after, sizeof(fresh));
 }
 
+/* The trial the bootloader hands over in the next two tests. */
+static const plat_boot_handoff_t s_trial = {.slot = 1U,
+                                            .mode = PLAT_BOOT_TRIAL,
+                                            .attempt = 1U,
+                                            .image_version = 0x01050000U,
+                                            .event = PLAT_BOOT_EVENT_NONE,
+                                            .event_slot = PLAT_HANDOFF_NO_SLOT,
+                                            .select_write_error = 0U};
+
+/* The bootloader takes back the hand-off of an image it could not start: the four words are
+ * zeroed and the cell sealed again, with the header, the reason and the count kept, so that the
+ * next start, one without the bootloader, finds no hand-off and the reset cause as before. */
+static void test_a_hand_off_taken_back_leaves_none_and_keeps_the_reason(void)
+{
+    const plat_retained_cell_t before = make_cell((uint32_t)PLAT_RESET_WATCHDOG, 5U);
+    plat_boot_handoff_t got;
+
+    write_bytes(&before, sizeof(before));
+    TEST_ASSERT_TRUE_MESSAGE(posix_retained_open_boot(s_path, s_error, sizeof(s_error)), s_error);
+    TEST_ASSERT_TRUE(posix_retained_set_handoff(&s_trial));
+    TEST_ASSERT_EQUAL_HEX32(PLAT_HANDOFF_MAGIC, read_cell().reserved[0]);
+    posix_retained_clear_handoff();
+
+    const plat_retained_cell_t after = read_cell();
+
+    TEST_ASSERT_EQUAL_HEX32(before.magic, after.magic);
+    TEST_ASSERT_EQUAL_UINT16(before.version, after.version);
+    TEST_ASSERT_EQUAL_UINT16(before.size, after.size);
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)PLAT_RESET_WATCHDOG, after.reset_reason);
+    TEST_ASSERT_EQUAL_UINT32(5U, after.resets);
+
+    for (uint32_t w = 0U; w < PLAT_RETAINED_RESERVED_WORDS; w++) {
+        TEST_ASSERT_EQUAL_HEX32(0U, after.reserved[w]);
+    }
+
+    TEST_ASSERT_EQUAL_HEX32(expected_crc(&after), after.crc);
+    posix_retained_close();
+
+    const posix_retained_info_t info = start();
+
+    ASSERT_START("WATCHDOG", "reset", 5U, info);
+    TEST_ASSERT_EQUAL_STRING("none", info.handoff_verdict);
+    TEST_ASSERT_FALSE(info.have_handoff);
+    TEST_ASSERT_FALSE(plat_boot_handoff(&got));
+}
+
+/* Taking a hand-off back where there is none changes nothing: without a cell, in a cell whose
+ * reserved words hold no hand-off (word 0 is not the magic: they are kept, as the image's
+ * open keeps them), and a second time after a hand-off was taken back. */
+static void test_taking_back_a_hand_off_where_there_is_none_changes_nothing(void)
+{
+    const plat_retained_cell_t before = make_cell((uint32_t)PLAT_RESET_REQUESTED, 2U);
+
+    TEST_ASSERT_TRUE(posix_retained_open_boot(NULL, s_error, sizeof(s_error)));
+    posix_retained_clear_handoff();
+    posix_retained_close();
+
+    write_bytes(&before, sizeof(before));
+    TEST_ASSERT_TRUE_MESSAGE(posix_retained_open_boot(s_path, s_error, sizeof(s_error)), s_error);
+    const plat_retained_cell_t opened = read_cell();
+
+    TEST_ASSERT_EQUAL_HEX32(0x11111111U, opened.reserved[0]);
+    posix_retained_clear_handoff();
+    const plat_retained_cell_t kept = read_cell();
+
+    TEST_ASSERT_EQUAL_MEMORY(&opened, &kept, sizeof(opened));
+
+    TEST_ASSERT_TRUE(posix_retained_set_handoff(&s_trial));
+    posix_retained_clear_handoff();
+    const plat_retained_cell_t once = read_cell();
+
+    posix_retained_clear_handoff();
+    const plat_retained_cell_t twice = read_cell();
+
+    TEST_ASSERT_EQUAL_MEMORY(&once, &twice, sizeof(once));
+    posix_retained_close();
+
+    const posix_retained_info_t info = start();
+
+    ASSERT_START("REQUESTED", "reset", 2U, info);
+    TEST_ASSERT_EQUAL_STRING("none", info.handoff_verdict);
+    TEST_ASSERT_FALSE(info.have_handoff);
+}
+
 /* Every hand-off the rules allow comes back from its words as it went in. */
 static void test_every_valid_hand_off_survives_its_encoding(void)
 {
@@ -723,6 +807,8 @@ int main(void)
     RUN_TEST(test_a_hand_off_that_breaks_a_rule_is_none);
     RUN_TEST(test_the_bootloader_keeps_the_reason_and_hands_over);
     RUN_TEST(test_a_hand_off_that_cannot_be_written_changes_nothing);
+    RUN_TEST(test_a_hand_off_taken_back_leaves_none_and_keeps_the_reason);
+    RUN_TEST(test_taking_back_a_hand_off_where_there_is_none_changes_nothing);
     RUN_TEST(test_every_valid_hand_off_survives_its_encoding);
 
     const int status = UNITY_END();

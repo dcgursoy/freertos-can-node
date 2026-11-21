@@ -18,10 +18,11 @@ outside (docs/update.md, the power-cut campaign):
   - the next update can be staged (and, once, runs to its confirm).
 
 The campaign is small on purpose, 24 cuts (13 in staging, 3 in attempts, 4 in the rollback,
-4 in the confirm) that run in about a minute and a quarter: lib/boot's unit tests cut every
-operation of every sequence at every position (tests/unit/test_boot_cuts.c), and
-tests/python/test_flash_decoder.py every operation of a staged update with three seeds; phase 6
-runs the large campaign. A cut of a one-unit program (a commit field, an attempt) can leave none,
+4 in the confirm) that take about a minute in a functional run and half a minute in the timing
+run (the 3 cuts armed at run time, marked `timing`, see the confirm's test): lib/boot's unit
+tests cut every operation of every sequence at every position (tests/unit/test_boot_cuts.c),
+and tests/python/test_flash_decoder.py every operation of a staged update with three seeds;
+phase 6 runs the large campaign. A cut of a one-unit program (a commit field, an attempt) can leave none,
 some or all of its transitions done, as the seed says; the seeds of those cuts are chosen so that
 each outcome occurs, and the tests check that it does (with lib/flash's model on this geometry,
 measured on the units these tests cut: seed 7 leaves none, seeds 0, 1, 2, 8 and 9 some, seeds 3
@@ -36,6 +37,8 @@ import time
 import pytest
 
 from fcn_tools.node import EXIT_OK, RESET_IMAGE_FAULT, RESET_POWER_LOSS
+from fcn_tools.simctl import SimError
+from fcn_tools.timing import check_timing
 
 from update_bench import (BENCH_SEED, MAX_ATTEMPTS, ROLLBACK_BIT, RUN_WAIT_S, Boot,
                           check_frames_of, check_handoff, check_invariants, decoded,
@@ -272,39 +275,118 @@ def test_a_cut_in_the_rollback_never_starts_the_trial_again(start_node, restart_
 # --------------------------------------------------------------------------- the node's confirm
 
 
+#: How long a run whose confirm is cut at run time lasts at most: longer than the window of good
+#: health (5 s) and the confirm after it, so that a cut armed too late ends the run in order
+#: instead of never.
+CONFIRM_CUT_RUN_S = "8"
+
+
+def cut_came_too_late(node, flash, operation: int) -> None:
+    """For a cut armed at run time that did not cut the program it was armed for: the run must
+    have ended in one of the three ways a test process or a host that fell behind the node
+    leaves, and then the test missed a timing tolerance; any other end fails it.
+      - The command was served after the confirm's programs had begun and cut none of them, and
+        the run confirmed and ended in order (status 0) after CONFIRM_CUT_RUN_S (as does a run
+        that ended before the command could be served at all).
+      - The cut was armed for the record's program, was served after that program had begun,
+        and fell in the commit field instead (status 12, the FATAL line of the run's operation 2:
+        it numbers the programs and erases since the flash was opened).
+      - The run ended in order before its confirm, the trial still waiting with its window cut
+        short and nothing written: with nothing wrong on the bus, only a host that held the node
+        up for longer than a health period cuts the window short (update.h, WHY EVERY PERIOD
+        NEEDS AN ACKNOWLEDGED FRAME), and a window that began again after 3 s does not end
+        within CONFIRM_CUT_RUN_S."""
+    status, stderr = node.wait(timeout=1), node.stderr()
+    after = info(flash)
+    check_invariants(after)
+    confirmed = "confirmed: slot B, image 1.1.0, is the active image" in node.log()
+    if status == EXIT_OK and not confirmed:
+        confirm = node.stats()["confirm"]
+        assert "FATAL" not in stderr, stderr
+        assert confirm["state"] == "WAITING" and confirm["window_restarts"] >= 1, confirm
+        assert node.stats()["flash"]["programs"] == 0
+        assert states(after) == ("confirmed", "trial")
+        missed = (f"the run ended before its confirm, with its window cut short "
+                  f"{confirm['window_restarts']} times: the host held the node up")
+    elif status == EXIT_OK:
+        assert "FATAL" not in stderr, stderr
+        assert node.stats()["flash"]["programs"] == 2
+        assert states(after) == ("previous", "confirmed")
+        late = ("was served after the confirm's programs had begun, and cut none of them"
+                if node.cut_armed else
+                "was never armed: the run had confirmed and ended before the command was answered")
+        missed = (f"the cut for operation {operation} of the confirm {late}: the test process "
+                  "fell behind the node")
+    else:
+        assert (status, operation) == (RESET_POWER_LOSS, 1), f"status {status}\n{stderr}"
+        assert "FATAL flash: power cut in operation 2 (program of 8 bytes" in stderr, stderr
+        missed = ("the cut for operation 1 of the confirm was served after the program of the "
+                  "confirm's record had begun, and cut its commit field: the test process fell "
+                  "behind the node")
+    check_timing(False, missed)
+
+
 @pytest.mark.parametrize("how, operation, seed, leaves", [
     ("command line", 1, SEED_NONE, "commit"),
-    ("run time", 1, BENCH_SEED, "commit"),
-    ("run time", 2, SEED_SOME, "commit"),
-    ("run time", 2, SEED_ALL, "confirm")])
+    pytest.param("run time", 1, BENCH_SEED, "commit", marks=pytest.mark.timing),
+    pytest.param("run time", 2, SEED_SOME, "commit", marks=pytest.mark.timing),
+    pytest.param("run time", 2, SEED_ALL, "confirm", marks=pytest.mark.timing)])
 def test_a_cut_in_the_confirm_leaves_the_trial_or_the_confirmed_image(
         start_node, restart_node, workdir, ports, images, how, operation, seed, leaves):
     """The node's first flash programs after its start are the CONFIRM record's: the record, then
     its commit field. Cut in either, the run ends as a loss of supply (12). A torn record or a
     torn commit field does not count, the trial keeps its state with one attempt used, and its
     second start confirms it; a commit field cut after its last transition is the complete
-    confirm, and the next start is of the confirmed image."""
+    confirm, and the next start is of the confirmed image.
+
+    On the command line the cut is armed before the run starts. At run time (flash.cut) the test
+    arms it once the node's first BMS_BootInfo is out, and the cut lands where it is meant to
+    only if the command is served before the confirm's first program begins, 5 s after the
+    start: only if the test process keeps up with the node. So these cases are marked `timing`,
+    and their run is bounded (--duration-s CONFIRM_CUT_RUN_S), so that a cut armed too late ends
+    the run in order instead of never. Whether the cut came in time is decided from how the run
+    ended, as the node reports it: a loss of supply with the FATAL line of the operation of the
+    run the cut was armed for, or one of the ends of cut_came_too_late(), a missed timing
+    tolerance. The flash's counts when the command is served could not decide it: a program
+    that has begun but not yet been counted then is missing from them, and the cut does not
+    count it either."""
     flash, cell = workdir / "flash.bin", workdir / "cell.bin"
     factory(flash, images["node-1.0.0"])
     stage(flash, images["node-1.1.0"])
-    args = ("--flash-cut", f"{operation}:{seed}") if how == "command line" else ()
+    args = (("--flash-cut", f"{operation}:{seed}") if how == "command line"
+            else ("--duration-s", CONFIRM_CUT_RUN_S))
+    length = 96 if operation == 1 else 8
+    cut_line = f"FATAL flash: power cut in operation {operation} (program of {length} bytes"
 
     def cut_in_the_confirm(node, reader):
-        if how == "run time":
-            deadline = time.monotonic() + RUN_WAIT_S
-            while not decoded(reader.frames, "BMS_BootInfo"):   # simulation control is up
-                assert node.running and time.monotonic() < deadline, node.stderr()
-                time.sleep(0.01)
-            reply = node.arm_flash_cut(operation, seed)
+        if how == "command line":
+            assert node.wait_for_reset(timeout=RUN_WAIT_S) == RESET_POWER_LOSS
+            return
+        # Once BMS_BootInfo is out, simulation control is up; a run that has already ended can
+        # no longer be cut.
+        deadline = time.monotonic() + RUN_WAIT_S
+        while node.running and not decoded(reader.frames, "BMS_BootInfo"):
+            assert time.monotonic() < deadline, node.stderr()
+            time.sleep(0.01)
+        try:
+            reply = node.arm_flash_cut(operation, seed) if node.running else None
+        except SimError:
+            if node.running:
+                raise
+            reply = None                       # the run ended before the command was served
+        if reply is not None:
             assert (reply["cut"], reply["cut_in"]) == ("armed", str(operation)), reply
-        assert node.wait_for_reset(timeout=RUN_WAIT_S) == RESET_POWER_LOSS
+        # A cut ends the run as a reset; one armed too late lets it end in order.
+        if node.wait(timeout=RUN_WAIT_S) != EXIT_OK:
+            assert node.wait_for_reset(timeout=RUN_WAIT_S) == RESET_POWER_LOSS
 
     node, frames = listen(f"udp:{ports.bus}",
                           lambda: start_node(*args, flash_file=flash, retained_file=cell),
                           cut_in_the_confirm)
-    length = 96 if operation == 1 else 8
-    assert (f"FATAL flash: power cut in operation {operation} (program of {length} bytes"
-            in node.stderr())
+    if how == "run time" and not (node.wait(timeout=1) == RESET_POWER_LOSS
+                                  and cut_line in node.stderr()):
+        cut_came_too_late(node, flash, operation)
+    assert cut_line in node.stderr()
     assert "trial in slot B ran 5 s in good health: writing its confirm" in node.log()
     assert all(frame.signals["BootMode"] == "TRIAL" for frame in decoded(frames, "BMS_BootInfo"))
     torn = info(flash)
@@ -320,7 +402,8 @@ def test_a_cut_in_the_confirm_leaves_the_trial_or_the_confirmed_image(
     assert expected_boot(torn) == boot
 
     if boot.mode == "trial":
-        again, frames = listen(f"udp:{ports.bus}", lambda: restart_node(node), until_confirmed)
+        again, frames = listen(f"udp:{ports.bus}", lambda: restart_node(node, args=()),
+                               until_confirmed)
         assert again.stats()["confirm"]["state"] == "CONFIRMED"
     else:
         again, frames = listen(f"udp:{ports.bus}",

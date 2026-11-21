@@ -403,6 +403,15 @@ bool posix_retained_set_handoff(const plat_boot_handoff_t *handoff)
     return written;
 }
 
+void posix_retained_clear_handoff(void)
+{
+    /* What take_handoff() removes: four words whose first is the magic. */
+    if ((s_cell != NULL) && (s_cell->reserved[0] == PLAT_HANDOFF_MAGIC)) {
+        (void)memset(s_cell->reserved, 0, sizeof(s_cell->reserved));
+        seal(s_cell);
+    }
+}
+
 bool plat_boot_handoff(plat_boot_handoff_t *out)
 {
     bool present = false;

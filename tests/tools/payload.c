@@ -15,10 +15,10 @@
  *                         timeout, 500 ms, APP_WDG_TIMEOUT_MS).
  *
  * Both take the node's command line and use two of its options: --retained-file (the cell, read
- * as the node reads it, posix_retained_open(): the reset cause is spent and the bootloader's
- * hand-off taken) and --log-file (one line saying what the hand-off was, so that a test sees
- * which slot and attempt the bootloader started). Every other option, --flash-file among them,
- * is ignored. The line, after lib/log's prefix:
+ * first, as the node reads it, posix_retained_open(): the reset cause is spent and the
+ * bootloader's hand-off taken) and --log-file (one line saying what the hand-off was, so that a
+ * test sees which slot and attempt the bootloader started). Every other option, --flash-file
+ * among them, is ignored. The line, after lib/log's prefix:
  *   payload <kind>: hand-off slot B trial attempt 2, image 1.1.0, event 0; reset cause
  *   IMAGE_FAULT
  * (the event as its number, plat_boot_event_t)
@@ -69,9 +69,11 @@ int main(int argc, char **argv)
     posix_retained_info_t retained;
     char version[BOOT_HOST_VERSION_TEXT];
 
-    if (!boot_host_log_open(option_value(argc, argv, "--log-file"), LOG_LEVEL_INFO, error,
-                            sizeof(error)) ||
-        !posix_retained_open(option_value(argc, argv, "--retained-file"), error, sizeof(error))) {
+    /* The cell before the log, as the node opens it before anything else: a payload that ends
+     * because its log cannot be opened has taken the hand-off all the same. */
+    if (!posix_retained_open(option_value(argc, argv, "--retained-file"), error, sizeof(error)) ||
+        !boot_host_log_open(option_value(argc, argv, "--log-file"), LOG_LEVEL_INFO, error,
+                            sizeof(error))) {
         (void)fprintf(stderr, "payload %s: %s\n", kind, error);
         return 1;
     }

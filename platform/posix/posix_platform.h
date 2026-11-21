@@ -133,6 +133,15 @@ void posix_tick_get_stats(posix_tick_stats_t *out);
  */
 bool posix_can_start(const char *backend_spec, uint32_t bitrate, char *error, size_t error_len);
 
+/**
+ * Put the bus fault `name` into the model from its start, as simulation control's
+ * "can.fault <name>" puts it in from the moment it is served: none, short, dominant or noack
+ * (docs/can-simulation.md). The node's --can-fault, for a test that must not race the node to
+ * apply the fault. Returns false, changing nothing, for NULL or any other name. Call before
+ * posix_can_start().
+ */
+bool posix_can_set_start_fault(const char *name);
+
 /** Stop the hardware thread and close the transport. Call after the scheduler has ended. */
 void posix_can_stop(void);
 

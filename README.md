@@ -262,13 +262,15 @@ measured for a target.
   campaign that cuts every operation of every sequence at every unit position, on two flash
   models.
 - **A bootloader** (`fcn_boot`, [platform/posix/boot_main.c](platform/posix/boot_main.c)). It
-  reads the reset cause, selects the slot, writes a hand-off into the retained cell (slot, trial
-  or confirmed, attempt, version, the rollback it made), copies the payload into a sealed memory
-  file, checks its digest again and replaces itself with it (`fexecve`), so the test harness
-  still sees one process. Phase 7's bootloader on the Cortex-M3 sets VTOR and the stack pointer
-  and branches instead.
+  reads the reset cause, selects the slot, copies the payload into a sealed memory file, checks
+  its digest again, writes a hand-off into the retained cell (slot, trial or confirmed, attempt,
+  version, the rollback it made) and replaces itself with the copy (`fexecve`), so the test
+  harness still sees one process. Phase 7's bootloader on the Cortex-M3 sets VTOR and the
+  stack pointer and branches instead.
 - **The node's side** ([app/update.h](app/update.h)). A trial confirms itself once it has run
-  5 s with the watchdog manager OK and the bus never off; a new lowest-priority task makes every
+  5 s with the watchdog manager OK, its CAN controller error active and never bus off, and frames
+  of its own acknowledged in every 100 ms period (a node alone on the bus stays error passive and
+  never goes bus off, so bus off alone would not do); a new lowest-priority task makes every
   write of the node to the flash, so that its waits delay no deadline (task table, schedulability
   check and [docs/architecture.md](docs/architecture.md) updated). BMS_NodeInfo reports the
   active slot, a new message BMS_BootInfo the trial, its attempt and the confirm, and a rollback
@@ -278,8 +280,9 @@ measured for a target.
   test holds against the tool's own reading.
 - **Tests.** Unit tests of every new module, each challenged with planted defects; system tests
   that start the node through the bootloader and watch it from the bus: a factory image, a trial
-  that confirms itself and stays, trials that crash or hang and are rolled back after exactly
-  three starts, a slot with one flipped bit that is never started, an update refused while a
+  that confirms itself and stays, a trial whose frames nobody acknowledges that does not confirm
+  itself until they are acknowledged again, trials that crash or hang and are rolled back after
+  exactly three starts, a slot with one flipped bit that is never started, an update refused while a
   trial is pending, and power cuts while an update is staged, while the bootloader counts an
   attempt or writes a rollback, and while the node confirms, each followed by a start that must
   be what the state machine says.

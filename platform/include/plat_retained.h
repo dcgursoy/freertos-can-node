@@ -22,15 +22,19 @@
  * supply would.
  *
  * THE HAND-OFF. The bootloader (on the host fcn_boot, platform/posix/boot_main.c) reads the
- * cell before the image, decides which slot to start (lib/boot, boot_select()) and writes
- * what it decided into the reserved words, sealed with the cell's CRC, before it starts the
- * image: the slot, whether the image runs as a TRIAL or as the CONFIRMED image, which attempt
- * of the trial this is, the image's version from its header, and the state change the
- * bootloader made on the way (a rollback, a rejected trial, a fallback, the adoption of the
- * factory image). It leaves the recorded reset reason in the cell for the image. The image's
- * platform reads the hand-off together with the reason (plat_boot_handoff()) and then zeroes
- * the four words, so that a later start without the bootloader finds none: no hand-off means
- * that the image was started without a bootloader. The words:
+ * cell before the image, zeroing the words of a hand-off an earlier start left in it, decides
+ * which slot to start (lib/boot, boot_select()) and, once nothing but the start itself is left
+ * to fail, writes what it decided into the reserved words, sealed with the cell's CRC: the
+ * slot, whether the image runs as a TRIAL or as the CONFIRMED image, which attempt of the
+ * trial this is, the image's version from its header, and the state change the bootloader
+ * made on the way (a rollback, a rejected trial, a fallback, the adoption of the factory
+ * image). It leaves the recorded reset reason in the cell for the image. If the start fails
+ * after all (on the host a failed exec), it zeroes the four words again, with the reason and
+ * the rest of the cell kept, before it gives up. The image's platform reads the hand-off
+ * together with the reason (plat_boot_handoff()) and then zeroes the four words, so that a
+ * later start without the bootloader finds none: no hand-off means that no bootloader started
+ * the image, or (on the host) that fcn_boot had no cell to write it into, and a hand-off means
+ * that the bootloader started this image, but for THE REMAINING WINDOW below. The words:
  *
  *     word  bits    content
  *     0     0-31    PLAT_HANDOFF_MAGIC ("FCNH"): a hand-off is present; anything else: none
@@ -49,6 +53,16 @@
  * kept here: RAM does not survive a loss of supply, and a trial that cuts its own supply must
  * still run out of attempts. lib/boot counts them in the flash (one program unit per attempt,
  * written before the trial is started).
+ *
+ * THE REMAINING WINDOW (host only). A hand-off stays in the cell only when the run ends between
+ * its write and the image's read of the cell: fcn_boot killed after it wrote the hand-off and
+ * before the exec (or, after a failed exec, before it zeroed the words again), or an image
+ * that ends before its platform has opened the cell. The node and the test payloads open it
+ * as soon as they have read their command line, before any other check of it, so only a
+ * command line the node cannot parse (or --help, --version) ends it before the open: the
+ * cell's path is one of its options. A node started directly on that cell, without fcn_boot,
+ * would take that hand-off as its own. The next start through fcn_boot zeroes it when it opens
+ * the cell. On a target the bootloader runs at every reset, so there is no start without it.
  *
  * ON A TARGET. A software reset (assert, stack overflow, a requested reset) writes its reason
  * into the cell, then triggers the reset (SCB AIRCR SYSRESETREQ). A watchdog reset writes
@@ -150,10 +164,13 @@ typedef struct {
 plat_reset_reason_t plat_reset_cause(void);
 
 /**
- * The bootloader's hand-off to this start: true with `*out` filled if the bootloader started
- * the image, false (nothing written) if the image was started without one (no cell, no
- * hand-off in it, or one that breaks the rules of THE HAND-OFF). Constant while the image runs.
- * Any task, any time after the platform has started; NULL `out` returns false.
+ * The bootloader's hand-off to this start: true with `*out` filled if the cell held one when
+ * the platform started, false (nothing written) if it held none (no cell, no hand-off in it,
+ * or one that breaks the rules of THE HAND-OFF). True means that the bootloader started this
+ * image, but for THE REMAINING WINDOW on the host; false, that no bootloader started it or
+ * that it had no cell to write into (on the host, fcn_boot without --retained-file). Constant
+ * while the image runs. Any task, any time after the platform has started; NULL `out` returns
+ * false.
  */
 bool plat_boot_handoff(plat_boot_handoff_t *out);
 

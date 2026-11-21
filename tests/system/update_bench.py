@@ -16,6 +16,11 @@ read, written from the state machine in docs/update.md, and check_invariants() w
 must satisfy whatever happened to it, a power cut included (docs/update.md, "Decision 5's
 invariants" in the power-cut campaign).
 
+The helpers at the end follow a trial on the bus for the tests of its confirm: the start of its
+window in BMS_BootInfo, its own seconds in its log, its CAN controller's state through
+simulation control, and two other nodes, a tester that switches the telemetry off and the flood
+of test_can_flood.py.
+
 The images (the `images` fixture, tests/system/conftest.py) are packed from the release build of
 the node, stripped, and from the test payloads of tests/tools: an image of the asan node does
 not fit a slot.
@@ -24,7 +29,9 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,9 +41,11 @@ import can
 import pytest
 
 from fcn_tools import bus as bus_module
+from fcn_tools import e2e
 from fcn_tools import flash as flash_decoder
 from fcn_tools import paths
-from fcn_tools.decode import DecodedFrame, Decoder
+from fcn_tools.canbits import INTERMISSION_BITS, message_bits
+from fcn_tools.decode import DecodedFrame, Decoder, data_id, load_database
 from fcn_tools.node import EXIT_OK, NodeProcess
 
 #: UPDATE_ROLLBACK, fault 16 (app/fault.h), as a bit of BMS_Fault's masks.
@@ -264,3 +273,134 @@ def check_handoff(stats: dict, boot: Boot) -> None:
         boot.slot, boot.mode, boot.attempt, boot.event), handoff
     assert handoff["rolled_back"] == (boot.event in ("ROLLBACK", "REJECT", "FALLBACK"))
     assert handoff["select_write_error"] == 0, handoff
+
+
+# ------------------------------------------------------------------ the bus during a trial
+
+
+#: A line of the node's log that ends a second of its uptime (app.c, log_alive()): the seconds
+#: its health task has counted, ten health periods each.
+ALIVE_LINE = re.compile(r"\balive: (\d+) s, ")
+
+
+def alive_seconds(node: NodeProcess) -> int:
+    """The node's uptime in its own seconds, as the last such line of its log says; -1 before
+    the first one."""
+    found = ALIVE_LINE.findall(node.log())
+    return int(found[-1]) if found else -1
+
+
+def wait_for_alive(node: NodeProcess, seconds: int) -> None:
+    """Wait until the node's log says that it has run `seconds` of its own seconds, while it
+    runs. The node's count decides; RUN_WAIT_S only bounds the wait."""
+    deadline = time.monotonic() + RUN_WAIT_S
+    while alive_seconds(node) < seconds:
+        if not node.running or time.monotonic() >= deadline:
+            pytest.fail(f"the node's log did not reach {seconds} s of its uptime within "
+                        f"{RUN_WAIT_S} s (its last line says {alive_seconds(node)} s)\n"
+                        f"--- stderr\n{node.stderr()}", pytrace=False)
+        time.sleep(0.1)
+
+
+def wait_for_confirm_seconds(reader: bus_module.BusReader, node: NodeProcess,
+                             seconds: int) -> None:
+    """Wait for a BMS_BootInfo with at least `seconds` of good health counted (ten healthy
+    periods in a row each): the trial's window has begun. RUN_WAIT_S only bounds the wait. A
+    test process that fell behind may find the trial confirming or confirmed by then (its
+    seconds are 5 from the request on); the caller decides that from the node's counts."""
+    deadline = time.monotonic() + RUN_WAIT_S
+    while time.monotonic() < deadline and node.running:
+        for frame in decoded(reader.frames, "BMS_BootInfo"):
+            if frame.raw["ConfirmSeconds"] >= seconds:
+                return
+        time.sleep(0.05)
+    pytest.fail(f"no BMS_BootInfo with ConfirmSeconds {seconds} within {RUN_WAIT_S} s\n"
+                f"--- log\n{node.log()}\n--- stderr\n{node.stderr()}", pytrace=False)
+
+
+def wait_for_can_state(node: NodeProcess, state: str) -> dict:
+    """Wait until simulation control reports the node's CAN controller in `state` (active,
+    passive or busoff, SimControl.can_status()) and return that report. RUN_WAIT_S only bounds
+    the wait."""
+    deadline = time.monotonic() + RUN_WAIT_S
+    while True:
+        with node.sim() as sim:
+            status = sim.can_status()
+        if status["state"] == state:
+            return status
+        if not node.running or time.monotonic() >= deadline:
+            pytest.fail(f"the controller did not become {state} within {RUN_WAIT_S} s: {status}",
+                        pytrace=False)
+        time.sleep(0.05)
+
+
+_DB = load_database()
+_COMMAND = _DB.get_message_by_name("TESTER_Command")
+
+
+class TelemetryOff:
+    """A tester that switches the node's telemetry off: TESTER_Command with CmdTelemetryOn 0,
+    protected with fcn_tools.e2e, every 20 ms from a thread and a bus of its own, until stop().
+    The node acts from the third frame on and keeps the switch off afterwards, also when the
+    commands stop (app/command.h)."""
+
+    def __init__(self, spec: str) -> None:
+        self.sent = 0
+        self._bus = bus_module.open_bus(spec)
+        self._sender = e2e.Sender(e2e.Config(data_id=data_id(_COMMAND), data_length=64))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="TelemetryOff", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            payload = _DB.encode_message(_COMMAND.name, {"E2E_Crc": 0, "E2E_Counter": 0,
+                                                         "CmdTelemetryOn": 0,
+                                                         "CmdClearFaultsSeq": 0})
+            self._bus.send(can.Message(arbitration_id=_COMMAND.frame_id,
+                                       data=self._sender.protect(payload), is_extended_id=False))
+            self.sent += 1
+            self._stop.wait(0.02)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+        self._bus.shutdown()
+
+
+#: The flood of test_can_flood.py, the heaviest load the system tests put on a bus: frames of
+#: another node at 0x700, below every periodic frame of the node in priority, at FLOOD_LOAD
+#: times what a bus of FLOOD_BITRATE can carry of them.
+FLOOD_BITRATE = 125_000
+FLOOD_LOAD = 1.2
+FLOOD_FRAME = can.Message(arbitration_id=0x700, data=bytes([0x55] * 8), is_extended_id=False)
+
+
+class Flood:
+    """Sends FLOOD_FRAME at FLOOD_LOAD times the capacity of a FLOOD_BITRATE bus, from a thread
+    and a bus of its own, until stop(). It follows the clock as test_can_flood.py's flood does:
+    every millisecond it sends as many frames as the rate and the time since its start ask for,
+    so a sender that the host delays catches up with a burst."""
+
+    def __init__(self, spec: str) -> None:
+        self.rate = FLOOD_LOAD * FLOOD_BITRATE / (message_bits(FLOOD_FRAME).frame_bits
+                                                  + INTERMISSION_BITS)
+        self.sent = 0
+        self._bus = bus_module.open_bus(spec)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="Flood", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        start = time.monotonic()
+        while not self._stop.is_set():
+            due = int((time.monotonic() - start) * self.rate)
+            while self.sent < due:
+                self._bus.send(FLOOD_FRAME)
+                self.sent += 1
+            time.sleep(0.001)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+        self._bus.shutdown()

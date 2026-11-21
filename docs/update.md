@@ -840,7 +840,8 @@ It does what a bootloader on a microcontroller does, in the same order:
 
 1. **The retained cell.** It opens the cell with `posix_retained_open_boot()`, which reads the
    reset cause and leaves it recorded for the image. A cell that is not valid is written afresh,
-   as after power-on.
+   as after power-on. A hand-off an earlier start left in the cell is zeroed, as the image's
+   open zeroes one (see the next section).
 2. **The flash.** It opens the flash file (created erased if missing, like an empty part) and
    arms `--flash-cut` if given. Operations wait the modelled times by sleeping. A cut that fires
    destroys the cell and ends the process with status 12.
@@ -848,19 +849,26 @@ It does what a bootloader on a microcontroller does, in the same order:
    IMAGE_TARGET_HOST). The select validates the slots it must decide about, counts an attempt
    before it starts a trial, and writes ADOPT, ROLLBACK, REJECT or FALLBACK when that is the
    state change to make.
-4. **The hand-off.** It writes the hand-off into the cell's reserved words (see the next
-   section).
-5. **The jump.**
+4. **The copy and the command line.**
    - It decodes the chosen slot's header again and checks that its version is the one select
      validated.
    - It copies the payload into a memory file (`memfd_create("fcn-image-A"/"-B")`), hashing it
      as it copies, and compares the SHA-256 with the header, so the process starts exactly the
      bytes whose digest the header names, whatever happened to the flash since the validation.
-   - It seals the file (no shrink, grow or write), closes (and so unlocks) the flash and the
-     cell, and calls `fexecve()`.
+   - It seals the file (no shrink, grow or write).
    - The image's command line is `fcn-image-<slot>`, the options after `--`, then
      `--flash-file F` and, when a cell was given, `--retained-file R`. The node options may
      not contain these two options themselves: that is a usage error.
+5. **The hand-off.** Only now, when nothing but the exec is left to fail, it writes the
+   hand-off into the cell's reserved words (see the next section), so that an image it does not
+   start leaves no hand-off for a later start without the bootloader.
+6. **The jump.** It calls `fexecve()`.
+   - The flash and the cell stay open, and locked, up to the exec. Their descriptors are
+     close-on-exec, so the exec itself closes (and so unlocks) them for the image, which opens
+     both, and no other process can take either in between.
+   - If the exec fails, it zeroes the hand-off's words and seals the cell again through its
+     mapping, still open and locked (`posix_retained_clear_handoff()`; the reset reason and the
+     rest of the cell stay as they were), closes the cell and ends with 42.
    - The process keeps its id, so the bench sees one process, the node, with the node's exit
      status. `FCN_DIE_WITH_PARENT` (the test harness's) makes the kernel kill it with its
      parent, and the setting survives the exec.
@@ -878,6 +886,14 @@ It does what a bootloader on a microcontroller does, in the same order:
 
 None of these is a status of the node (0, 1, 10 to 22, 70, 74). After the jump, the exit status
 is the image's.
+
+None of these ends leaves a hand-off in the cell. 0 and 1 end before the cell is opened, which
+leaves it as it was, or (a flash file that cannot be used) after the open of step 1, which
+zeroed an earlier hand-off. 12, 40 and 41 end in or before the select, before the hand-off is
+written. 42 ends before it is written (the header read back, the copy, its digest, the seal,
+the image's arguments) or after a failed exec, which takes it back. Of the bootloader's own
+ends, only a kill between the write and the exec leaves one: the remaining window in the next
+section.
 
 **The log.** Lines are in lib/log's format, stamped with CLOCK_MONOTONIC like the node's, and
 are appended to `--log-file` (default stderr). Errors also go to stderr as `fcn_boot: ...`. A
@@ -909,14 +925,15 @@ before select has said what it decided: the log then ends with the metadata line
 reads.
 
 **The jump on a target (phase 7).** A bootloader on the Cortex-M3 cannot start a new process; it
-starts the image in place. After select and the hand-off it masks interrupts, sets VTOR to the
-slot's vector table (the payload, at slot offset 256), loads the main stack pointer from the
-table's first word and branches to the reset handler in its second, so that the image starts as
-from a reset with the bootloader's RAM given up. The image is linked for its slot's address, and
-the retained cell, with the hand-off, has to be at the same address in both linker scripts.
-Phase 7 builds and tests this; the host's memfd is the stand-in, and the checks the host makes
-before `fexecve()` would have their counterparts there: the header read back, the digest checked
-again (or the flash kept from writes since the validation), and the reset vector inside the slot.
+starts the image in place. After select, the checks below and then the hand-off, it masks
+interrupts, sets VTOR to the slot's vector table (the payload, at slot offset 256), loads the
+main stack pointer from the table's first word and branches to the reset handler in its second,
+so that the image starts as from a reset with the bootloader's RAM given up. The image is linked
+for its slot's address, and the retained cell, with the hand-off, has to be at the same address
+in both linker scripts. Phase 7 builds and tests this; the host's memfd is the stand-in, and the
+checks the host makes before the hand-off and `fexecve()` would have their counterparts there:
+the header read back, the digest checked again (or the flash kept from writes since the
+validation), and the reset vector inside the slot.
 
 ## The hand-off
 
@@ -951,6 +968,19 @@ The boot attempts are not counted in the cell: RAM does not survive a loss of su
 trial that cuts its own supply must still run out of attempts. lib/boot counts them in the
 flash, one attempt field written before each start of the trial.
 
+**The remaining window (host only).** The bootloader writes the hand-off directly before the
+exec and takes it back if the exec fails, and the image takes it when its platform opens the
+cell. A hand-off therefore stays in the cell only when the run ends between the two: fcn_boot
+killed after it wrote the hand-off and before the exec (or, after a failed exec, before it
+zeroed the words again), or an image that ends before its platform has opened the cell. The
+node and the test payloads open it as soon as they have read their command line, before any
+other check of it (an image that ends at its start-up checks has taken its hand-off), so only a
+command line the node cannot parse, or `--help` and `--version`, ends it before the open: the
+cell's path is one of its options. A node started directly on that cell, without fcn_boot,
+would take that hand-off as its own; the next start through fcn_boot zeroes it when it opens the
+cell (step 1 above). On a target the bootloader runs at every reset, so there is no start
+without it.
+
 ## The node's side of an update
 
 [app/update.h](../app/update.h) and THE UPDATE in [app/app.c](../app/app.c).
@@ -978,14 +1008,57 @@ The flash task reads the metadata once and logs
 
 **The confirm.**
 - **The window.** A trial confirms itself once 50 consecutive health periods (5 s,
-  `UPDATE_CONFIRM_AFTER_S`) have been in good health: the watchdog manager's global status OK,
-  the CAN controller not bus off, and no bus-off since the last period. Any other period starts
-  the window again (`confirm.window_restarts`). Why 5 s is in update.h: the watchdog manager
-  finds a task that stops within 300 to 400 ms and the hardware watchdog resets the node 500 ms
-  after its last kick, so an image that hangs or crashes in its first seconds is reset well
-  inside the window; 50 supervision cycles and about 1600 frames go by in it; and it is short
-  enough for system tests that run several updates. A product waits longer (minutes, a drive
-  cycle) or leaves the confirm to a tester's routine after its own checks.
+  `UPDATE_CONFIRM_AFTER_S`) have been in good health. A period is in good health when the
+  watchdog manager's global status is OK, the CAN controller is error active (neither error
+  passive nor bus off), no bus-off happened since the period before, and the controller has
+  transmitted at least one frame with an acknowledgement since the period before (the transmit
+  queue's count of transmit-done events grew). The CAN conditions come from the controller's own
+  state and counters, not from the DTCs CAN_ERROR_PASSIVE and CAN_BUS_OFF, which can stay set
+  after their fault has gone. Any other period starts the window again
+  (`confirm.window_restarts`), and each condition a period failed is counted
+  (`unsupervised_periods`, `not_active_periods`, `bus_off_periods`, `unacked_periods`).
+- **Why 5 s, and why these conditions** (update.h, WHY 5 SECONDS). The watchdog manager finds a
+  task that stops within 300 to 400 ms and the hardware watchdog resets the node 500 ms after its
+  last kick, so an image that hangs or crashes in its first seconds is reset well inside the
+  window, in which 50 supervision cycles go by. On the bus, a fault that other nodes signal with
+  error flags, or that the node sees as bit errors, adds 8 to the transmit error counter for
+  every failed frame: the controller is error passive after 16 failed frames in a row and bus off
+  after 32, and either restarts the window. A node that nobody acknowledges (alone on the bus,
+  cut off from it, or with a transmit path that leads nowhere) never goes bus off: under ISO
+  11898-1's exception an error-passive transmitter does not count an ACK error that is all it
+  sees ([lib/can/can_fc.c](../lib/can/can_fc.c), `CAN_FC_TX_ACK_ERROR_ALONE`), so its controller
+  stays error passive at a transmit error counter of 128 and none of its frames is acknowledged.
+  That is why error passive and a period without a newly acknowledged frame restart the window
+  as well: a trial confirms itself only once it has been heard on the bus in every period of the
+  window. 5 s is also short enough for system tests that run several updates. A product waits
+  longer (minutes, a drive cycle) or leaves the confirm to a tester's routine after its own
+  checks.
+- **What the node sends in the window.** In every period it publishes ten BMS_Heartbeat (the
+  sensor task) and one BMS_Fault (the health task) whatever its telemetry switch says, with
+  BMS_TaskStats in every second period and BMS_NodeInfo and BMS_BootInfo once a second; with the
+  telemetry on, also BMS_PackStatus every 10 ms, BMS_CellVoltages1/2 every 20 ms and
+  BMS_Temperatures every 100 ms. Two reads of the count are at least 80 ms apart (the health
+  task's response time is under 20 ms), so no period of a node that works sees no acknowledged
+  frame, and one is all the rule asks for: the weaker "one within the last N periods" is not
+  needed (update.h, WHY EVERY PERIOD NEEDS AN ACKNOWLEDGED FRAME). What the windows of
+  `test_no_condition_of_a_working_node_cuts_the_window_short` counted in one run
+  (`confirm.window_acked` and `confirm.fewest_acked` in the statistics, from
+  `scripts/test-system.sh -k working_node`, release build, the run's
+  `logs-timing/<test>/node.stats.json`; another run differs by a few frames):
+
+  | Condition | Frames acknowledged in the window | Fewest in one period |
+  |---|---|---|
+  | telemetry on, nothing on the bus but a listener | 1633 | 31 |
+  | telemetry switched off by the tester's TESTER_Command | 596 | 11 |
+  | 125 kbit/s, under the flood of test_can_flood.py (1.2 times the bus capacity of 0x700 frames) | 1628 | 30 |
+
+  The window's first period counts the frames acknowledged since the start. With the tester, no
+  BMS_PackStatus went out after the first BMS_BootInfo (health period 2), which the test checks
+  as a timing tolerance.
+- **What the window does not prove.** That the trial receives: an image that cannot (a wrong
+  acceptance filter, say) confirms itself all the same, as long as its own frames are
+  acknowledged. A tester's routine proves the receive path, and phase 5, whose next update comes
+  over that path, adds one.
 - **The request.** The health task asks the flash task once (a task notification).
 - **The flash task** (priority 1, the lowest) calls `boot_confirm()` for the hand-off's slot.
   It logs `trial in slot B ran 5 s in good health: writing its confirm` and
@@ -1005,8 +1078,11 @@ delay no task with a deadline or an alive indication to give.
 - `handoff`: verdict, present, slot, mode, attempt, image_version, image_version_code, event,
   event_slot, select_write_error, rolled_back.
 - `confirm`: state, confirm_after_s, periods_needed, periods, healthy_periods, window_restarts,
-  requested_period, status, and `flash_task` with flash, boot_init, described, have_record, seq,
-  active_slot, trial_slot, attempts_used, records_valid, confirms, confirm_status and confirm_ns.
+  requested_period, the periods that failed each condition (unsupervised_periods,
+  not_active_periods, bus_off_periods, unacked_periods), the frames acknowledged in the window so
+  far (window_acked) and the fewest in one of its periods (fewest_acked), status, and
+  `flash_task` with flash, boot_init, described, have_record, seq, active_slot, trial_slot,
+  attempts_used, records_valid, confirms, confirm_status and confirm_ns.
 - `flash`: the operation counts of the host's flash (above).
 - `tasks` and `task_table` include `flash`; `telemetry.messages` includes `BMS_BootInfo`.
 
@@ -1119,12 +1195,16 @@ for the metadata just read, written from the state machine above), `check_invari
 one CONFIRMED slot, holding its recorded image intact; at most one TRIAL with 0 to 3 attempts
 used; every slot whose state names an image holding it intact), the bit flip of the bench, and
 the checks of BMS_NodeInfo, BMS_BootInfo and the hand-off against what was expected. The functional
-tests decide from what the node itself reports, never from the host's clock.
+tests decide from what the node itself reports, never from the host's clock, and never from how
+far the test process has got while the node runs: a node the test acts on meanwhile runs until
+the test stops it, and where the outcome depends on whether the test acted in time (a cut armed at
+run time, below, or a bus lost at run time) the test is marked `timing`; a fault that must not
+race the node is put in from its start (`--flash-cut`, `--can-fault`).
 
 | Test file | What it shows |
 |---|---|
-| [test_boot.py](../tests/system/test_boot.py) | a factory flash starts slot A as the confirmed image (ActiveSlot A, BootMode CONFIRMED, its version) and writes nothing; an erased flash ends fcn_boot with 40 and starts nothing; without a retained cell there is no hand-off (ActiveSlot SNA, BootMode NONE); and the reset cause reaches the image through the bootloader: the node reset by its watchdog and started again through fcn_boot reports WATCHDOG in BMS_NodeInfo, its statistics and RESET_WATCHDOG |
-| [test_update.py](../tests/system/test_update.py) | an image staged into slot B starts as a trial, confirms itself after 50 healthy health periods (BMS_BootInfo WAITING with its seconds, then CONFIRMED), and is the confirmed image after a restart; a trial that crashes (13) or hangs until the watchdog's time (11) is started exactly three times and rolled back to A, which reports UPDATE_ROLLBACK in its first BMS_Fault and only in that run; no update can begin while a trial is pending (the tool cannot open the flash while the node holds it; afterwards lib/boot refuses every address, and nothing of the flash changes); a trial with one bit flipped in its header or its payload is rejected and never started (REJECT, the DTC); a confirmed image with one bit flipped falls back to the one before it (FALLBACK, the DTC), and the next update goes to the damaged slot; a confirmed image with one bit flipped and nothing before it is not started (40). Marked `timing`: the confirm is asked for 5 s after the node's start, by its own CLOCK_MONOTONIC log stamps, never earlier than 4.9 s and at most 0.2 s late, in period 50 with no window restart |
+| [test_boot.py](../tests/system/test_boot.py) | a factory flash starts slot A as the confirmed image (ActiveSlot A, BootMode CONFIRMED, its version) and writes nothing; an erased flash ends fcn_boot with 40 and starts nothing; without a retained cell there is no hand-off (ActiveSlot SNA, BootMode NONE); and the reset cause reaches the image through the bootloader: the node reset by its watchdog and started again through fcn_boot reports WATCHDOG in BMS_NodeInfo, its statistics and RESET_WATCHDOG; an image fcn_boot cannot start (a trial whose payload is no program: 42) leaves no hand-off, so a node started then directly on its flash and cell finds none, writes nothing and confirms nothing, and the next start through fcn_boot gives the trial its second attempt; and a trial, the node or a test payload, that ends at its own start-up checks (a `--log-file` it cannot write: 1) has taken its hand-off all the same |
+| [test_update.py](../tests/system/test_update.py) | an image staged into slot B starts as a trial, confirms itself after 50 healthy health periods (BMS_BootInfo WAITING with its seconds, then CONFIRMED), and is the confirmed image after a restart; a trial that crashes (13) or hangs until the watchdog's time (11) is started exactly three times and rolled back to A, which reports UPDATE_ROLLBACK in its first BMS_Fault and only in that run; no update can begin while a trial is pending (after a run of the trial that ended by itself before its confirm, lib/boot refuses every address and nothing of the flash changes; while its next run runs, until the test stops it, the tool cannot open the flash the node holds); a trial with one bit flipped in its header or its payload is rejected and never started (REJECT, the DTC); a confirmed image with one bit flipped falls back to the one before it (FALLBACK, the DTC), and the next update goes to the damaged slot; a confirmed image with one bit flipped and nothing before it is not started (40); a trial whose frames nobody acknowledges (started with `--can-fault noack`, simulation control's `can.fault noack` from its start) stays error passive at 128, never bus off, and does not confirm itself in more periods than a window (the node's counts; the flash still holds the trial), and once it is acknowledged again (`can.fault none`) it confirms itself after a whole window that follows every period with the bus lost. Marked `timing`: the confirm is asked for 5 s after the node's start, by its own CLOCK_MONOTONIC log stamps, never earlier than 4.9 s and at most 0.2 s late, in period 50 with no window restart; no period cuts the window short with nothing on the bus but a listener, with the telemetry switched off by a tester, or at 125 kbit/s under a flood above the bus capacity; and the bus lost at run time (`can.fault noack`) once the window has begun cuts it short, and the trial confirms itself after a whole new window once it is acknowledged again (if the command came only after the confirm was asked for, the test process fell behind the node: a missed tolerance) |
 | [test_update_cuts.py](../tests/system/test_update_cuts.py) | power cuts on the system, below |
 | [test_flash_file.py](../tests/system/test_flash_file.py) | the flash in the running node: the option, the file, the statistics, the simulation commands |
 
@@ -1146,23 +1226,41 @@ three times in all and is then rolled back; and the next update can be staged.
 | staging (the flash tool) | 13: both programs of the BEGIN record, the first, the last and one drawn erase of slot B, the first, the last and two drawn pages, both programs of the COMMIT record; the commit fields once with a seed that leaves some of the unit and once with one that leaves all of it; the drawn operations and their seeds from a fixed seed | slot A confirmed and started every time; B EMPTY (BEGIN torn), WRITING (anything after BEGIN's commit field), or TRIAL if COMMIT's commit field was cut after its last transition, which is then started as attempt 1 and blocks the next update; otherwise the next update is staged over whatever the cut left. Once, the update staged after a torn erase runs to its confirm |
 | the bootloader's attempt | 3, in one sequence with a trial that crashes: an attempt field left erased (not counted, the trial not started), one left partly programmed (counted although the trial never ran), one completed (counted) | the trial runs once in all, its three attempts are used, and the next start rolls it back with the DTC |
 | the bootloader's rollback | 4: the record's program, the commit field with none, some and all of it done | the trial is never started again. A torn record: the next start writes the rollback again and reports it. A complete one: the rollback was made, but its report is lost with the start that made it (the hand-off is written after the record), so the next start finds nothing to report, a stated limitation ([faults.md](faults.md)) |
-| the node's confirm | 4: the record's program (command line, and at run time), the commit field with some and with all of it done (at run time) | a torn record or commit field leaves the trial with one attempt used, and its second start confirms it; a complete commit field is the confirm, and the next start is of the confirmed image |
+| the node's confirm | 4: the record's program (command line, and at run time), the commit field with some and with all of it done (at run time); the three at run time are marked `timing` (below) | a torn record or commit field leaves the trial with one attempt used, and its second start confirms it; a complete commit field is the confirm, and the next start is of the confirmed image |
 
-That is 24 cuts, and the file runs in 87 s and 89 s of each functional run of
-`scripts/test-system.sh` (release and asan). It is small on purpose: lib/boot's unit campaign
-cuts every operation of every sequence at every position, test_flash_decoder.py every operation
-of a staged update with three seeds, and phase 6 runs the large campaign of at least 1000 trials.
-A cut of a one-unit program (a commit field, an attempt) leaves none, some or all of its
-transitions done, as the seed says; the seeds of those cuts are chosen so that each outcome
-occurs (with lib/flash's model on this geometry, seed 7 leaves none, 0 some and 4 all of a
-unit's transitions), and the tests check that it does.
+That is 24 cuts: 21 in the functional runs of `scripts/test-system.sh`, where the file takes
+58 s (release) and 60 s (asan), and the three armed at run time in its timing run, 30 s (the
+times of the file's test cases in the JUnit reports of one run of `scripts/test-system.sh -k
+"test_update.py or test_update_cuts.py or test_boot.py or test_flash_file.py"`). It is small on
+purpose: lib/boot's unit campaign cuts every operation of every sequence at every position,
+test_flash_decoder.py every operation of a staged update with three seeds, and phase 6 runs the
+large campaign of at least 1000 trials. A cut of a one-unit program (a commit field, an attempt)
+leaves none, some or all of its transitions done, as the seed says; the seeds of those cuts are
+chosen so that each outcome occurs (with lib/flash's model on this geometry, seed 7 leaves none,
+0 some and 4 all of a unit's transitions), and the tests check that it does.
+
+A cut armed at run time lands in the confirm only if `flash.cut` is served before the confirm's
+first program begins, 5 s after the node's start: only if the test process keeps up with the
+node. Those three cases are therefore marked `timing`, and their run is bounded (`--duration-s
+8`, longer than the 5 s window), so that a cut armed too late ends the run in order instead of
+never.
+The test decides from how the run ended. Status 12 with the FATAL line of the operation the cut
+was armed for is a cut in time, and the checks above follow. Three ends are a missed timing
+tolerance: a run that confirmed and ended in order (the command came after the confirm's programs
+had begun); for a cut armed for the record, a cut in the commit field, the run's operation 2 (the
+command came after the record's program had begun); and a run that ended in order before its
+confirm, the trial still waiting with its window cut short and nothing written (only a host that
+held the node up for longer than a health period cuts the window of a working node short, and a
+window that begins again after 3 s does not end within the 8 s). Any other end fails the test.
+The flash's counts when the command is served could not decide it: a program that has begun but
+has not been counted yet is missing from them, and the cut does not count it either.
 
 ## How it is tested
 
 | Level | Tests |
 |---|---|
 | unit (Unity, under ASan and UBSan, and for coverage) | [test_flash.c](../tests/unit/test_flash.c) (the interface and the NOR model, above); [test_sha256.c](../tests/unit/test_sha256.c) (the FIPS 180-4 examples, every length from 0 to 320 bytes against hashlib, every split, the padding boundaries, the 64-bit length); [test_image.c](../tests/unit/test_image.c) (every field at its offset, every rejection in the order of the checks, every flipped bit of an image, steps against the one call, interleaved validations, a failed read at every read); [test_bootimg.c](../tests/unit/test_bootimg.c) (the id, the steps, the results); [test_boot.c](../tests/unit/test_boot.c) (the record bytes, every operation in every state against the reference model, random runs, the ring, the slot writer, the counts above) and [test_boot_cuts.c](../tests/unit/test_boot_cuts.c) (the campaign above), each on two flash models; [test_update.c](../tests/unit/test_update.c) (the confirm's window), [test_fault.c](../tests/unit/test_fault.c) and [test_telemetry.c](../tests/unit/test_telemetry.c) (UPDATE_ROLLBACK, BMS_BootInfo, ActiveSlot) |
-| platform | [test_posix_flash.c](../tests/platform/test_posix_flash.c) and [flash_selftest.c](../tests/platform/flash_selftest.c) (the host's flash, above); [test_posix_retained.c](../tests/platform/test_posix_retained.c) (the hand-off: taken once and zeroed, the rules, the bootloader's open that keeps the reason) |
+| platform | [test_posix_flash.c](../tests/platform/test_posix_flash.c) and [flash_selftest.c](../tests/platform/flash_selftest.c) (the host's flash, above); [test_posix_retained.c](../tests/platform/test_posix_retained.c) (the hand-off: taken once and zeroed, the rules, the bootloader's open that keeps the reason, and the bootloader taking back the hand-off of an image it could not start: none left, the reason and the count kept, nothing changed where there is none) |
 | Python | [test_image.py](../tests/python/test_image.py) (fcn_tools.image against the text and against the C code), [test_sha256_table.py](../tests/python/test_sha256_table.py), [test_flash_tool.py](../tests/python/test_flash_tool.py) (what fcn_flash refuses and leaves), [test_flash_decoder.py](../tests/python/test_flash_decoder.py) (above), [test_simctl.py](../tests/python/test_simctl.py) (the flash commands' client), [test_node.py](../tests/python/test_node.py) (the harness: the bootloader's command line, the restart, the power-loss rule) |
 | system | the table above |
 
@@ -1196,7 +1294,8 @@ of its own, can answer responsePending meanwhile; its response-pending timing mu
 part's maximum times, not its typical ones. Phase 5 also has to decide how the flash task is
 supervised while a download runs (in phase 4 it has one job per run and is no supervised entity),
 and adds ReadDTCInformation (0x19) and ClearDiagnosticInformation (0x14) for the DTCs, among them
-UPDATE_ROLLBACK. A tester routine could also take over the confirm.
+UPDATE_ROLLBACK. A tester routine could also take over the confirm, and prove what the 5 s
+window cannot: that the new image receives.
 
 ## What a product would add
 
@@ -1247,3 +1346,6 @@ image leaves the device without an image to start. A product adds at least the f
   first health period), the next start has nothing to report; the metadata still show it (the
   newest record's event, `fcn_flash info`). DTCs are not kept in flash in this phase
   ([faults.md](faults.md)).
+- **The confirm proves that the trial is heard, not that it hears.** Its frames must be
+  acknowledged in every period of the window; what it receives plays no part (the confirm,
+  above). Phase 5's tester routine proves the receive path.

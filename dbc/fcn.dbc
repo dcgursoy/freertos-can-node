@@ -195,7 +195,7 @@ CM_ SG_ 1553 BootEventSlot "The slot BootEvent acted on: the adopted slot (ADOPT
 CM_ SG_ 1553 ImageVersionMajor "The version of the running image as its header gives it (major.minor.patch); 0 without the bootloader.";
 CM_ SG_ 1553 ImageVersionMinor "As ImageVersionMajor.";
 CM_ SG_ 1553 ImageVersionPatch "As ImageVersionMajor.";
-CM_ SG_ 1553 ConfirmSeconds "For a trial: the seconds of good health counted towards its confirm (the watchdog manager OK and the controller never bus off, without a break), saturated at 255; the confirm is made at 5.";
+CM_ SG_ 1553 ConfirmSeconds "For a trial: the seconds of good health counted towards its confirm (the watchdog manager OK, the controller error active and not bus off since the period before, and a frame of the node acknowledged since then, in every 100 ms period without a break), saturated at 255; the confirm is made at 5.";
 CM_ BO_ 1776 "Echo request: any payload of 0 to 8 bytes. No signals; used for link tests and latency measurements.";
 CM_ BO_ 1777 "Echo reply: the payload of the request, 0 to 8 bytes.";
 CM_ BO_ 2016 "Diagnostic requests, ISO 15765-2 frames (phase 5). No signals.";

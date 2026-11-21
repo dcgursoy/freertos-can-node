@@ -3,11 +3,17 @@
 with the flash tool is started as a trial from slot B, confirms itself after five seconds in good
 health and stays the active image; one that fails is started exactly three times and rolled
 back; a slot with one bit flipped by the bench is never started; and no update can begin while a
-trial is pending (docs/update.md; decisions 5, 6 and 8 of phase 4).
+trial is pending (docs/update.md; decisions 5, 6 and 8 of phase 4). A trial whose frames nobody
+acknowledges does not confirm itself until it is acknowledged again, a bus lost inside its
+window cuts the window short, and nothing a node that works does cuts it short (app/update.h,
+THE CONFIRM OF A TRIAL).
 
 The functional tests decide from what the node itself reports (its statistics, its frames, its
-log, the flash afterwards), never from the host's clock; the one test of the five-second window
-on the wall clock is marked `timing`. tests/system/update_bench.py is the bench.
+log, the flash afterwards), never from the host's clock or from how fast the test process is: a
+bus lost from the start is the node's own --can-fault. Marked `timing` are the test of the
+five-second window on the wall clock, the one that a working node's window is never cut short
+(a host that holds the node up can cut it), and the one of a bus lost at run time inside the
+window, which the test process has to reach in time. tests/system/update_bench.py is the bench.
 """
 from __future__ import annotations
 
@@ -21,10 +27,11 @@ from fcn_tools import paths
 from fcn_tools.node import (BOOT_NOTHING_BOOTABLE, EXIT_OK, RESET_IMAGE_FAULT, RESET_WATCHDOG)
 from fcn_tools.timing import check_timing
 
-from update_bench import (BENCH_SEED, MAX_ATTEMPTS, ROLLBACK_BIT, RUN_WAIT_S, Boot,
-                          check_frames_of, check_handoff, check_invariants, decoded,
-                          expected_boot, factory, flip_bit, info, listen, stage, states,
-                          until_confirmed)
+from update_bench import (BENCH_SEED, FLOOD_BITRATE, MAX_ATTEMPTS, ROLLBACK_BIT, RUN_WAIT_S,
+                          Boot, Flood, TelemetryOff, alive_seconds, check_frames_of,
+                          check_handoff, check_invariants, decoded, expected_boot, factory,
+                          flip_bit, info, listen, stage, states, until_confirmed,
+                          wait_for_alive, wait_for_can_state, wait_for_confirm_seconds)
 
 #: UPDATE_CONFIRM_AFTER_S (app/update.h) in health periods of 100 ms.
 WINDOW_PERIODS = 50
@@ -187,27 +194,23 @@ def flash_tool_run(*args) -> subprocess.CompletedProcess:
                           text=True, timeout=60, check=False)
 
 
-def test_no_update_can_begin_while_a_trial_is_pending(start_node, workdir, ports, images):
-    """While the trial runs, the node holds the flash file and the tool cannot open it; once it
-    has stopped before its confirm, lib/boot refuses to begin an update of either slot (the
-    confirmed one is the trial's fallback), and nothing of the flash changes."""
+def test_no_update_can_begin_while_a_trial_is_pending(start_node, restart_node, workdir, ports,
+                                                      images):
+    """Once a run of the trial has stopped before its confirm (a run of 2 s, which the node ends
+    by its own tick count), lib/boot refuses to begin an update of either slot (the confirmed one
+    is the trial's fallback), and nothing of the flash changes. And while the trial runs, the
+    node holds the flash file and the tool cannot open it: shown on its next run, which only the
+    test ends. The node holds the file from before its first frame until its scheduler has
+    stopped, so a node still running after the tool returned held it while the tool ran,
+    however late the test process got to start the tool. (Whether that run confirms meanwhile
+    depends on how fast the test process is, and is not checked.)"""
     flash, cell = workdir / "flash.bin", workdir / "cell.bin"
     factory(flash, images["node-1.0.0"])
     stage(flash, images["node-1.1.0"])
 
-    def stage_meanwhile(node, reader):
-        deadline = time.monotonic() + RUN_WAIT_S
-        while not decoded(reader.frames, "BMS_BootInfo"):      # the node has opened the flash
-            assert node.running and time.monotonic() < deadline, node.stderr()
-            time.sleep(0.01)
-        busy = flash_tool_run("stage", "--flash-file", flash, "--no-wait", images["node-1.4.0"])
-        assert busy.returncode == 1 and "in use by another process" in busy.stderr, busy
-        assert node.wait(timeout=RUN_WAIT_S) == EXIT_OK
-
     node, frames = listen(f"udp:{ports.bus}",
                           lambda: start_node("--duration-s", "2", flash_file=flash,
-                                             retained_file=cell),
-                          stage_meanwhile)
+                                             retained_file=cell))
     check_frames_of(Boot("B", "trial", 1, "NONE"), frames, "1.1.0")
     assert all(frame.signals["ConfirmState"] == "WAITING"
                for frame in decoded(frames, "BMS_BootInfo"))
@@ -220,6 +223,20 @@ def test_no_update_can_begin_while_a_trial_is_pending(start_node, workdir, ports
         assert refused["status"] == "refused" and refused["detail"].startswith("state at address"), \
             refused
         assert flash.read_bytes() == before, f"stage {options} changed the flash"
+
+    def stage_meanwhile(node, reader):
+        deadline = time.monotonic() + RUN_WAIT_S
+        while not decoded(reader.frames, "BMS_BootInfo"):      # the node has opened the flash
+            assert node.running and time.monotonic() < deadline, node.stderr()
+            time.sleep(0.01)
+        busy = flash_tool_run("stage", "--flash-file", flash, "--no-wait", images["node-1.4.0"])
+        assert node.running, node.stderr()          # and so held the flash while the tool ran
+        assert busy.returncode == 1 and "in use by another process" in busy.stderr, busy
+        assert node.stop() == EXIT_OK
+
+    listen(f"udp:{ports.bus}", lambda: restart_node(node, name="running", args=()),
+           stage_meanwhile)
+    check_invariants(info(flash))
 
 
 @pytest.mark.parametrize("where", ["header", "payload"])
@@ -288,3 +305,225 @@ def test_a_confirmed_image_with_one_bit_flipped_and_nothing_before_it_is_not_sta
     assert node.wait(timeout=RUN_WAIT_S) == BOOT_NOTHING_BOOTABLE
     assert f"nothing bootable: slot A {verdict}, slot B bad_magic" in node.boot_log()
     assert not node.log_path.exists()       # no image ran
+
+
+# ---------------------------------------------------------------- the confirm and the bus
+
+#: How long the tests keep a trial's bus lost, in the node's own seconds: longer than a whole
+#: window (UPDATE_CONFIRM_AFTER_S, 5 s), with two seconds to spare for the log lines the test
+#: counts them by, which the node writes out a few milliseconds late (posix_log.c).
+LOST_S = 7
+
+#: The identifiers of BMS_PackStatus and BMS_BootInfo (dbc/fcn.dbc).
+PACK_STATUS_ID = 0x020
+BOOT_INFO_ID = 0x611
+
+
+def staged_trial(workdir, images):
+    """Factory image 1.0.0 in slot A and 1.1.0 staged into slot B: the flash file and the
+    retained cell of a node whose next start is the trial's first."""
+    flash, cell = workdir / "flash.bin", workdir / "cell.bin"
+    factory(flash, images["node-1.0.0"])
+    stage(flash, images["node-1.1.0"])
+    assert expected_boot(info(flash)) == Boot("B", "trial", 1, "NONE")
+    return flash, cell
+
+
+def start_without_acknowledgement(start_node, flash, cell):
+    """Start the trial with every acknowledgement taken away from its frames from its start on,
+    as when no other node is on the bus (--can-fault noack, simulation control's can.fault noack
+    put in force by the node itself): nothing here races the node."""
+    return start_node("--can-fault", "noack", flash_file=flash, retained_file=cell)
+
+
+def keep_the_bus_lost(node) -> None:
+    """For a trial started without acknowledgement: wait until it has run LOST_S of its own
+    seconds so, and check that its controller is then error passive at a transmit error counter
+    of 128 and has never been bus off (ISO 11898-1's exception, lib/can/can_fc.c)."""
+    wait_for_alive(node, LOST_S)
+    status = wait_for_can_state(node, "passive")
+    assert (status["fault"], status["tec"], status["bus_off"]) == ("noack", 128, 0), status
+
+
+def check_lost_periods(confirm: dict) -> None:
+    """The node's counts of a run with the bus lost for LOST_S: more periods than a window were
+    judged with the controller not error active and with no frame acknowledged, and none after
+    a bus-off: the controller never went bus off."""
+    needed = confirm["periods_needed"]
+    assert confirm["not_active_periods"] > needed, confirm
+    assert confirm["unacked_periods"] > needed, confirm
+    assert confirm["bus_off_periods"] == 0, confirm
+
+
+def test_a_trial_that_has_lost_the_bus_does_not_confirm_itself(start_node, workdir, ports,
+                                                               images):
+    """A trial whose frames nobody acknowledges is error passive at 128 for as long as that
+    lasts, never bus off, and does not confirm itself. Started so (--can-fault noack) and
+    stopped after LOST_S of its seconds, more than a window; decided from the node's counts (no
+    period healthy, none with a frame acknowledged, so no window begun; no confirm asked for or
+    made), its controller's state in its statistics, and the flash afterwards, which still holds
+    the trial with one attempt used."""
+    flash, cell = staged_trial(workdir, images)
+
+    def run(node, reader):
+        keep_the_bus_lost(node)
+        assert node.stop() == EXIT_OK
+
+    node, _ = listen(f"udp:{ports.bus}",
+                     lambda: start_without_acknowledgement(start_node, flash, cell), run)
+    assert "bus fault noack from the start (--can-fault)" in node.log()
+    stats = node.stats()
+    confirm = stats["confirm"]
+    assert confirm["state"] == "WAITING", confirm
+    assert (confirm["requested_period"], confirm["flash_task"]["confirms"]) == (0, 0), confirm
+    assert (confirm["healthy_periods"], confirm["window_restarts"]) == (0, 0), confirm
+    assert confirm["unacked_periods"] == confirm["periods"], confirm
+    check_lost_periods(confirm)
+    can_stats = stats["can"]
+    assert (can_stats["state"], can_stats["tec"]) == ("passive", 128), can_stats
+    assert can_stats["controller"]["tx_frames"] == 0, can_stats
+    assert can_stats["controller"]["bus_off_events"] == 0, can_stats
+    assert "writing its confirm" not in node.log()
+
+    after = info(flash)
+    check_invariants(after)
+    assert states(after) == ("confirmed", "trial")
+    assert after["metadata"]["attempts_used"] == 1
+
+
+def test_a_trial_that_gets_its_bus_back_confirms_itself_after_a_whole_window(
+        start_node, workdir, ports, images):
+    """The same trial, acknowledged again after LOST_S of its seconds (can.fault none): it
+    confirms itself after a window of 50 healthy periods, all of them after the last period with
+    the bus lost. Decided from the node's counts (every period with the bus lost came before the
+    period that asked for the confirm) and from the flash afterwards."""
+    flash, cell = staged_trial(workdir, images)
+
+    def run(node, reader):
+        keep_the_bus_lost(node)
+        with node.sim() as sim:
+            sim.can_fault("none")
+        until_confirmed(node, reader)
+
+    node, frames = listen(f"udp:{ports.bus}",
+                          lambda: start_without_acknowledgement(start_node, flash, cell), run)
+    confirm = node.stats()["confirm"]
+    needed = confirm["periods_needed"]
+    assert (confirm["state"], confirm["status"]) == ("CONFIRMED", "ok"), confirm
+    assert confirm["flash_task"]["confirms"] == 1, confirm
+    check_lost_periods(confirm)
+    assert confirm["requested_period"] >= needed + confirm["unacked_periods"], confirm
+    assert confirm["requested_period"] >= needed + confirm["not_active_periods"], confirm
+    assert confirm["requested_period"] >= needed + confirm["window_restarts"], confirm
+    assert confirm["healthy_periods"] == needed and confirm["fewest_acked"] >= 1, confirm
+    assert decoded(frames, "BMS_BootInfo")[-1].raw["ConfirmSeconds"] == 5
+
+    after = info(flash)
+    check_invariants(after)
+    assert states(after) == ("previous", "confirmed")
+
+
+@pytest.mark.timing
+def test_a_bus_lost_in_the_window_cuts_it_short(start_node, workdir, ports, images):
+    """The bus lost at run time, once the trial's window has begun (simulation control's
+    can.fault noack after a BMS_BootInfo with a second of good health), cuts the window short,
+    and the trial confirms itself only after a whole new window once it is acknowledged again
+    (can.fault none). The fault lands in the window only if the test process sends it before
+    the window is full, at least 3.1 s of the node's time after that BMS_BootInfo (at most 19 of
+    its 50 periods are behind it): if no period found the controller other than error active
+    while the trial waited, the confirm was asked for first, and the test missed a timing
+    tolerance. Otherwise the node's counts decide: the window cut short, every period with the
+    bus lost before the period that asked for the confirm."""
+    flash, cell = staged_trial(workdir, images)
+
+    def run(node, reader):
+        wait_for_confirm_seconds(reader, node, 1)
+        with node.sim() as sim:
+            sim.can_fault("noack")
+        status = wait_for_can_state(node, "passive")
+        assert (status["fault"], status["tec"], status["bus_off"]) == ("noack", 128, 0), status
+        # The fault was in force before the second after the last one logged ended.
+        wait_for_alive(node, alive_seconds(node) + 1 + LOST_S)
+        with node.sim() as sim:
+            sim.can_fault("none")
+        until_confirmed(node, reader)
+
+    node, _ = listen(f"udp:{ports.bus}", lambda: start_node(flash_file=flash, retained_file=cell),
+                     run)
+    confirm = node.stats()["confirm"]
+    needed = confirm["periods_needed"]
+    assert (confirm["state"], confirm["status"]) == ("CONFIRMED", "ok"), confirm
+    check_timing(confirm["not_active_periods"] > 0,
+                 f"the bus was lost only after the confirm had been asked for (period "
+                 f"{confirm['requested_period']}): the test process fell behind the node")
+    assert confirm["window_restarts"] >= 1, confirm
+    check_lost_periods(confirm)
+    assert confirm["requested_period"] >= needed + confirm["window_restarts"], confirm
+    assert confirm["requested_period"] >= needed + confirm["not_active_periods"], confirm
+    assert confirm["healthy_periods"] == needed, confirm
+
+    after = info(flash)
+    check_invariants(after)
+    assert states(after) == ("previous", "confirmed")
+
+
+#: The other nodes of the conditions below, each on a bus of its own: none but the test's
+#: listener, a tester that switches the telemetry off, the flood of test_can_flood.py.
+OTHER_NODES = {"no tester": None, "telemetry off": TelemetryOff, "flood": Flood}
+
+
+@pytest.mark.timing
+@pytest.mark.parametrize("condition", list(OTHER_NODES))
+def test_no_condition_of_a_working_node_cuts_the_window_short(start_node, workdir, ports, images,
+                                                              condition):
+    """The four conditions of good health hold in every period of a node that works (update.h,
+    WHY EVERY PERIOD NEEDS AN ACKNOWLEDGED FRAME): with nobody on the bus but the test's
+    listener, which sends nothing; with the telemetry switched off by a tester's TESTER_Command,
+    so that the node sends the fewest frames it ever sends (BMS_Heartbeat, BMS_Fault,
+    BMS_TaskStats, BMS_NodeInfo, BMS_BootInfo); and at 125 kbit/s under the flood of
+    test_can_flood.py, the heaviest load the system tests make. Plain asserts: the trial
+    confirms itself, and no period found the controller other than error active or after a
+    bus-off. Timing tolerances: no period cut the window short (a host that holds the node up
+    for longer than a period can leave a period without a supervision cycle or without an
+    acknowledged frame), the tester and the flood had their effect, and with the tester the
+    telemetry was off from the first BMS_BootInfo on (their threads run when the host lets
+    them)."""
+    flash, cell = staged_trial(workdir, images)
+    args = ("--bitrate", str(FLOOD_BITRATE)) if condition == "flood" else ()
+    other = {}
+
+    def run(node, reader):
+        sender = OTHER_NODES[condition]
+        other["node"] = sender(f"udp:{ports.bus}") if sender is not None else None
+        try:
+            until_confirmed(node, reader)
+        finally:
+            if other["node"] is not None:
+                other["node"].stop()
+
+    node, frames = listen(f"udp:{ports.bus}",
+                          lambda: start_node(*args, flash_file=flash, retained_file=cell), run)
+    stats = node.stats()
+    confirm = stats["confirm"]
+    assert (confirm["state"], confirm["status"]) == ("CONFIRMED", "ok"), confirm
+    assert confirm["not_active_periods"] == 0 and confirm["bus_off_periods"] == 0, confirm
+    assert confirm["fewest_acked"] >= 1, confirm
+    # The tester and the flood are threads of the test process, which run when the host lets
+    # them: whether they had their effect before the confirm is a timing tolerance.
+    if condition == "telemetry off":
+        check_timing(stats["telemetry"]["enabled"] is False,
+                     f"the tester's commands ({other['node'].sent} sent) did not switch the "
+                     "telemetry off before the confirm")
+    if condition == "flood":
+        check_timing(other["node"].sent > 0 and stats["can"]["driver"]["rx_unhandled"] > 0,
+                     f"the flood ({other['node'].sent} frames sent) did not reach the node "
+                     "before the confirm")
+    check_timing(confirm["window_restarts"] == 0
+                 and confirm["requested_period"] == confirm["periods_needed"]
+                 and confirm["unacked_periods"] == 0 and confirm["unsupervised_periods"] == 0,
+                 f"{condition}: the window was cut short: {confirm}")
+    if condition == "telemetry off":
+        ids = [message.arbitration_id for message in frames]
+        check_timing(PACK_STATUS_ID not in ids[ids.index(BOOT_INFO_ID):],
+                     "a BMS_PackStatus after the first BMS_BootInfo: the tester switched the "
+                     "telemetry off late")

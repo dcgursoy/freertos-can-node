@@ -13,12 +13,19 @@
  * UPDATE_ROLLBACK (fault.h, update_rolled_back()).
  *
  * THE CONFIRM OF A TRIAL. A trial confirms itself once it has run UPDATE_CONFIRM_AFTER_S
- * seconds in good health without a break: the watchdog manager's global status OK and the CAN
- * controller not bus off in every health period of the window, and no bus-off between two of
- * them. The health task judges each period (update_health_period()); a period that is not
- * healthy starts the window again, counted in `window_restarts`. When the window is full the
- * monitor asks for the confirm once (it returns true), and the flash task makes it
- * (boot_confirm() of the slot the hand-off names) and reports how it went
+ * seconds in good health without a break. A health period is healthy when all four hold:
+ *   - the watchdog manager's global status is OK;
+ *   - the CAN controller is error active (neither error passive nor bus off) at the period;
+ *   - no bus-off happened since the period before, although the controller may have recovered;
+ *   - the controller has transmitted at least one frame with an acknowledgement since the
+ *     period before (its count of acknowledged frames grew).
+ * The CAN conditions come from the controller's own state and counters, never from the DTCs
+ * CAN_ERROR_PASSIVE and CAN_BUS_OFF, whose status can stay set after the fault has gone. The
+ * health task judges each period (update_health_period()); a period that is not healthy starts
+ * the window again, counted in `window_restarts`, and every condition it failed is counted on
+ * its own (`unsupervised_periods`, `not_active_periods`, `bus_off_periods`, `unacked_periods`).
+ * When the window is full the monitor asks for the confirm once (it returns true), and the
+ * flash task makes it (boot_confirm() of the slot the hand-off names) and reports how it went
  * (update_confirm_done()). A confirm that fails is not tried again in the run: the trial is then
  * rolled back after its attempts, which is safe, while writing again and again into a flash
  * that refused a write is not.
@@ -28,12 +35,43 @@
  * stops within 300 to 400 ms and the hardware watchdog resets the node 500 ms after its last
  * kick (app.c, SUPERVISION), so an image that hangs in its first seconds is reset well inside
  * the window, as is one that crashes; 50 supervision cycles and 5 BMS_NodeInfo frames have gone
- * by; the node has sent about 1600 frames (the cycle times of the DBC), and a bus fault that
- * makes its transmissions fail takes the controller bus off after 32 failed ones in a row
- * (transmit error counter +8 each, bus off above 255). Short enough for the system tests, which
- * run several updates. A product would wait longer (minutes, a drive cycle) or
- * leave the confirm to a tester's routine after its own checks of the new image; phase 5's UDS
- * server can add the routine.
+ * by, and in each of the 50 periods frames of the node were acknowledged on the bus (how many:
+ * docs/update.md, the confirm). A bus fault that other nodes signal with error flags, or that
+ * the node sees as bit errors, adds 8 to the transmit error counter for every failed frame:
+ * the controller is error passive after 16 in a row (128) and bus off after 32 (above 255),
+ * and either restarts the window. A node that nobody acknowledges never goes bus off: alone on
+ * the bus, cut off from it, or with a transmit path that leads nowhere, it sees an ACK error
+ * with every frame, and under ISO 11898-1's exception an error-passive transmitter does not
+ * count an ACK error that is all it sees (lib/can/can_fc.c, CAN_FC_TX_ACK_ERROR_ALONE). Its
+ * controller stays error passive at 128, and none of its frames is acknowledged, for as long
+ * as nobody is there to. That is why an error passive controller, and a period without a newly
+ * acknowledged frame, restart the window as well: a trial confirms itself only if it has been
+ * heard. It does not prove that the trial
+ * hears: an image that cannot receive (a wrong acceptance filter, say) confirms itself all the
+ * same. A tester's routine proves the receive path, and phase 5 adds one. Short enough for the
+ * system tests, which run several updates. A product would wait longer (minutes, a drive cycle)
+ * or leave the confirm to a tester's routine after its own checks of the new image; phase 5's
+ * UDS server can add the routine.
+ *
+ * WHY EVERY PERIOD NEEDS AN ACKNOWLEDGED FRAME. The weakest form that still catches a node
+ * nobody acknowledges would be "a frame acknowledged within the last N periods"; N = 1 is
+ * enough because no period of a node that works sees none. Whatever the telemetry switch says,
+ * the sensor task publishes BMS_Heartbeat every 10 ms and the health task BMS_Fault every
+ * period (app.c, WHO SENDS WHAT); BMS_TaskStats, BMS_NodeInfo and BMS_BootInfo come on top, and
+ * with telemetry on BMS_PackStatus every 10 ms, BMS_CellVoltages1/2 every 20 ms and
+ * BMS_Temperatures every 100 ms. The health task's periods are released 100 ms apart and it
+ * reads the count within its job, whose response time is under 20 ms (19.9 ms in the
+ * response-time analysis of the task table, docs/architecture.md), so two reads are at least
+ * 80 ms apart. In between, at least seven heartbeats and the BMS_Fault of the period before
+ * have been published, and each is acknowledged a few milliseconds after its publication: the
+ * transmit task's response time (under 1 ms) and the frames ahead of it, also under a flood of
+ * other nodes' frames of lower priority, since the node's periodic frames win the arbitration
+ * at the next frame boundary. No tester is needed: any other node on the bus acknowledges (on
+ * the host, the controller model does unless simulation control takes the acknowledgement
+ * away), and what the node receives plays no part. A period without a newly acknowledged frame
+ * is therefore a fault, or a host that held the node up for longer than a period, which the
+ * system tests treat as a timing tolerance. (The fewest a system test counted in one period:
+ * 11 with the telemetry off, 30 with it on; docs/update.md.)
  *
  * CONTEXT. No operating system and no locks: an update_monitor_t belongs to the health task
  * (the node: app.c), which alone calls update_health_period() and update_confirm_done(); the
@@ -64,11 +102,16 @@ typedef enum {
     UPDATE_CONFIRM_FAILED = 4      /**< the confirm could not be written */
 } update_confirm_state_t;
 
-/** What the health task reads in each period for the confirm. */
+/** What the health task reads in each period for the confirm: the watchdog manager's status
+ *  and the CAN controller's own state and counters. */
 typedef struct {
     wdgm_global_status_t supervision; /**< the watchdog manager's global status now */
     can_fc_state_t can_state;         /**< the CAN controller's error state now */
     uint32_t bus_off_count;           /**< bus-off events since the start */
+    /** frames the controller has transmitted with an acknowledgement since the start: its
+     *  transmit-done events, which a frame gets only once it went out without an error,
+     *  acknowledgement included (can_txq_stats_t.sent) */
+    uint64_t tx_acked;
 } update_health_t;
 
 /** The monitor. Set up with update_init(); read the members for diagnosis, write none. */
@@ -83,6 +126,17 @@ typedef struct {
     uint32_t requested_period;    /**< the period the confirm was asked for in; 0 before */
     uint32_t bus_off_count;       /**< the count at the last period */
     boot_status_t confirm_status; /**< what boot_confirm() returned; BOOT_OK before */
+    /* The periods judged that failed a condition of good health, one count per condition (a
+     * period can fail several; THE CONFIRM OF A TRIAL). */
+    uint32_t unsupervised_periods; /**< the watchdog manager's global status not OK */
+    uint32_t not_active_periods;   /**< the controller not error active: passive or bus off */
+    uint32_t bus_off_periods;      /**< a bus-off since the period before */
+    uint32_t unacked_periods;      /**< no frame acknowledged since the period before */
+    uint64_t tx_acked;             /**< the count of acknowledged frames at the last period */
+    uint64_t window_acked; /**< frames acknowledged in the healthy periods of the window so far */
+    /** the fewest frames acknowledged in one healthy period of the window so far; 0 before its
+     *  first */
+    uint64_t fewest_acked;
 } update_monitor_t;
 
 /**

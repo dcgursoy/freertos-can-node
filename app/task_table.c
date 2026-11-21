@@ -185,8 +185,10 @@ _Static_assert(TX_EVENTS_PER_TICK == 47U, "can_tx: 2 x 22 + 3 events in any 1000
 #define HEALTH_FAULT_WORK_US                                                                       \
     (15U + 2U + (APP_FAULT_VERDICT_QUEUE_LENGTH * HEALTH_VERDICT_US) + (HEALTH_CLEARS * 15U) +     \
      10U + 10U + 20U + 25U + (HEALTH_LOG_LINES * 100U))
-/* Phase 4 adds the confirm of a trial: the period judged (update_health_period()) and, once per
- * run, the request to the flash task (a task notification), 5 us. Its log lines are the flash
+/* Phase 4 adds the confirm of a trial: the period judged (update_health_period(): four
+ * comparisons and their counters, on the watchdog manager's status and the controller's state
+ * and counters already read for the DTCs above, so no read of its own) and, once per run, the
+ * request to the flash task (a task notification), 5 us. Its log lines are the flash
  * task's. A period still sends at most two frames: BMS_BootInfo goes in periods without
  * BMS_TaskStats and BMS_NodeInfo (app_tasks.h), within the two frames of phase 2. */
 #define HEALTH_UPDATE_US 5U

@@ -366,6 +366,7 @@ def run_node(node_binary, *args: str) -> subprocess.CompletedProcess:
     (("--bitrate", "2000000"), "invalid --bitrate"),
     (("--bitrate", "fast"), "invalid --bitrate"),
     (("--sim-port", "70000"), "invalid --sim-port"),
+    (("--can-fault", "loose-wire"), "invalid --can-fault"),
 ])
 def test_a_bad_bus_configuration_is_refused_at_start(node_binary, args, message):
     out = run_node(node_binary, "--duration-s", "1", *args)

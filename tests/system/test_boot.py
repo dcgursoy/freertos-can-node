@@ -4,19 +4,23 @@ hand-off into the retained cell and starts the image in its own process; the nod
 it was handed (docs/update.md, the bootloader and the hand-off).
 
 These tests are about the start: a factory flash, a flash with nothing to start, a start
-without a retained cell, and the reset cause, which the bootloader leaves in the cell for the
-image. An update's life (a trial, its confirm, its rollback, a damaged slot) is in
-test_update.py, power cuts in test_update_cuts.py; tests/system/update_bench.py is the bench they
-share.
+without a retained cell, the reset cause, which the bootloader leaves in the cell for the
+image, and an image the bootloader cannot start, or that ends at its own start-up checks, which
+leaves no hand-off behind. An update's life (a trial, its confirm, its rollback, a damaged
+slot) is in test_update.py, power cuts in test_update_cuts.py; tests/system/update_bench.py is
+the bench they share.
 """
 from __future__ import annotations
 
 import time
 
-from fcn_tools.node import BOOT_NOTHING_BOOTABLE, EXIT_OK, RESET_WATCHDOG
+import pytest
+
+from fcn_tools import image as image_format
+from fcn_tools.node import BOOT_JUMP_FAILED, BOOT_NOTHING_BOOTABLE, EXIT_OK, RESET_WATCHDOG
 
 from update_bench import (RUN_WAIT_S, Boot, check_frames_of, check_handoff, decoded, factory,
-                          info, listen, states)
+                          info, listen, stage, states)
 
 
 def test_a_factory_flash_starts_slot_a_as_the_confirmed_image(start_node, workdir, ports, images):
@@ -117,3 +121,87 @@ def test_the_reset_cause_reaches_the_image_through_the_bootloader(start_node, re
     faults = decoded(after, "BMS_Fault")
     assert faults and faults[0].signals["FaultMostRecent"] == "RESET_WATCHDOG"
     assert again.wait(timeout=1) == EXIT_OK
+
+
+def test_an_image_that_cannot_be_started_leaves_no_hand_off_behind(start_node, workdir, images):
+    """The bootloader writes the hand-off only directly before it starts the image, and takes
+    it back when the exec fails. A trial whose payload is no program: fcn_boot counts its first
+    attempt, cannot start it and ends with FCN_BOOT_EXIT_JUMP (42). A node started then directly
+    (without the bootloader) on the same flash and cell finds no hand-off: it runs longer than a
+    trial's window of good health and confirms nothing, it writes nothing to the flash, which
+    still holds the trial with one attempt used, and the next start through fcn_boot gives the
+    trial its second attempt (docs/update.md, the bootloader and the hand-off)."""
+    flash, cell = workdir / "flash.bin", workdir / "cell.bin"
+    factory(flash, images["node-1.0.0"])
+    not_a_program = workdir / "not-a-program.img"
+    not_a_program.write_bytes(image_format.pack(b"this is not a program\n",
+                                                image_format.parse_version("1.5.0"),
+                                                image_format.TARGETS["host"]))
+    stage(flash, not_a_program)
+
+    boot = start_node(flash_file=flash, retained_file=cell)
+    assert boot.wait(timeout=RUN_WAIT_S) == BOOT_JUMP_FAILED
+    assert "select: slot B as a trial, attempt 1 of 3, image 1.5.0" in boot.boot_log()
+    assert "jump: slot B at 0x102000, payload 22 bytes" in boot.boot_log()
+    assert "fcn_boot: fexecve of slot B: " in boot.stderr()
+    assert not boot.log_path.exists()       # no image ran
+    pending = info(flash)
+    assert states(pending) == ("confirmed", "trial")
+    assert (pending["metadata"]["trial_slot"], pending["metadata"]["attempts_used"]) == ("B", 1)
+    written = flash.read_bytes()
+
+    # 6 s of the node's ticks: a hand-off of a trial taken here would be confirmed after 5 s.
+    direct = start_node("--flash-file", str(flash), "--duration-s", "6", name="direct",
+                        retained_file=cell)
+    assert direct.wait(timeout=RUN_WAIT_S) == EXIT_OK
+    assert "started without the bootloader (no hand-off): nothing to confirm" in direct.log()
+    stats = direct.stats()
+    assert (stats["handoff"]["verdict"], stats["handoff"]["present"]) == ("none", False)
+    # The cell is valid (the bootloader sealed it again), and records no reset.
+    assert (stats["reset"]["cause"], stats["reset"]["verdict"]) == ("POWER_ON", "no reset")
+    assert stats["confirm"]["state"] == "NOT_NEEDED"
+    assert stats["confirm"]["flash_task"]["confirms"] == 0
+    assert (stats["flash"]["programs"], stats["flash"]["erases"]) == (0, 0)
+    assert flash.read_bytes() == written
+    assert info(flash) == pending
+
+    again = start_node(flash_file=flash, retained_file=cell, name="again")
+    assert again.wait(timeout=RUN_WAIT_S) == BOOT_JUMP_FAILED
+    assert "select: slot B as a trial, attempt 2 of 3, image 1.5.0" in again.boot_log()
+    assert info(flash)["metadata"]["attempts_used"] == 2
+
+
+@pytest.mark.parametrize("image", ["node-1.1.0", "crash"])
+def test_an_image_that_ends_at_its_start_up_checks_leaves_no_hand_off_behind(start_node, workdir,
+                                                                           images, image):
+    """The node and the test payloads open the retained cell before they check anything else
+    of their command line, so that an image the bootloader started and that ends at one of
+    those checks has taken its hand-off all the same (plat_retained.h, THE REMAINING WINDOW).
+    Here the trial's --log-file is in a directory that does not exist: the trial, the node or
+    the crash payload, ends with 1 at its start, and a node started then directly (without the
+    bootloader) on the same flash and cell finds no hand-off, so it has nothing to confirm, and
+    the flash still holds the trial with one attempt used."""
+    flash, cell = workdir / "flash.bin", workdir / "cell.bin"
+    factory(flash, images["node-1.0.0"])
+    stage(flash, images[image])
+    missing = workdir / "no-such-directory" / "trial.log"
+
+    boot = start_node("--log-file", str(missing), flash_file=flash, retained_file=cell)
+    assert boot.wait(timeout=RUN_WAIT_S) == 1
+    assert "select: slot B as a trial, attempt 1 of 3" in boot.boot_log()
+    assert f"--log-file {missing}" in boot.stderr()
+    pending = info(flash)
+    assert states(pending) == ("confirmed", "trial")
+    assert pending["metadata"]["attempts_used"] == 1
+    written = flash.read_bytes()
+
+    direct = start_node("--flash-file", str(flash), "--duration-s", "2", name="direct",
+                        retained_file=cell)
+    assert direct.wait(timeout=RUN_WAIT_S) == EXIT_OK
+    assert "started without the bootloader (no hand-off): nothing to confirm" in direct.log()
+    stats = direct.stats()
+    assert (stats["handoff"]["verdict"], stats["handoff"]["present"]) == ("none", False)
+    assert stats["confirm"]["state"] == "NOT_NEEDED"
+    assert (stats["flash"]["programs"], stats["flash"]["erases"]) == (0, 0)
+    assert flash.read_bytes() == written
+    assert info(flash) == pending

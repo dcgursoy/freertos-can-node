@@ -40,21 +40,48 @@ bool update_health_period(update_monitor_t *m, const update_health_t *health)
     bool request = false;
 
     if (m->state == UPDATE_CONFIRM_WAITING) {
-        /* A bus-off between two periods counts although the controller has recovered since. */
-        const bool bus_off =
-            (health->can_state == CAN_FC_BUS_OFF) || (health->bus_off_count != m->bus_off_count);
-        const bool healthy = (health->supervision == WDGM_GLOBAL_STATUS_OK) && !bus_off;
+        /* The four conditions of good health (update.h, THE CONFIRM OF A TRIAL). A bus-off
+         * between two periods counts although the controller has recovered since, and the
+         * frames acknowledged are those since the last period, whatever came in between. */
+        const bool supervised = (health->supervision == WDGM_GLOBAL_STATUS_OK);
+        const bool active = (health->can_state == CAN_FC_ERROR_ACTIVE);
+        const bool bus_off = (health->bus_off_count != m->bus_off_count);
+        const bool acked = (health->tx_acked > m->tx_acked);
+        const uint64_t new_acked = acked ? (health->tx_acked - m->tx_acked) : 0U;
 
         m->periods++;
 
-        if (healthy) {
+        if (!supervised) {
+            m->unsupervised_periods++;
+        }
+
+        if (!active) {
+            m->not_active_periods++;
+        }
+
+        if (bus_off) {
+            m->bus_off_periods++;
+        }
+
+        if (!acked) {
+            m->unacked_periods++;
+        }
+
+        if (supervised && active && !bus_off && acked) {
             m->healthy_periods++;
+            m->window_acked += new_acked;
+
+            if ((m->fewest_acked == 0U) || (new_acked < m->fewest_acked)) {
+                m->fewest_acked = new_acked;
+            }
         } else {
             if (m->healthy_periods != 0U) {
                 m->window_restarts++;
             }
 
             m->healthy_periods = 0U;
+            m->window_acked = 0U;
+            m->fewest_acked = 0U;
         }
 
         if (m->healthy_periods >= m->periods_needed) {
@@ -65,6 +92,7 @@ bool update_health_period(update_monitor_t *m, const update_health_t *health)
     }
 
     m->bus_off_count = health->bus_off_count;
+    m->tx_acked = health->tx_acked;
     return request;
 }
 

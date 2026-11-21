@@ -45,7 +45,7 @@
  * or interrupt, also concurrently, as long as no two calls write the same buffer.
  *
  * GENERATED FILE, DO NOT EDIT. The interface of the codec. Made by tools/gen_can_db.py from
- * dbc/fcn.dbc, SHA-256 a02487f999c9af5ca8814dcb829ef8b55573747bccf6df43a8f86e9873228d40.
+ * dbc/fcn.dbc, SHA-256 ee5a3fa516d3029851805544da6004843add051153e5492607e90ef8e1881e18.
  *
  * After a change of the DBC, run scripts/codegen-check.sh --update. Without --update the script
  * fails while this file is out of date; CI and scripts/check.sh run it.
@@ -1233,8 +1233,10 @@ bool can_db_bms_node_info_unpack(can_db_bms_node_info_t *msg, const uint8_t *dat
 
 /*
  * ConfirmSeconds: bits 48..55 (8 bits, unsigned); raw 0..255; physical = raw s, range 0..255 s. For
- * a trial: the seconds of good health counted towards its confirm (the watchdog manager OK and the
- * controller never bus off, without a break), saturated at 255; the confirm is made at 5.
+ * a trial: the seconds of good health counted towards its confirm (the watchdog manager OK, the
+ * controller error active and not bus off since the period before, and a frame of the node
+ * acknowledged since then, in every 100 ms period without a break), saturated at 255; the confirm
+ * is made at 5.
  */
 #define CAN_DB_BMS_BOOT_INFO_CONFIRM_SECONDS_START      48U
 #define CAN_DB_BMS_BOOT_INFO_CONFIRM_SECONDS_LENGTH     8U

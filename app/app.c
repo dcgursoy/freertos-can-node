@@ -75,8 +75,10 @@
  * scheduler starts, and is constant after: which slot runs, as a trial or as the confirmed
  * image, the image's version, and a rollback the bootloader made (the DTC UPDATE_ROLLBACK,
  * judged in fault_init() as the reset faults are). The health task judges every period
- * whether a trial runs in good health (update_health_period()); once it has done so for
- * UPDATE_CONFIRM_AFTER_S seconds without a break it asks the flash task to confirm it, once.
+ * whether a trial runs in good health (update_health_period(): the watchdog manager OK, the CAN
+ * controller error active, no bus-off, and a frame acknowledged since the period before); once
+ * it has done so for UPDATE_CONFIRM_AFTER_S seconds without a break it asks the flash task to
+ * confirm it, once.
  * The FLASH TASK, the lowest-priority task, makes every write of the node to the flash: a flash
  * operation blocks its caller for the time the part takes (a record: two page programs of
  * 0.4 ms, and a sector erase of 45 ms when it is the first of a sector), which no task with a
@@ -890,7 +892,9 @@ static void log_fault_changes(const fault_changes_t *changes)
 /*
  * Health task context, after the supervision cycle: work the processing task's verdicts into
  * the DTCs in their order, judge the CAN controller and the watchdog manager, carry out the
- * clear requests, publish the summary, and send BMS_Fault with it.
+ * clear requests, publish the summary, and send BMS_Fault with it. Hands the confirm of a trial
+ * what it read of the watchdog manager and the controller, with the transmit queue's count of
+ * acknowledged frames (update.h).
  *
  * The clears in order with the evidence. A verdict carries the count of clear requests the
  * processing task had read when it posted it, and fault_apply() clears before the first one
@@ -908,7 +912,7 @@ static void log_fault_changes(const fault_changes_t *changes)
  * never go back, and no verdict left for the next period comes from before a clear of this
  * one.
  */
-static void run_faults(fault_health_inputs_t *read)
+static void run_faults(update_health_t *confirm)
 {
     fault_verdict_t verdict;
     can_io_stats_t io;
@@ -957,7 +961,11 @@ static void run_faults(fault_health_inputs_t *read)
     const bool built = telemetry_fault(&s_fault_counter, &summary, &frame);
 
     publish(SLOT_FAULT, built, &frame, plat_time_ns());
-    *read = inputs;
+
+    confirm->supervision = inputs.supervision;
+    confirm->can_state = inputs.can_state;
+    confirm->bus_off_count = inputs.bus_off_count;
+    confirm->tx_acked = queue.sent;
 }
 
 /* ------------------------------------------------------------------------------ update */
@@ -994,14 +1002,11 @@ static const char *slot_name(uint8_t slot)
     return name;
 }
 
-/* Health task context, after run_faults() with what it read: take the flash task's result of a
- * confirm, judge the period for the confirm of a trial, and ask the flash task for it when the
- * trial has run long enough in good health. */
-static void run_update(const fault_health_inputs_t *read)
+/* Health task context, after run_faults() with what it read for the confirm (`health`): take the
+ * flash task's result of a confirm, judge the period for the confirm of a trial, and ask the
+ * flash task for it when the trial has run long enough in good health. */
+static void run_update(const update_health_t *health)
 {
-    const update_health_t health = {.supervision = read->supervision,
-                                    .can_state = read->can_state,
-                                    .bus_off_count = read->bus_off_count};
     boot_status_t result;
     bool reported;
 
@@ -1015,7 +1020,7 @@ static void run_update(const fault_health_inputs_t *read)
         update_confirm_done(&s_update, result);
     }
 
-    if (update_health_period(&s_update, &health)) {
+    if (update_health_period(&s_update, health)) {
         (void)xTaskNotifyGive(s_flash_task);
     }
 }
@@ -1361,12 +1366,12 @@ static void health_task(void *arg)
         cycles++;
 
         /* First the supervision and the kick, at the same point of every period. */
-        fault_health_inputs_t read;
+        update_health_t confirm;
 
         supervise();
         log_sample_wait();
-        run_faults(&read);
-        run_update(&read);
+        run_faults(&confirm);
+        run_update(&confirm);
 
         if ((cycles % APP_TASK_STATS_EVERY) == 1U) {
             send_task_stats(next_task);

@@ -8,21 +8,28 @@
  *
  * WHAT IT DOES, in the order a bootloader on a microcontroller does it:
  *   1. Reads the retained cell (posix_retained_open_boot()): the reset cause, which it leaves
- *      in the cell for the image, and a hand-off of an earlier start, which it overwrites.
+ *      in the cell for the image, and a hand-off an earlier start left in it, whose words the
+ *      open zeroes.
  *   2. Opens the flash (posix_flash.c; created erased if missing, as an empty part) and arms a
  *      cut of its supply if --flash-cut asks for one.
  *   3. Runs lib/boot's select with lib/image's validation behind it (lib/bootimg): it validates
  *      the slots it has to decide about, counts an attempt before it starts a trial, and writes
  *      a rollback, a rejection, a fallback or the adoption of the factory image when that is
  *      the state change to make (docs/update.md).
- *   4. Writes the HAND-OFF into the cell's reserved words (plat_retained.h): slot, trial or
- *      confirmed, attempt, image version, the state change it made.
- *   5. "Jumps": copies the payload of the slot it chose (the bytes after the 256-byte image
- *      header) into a memory file (memfd_create), checks the SHA-256 of what it copied against
- *      the header, seals the file and fexecve()s it with the node options given after "--",
- *      followed by --flash-file F and --retained-file R. The process keeps its id: the test
- *      harness that started fcn_boot sees one process, the node, and its exit status. The
- *      flash file and the cell are closed (unlocked) just before, so that the image opens them.
+ *   4. Prepares the "jump": copies the payload of the slot it chose (the bytes after the
+ *      256-byte image header) into a memory file (memfd_create), checks the SHA-256 of what it
+ *      copied against the header, seals the file, and makes the image's command line: the node
+ *      options given after "--", followed by --flash-file F and --retained-file R.
+ *   5. Writes the HAND-OFF into the cell's reserved words (plat_retained.h): slot, trial or
+ *      confirmed, attempt, image version, the state change it made. It does so only now, when
+ *      nothing but the exec is left to fail, so that an image it does not start leaves no
+ *      hand-off for a later start without the bootloader.
+ *   6. fexecve()s the memory file. The process keeps its id: the test harness that started
+ *      fcn_boot sees one process, the node, and its exit status. The flash file and the cell
+ *      stay open, and locked, up to the exec; their descriptors are close-on-exec, so the exec
+ *      itself closes (unlocks) them for the image, which opens both. If the exec fails, the
+ *      hand-off's words are zeroed again through the cell's mapping, still open and locked
+ *      (posix_retained_clear_handoff()), before the run ends with 42.
  *      Phase 7's bootloader on the Cortex-M3 sets VTOR and the main stack pointer from the
  *      slot's vector table and branches to its reset handler instead.
  *
@@ -32,6 +39,13 @@
  * slot may be started; FCN_BOOT_EXIT_FLASH (41) when the flash could not be read (lib/boot
  * then starts nothing: a device it cannot read cannot be trusted); FCN_BOOT_EXIT_JUMP (42)
  * when the chosen image could not be started. After a jump the status is the image's.
+ * None of these ends leaves a hand-off in the cell: 0 and 1 end before the cell is opened,
+ * which leaves it as it was, or (a flash file that cannot be used) after the open, which
+ * zeroed an earlier hand-off; 12, 40 and 41 end in or before select, before the hand-off is
+ * written; 42 ends before it is written (the header read back, the copy, its digest, the
+ * seal, the image's arguments) or after a failed exec, which zeroes its words again. Of its own
+ * ends, only a kill between the write and the exec leaves one (plat_retained.h, THE REMAINING
+ * WINDOW).
  *
  * THE LOG. Lines in lib/log's format, stamped with CLOCK_MONOTONIC like the node's, appended to
  * --log-file (default stderr): the start (reset cause, cell, flash), the metadata as found, the
@@ -487,15 +501,27 @@ static int jump(const boot_selection_t *sel, const boot_options_t *options)
             boot_host_slot_name(sel->slot), (unsigned long)sel->addr, (unsigned long)payload_size,
             options->node_argc);
 
-    /* The image opens the flash and the cell itself: release both (and their locks). */
-    posix_flash_close();
-    posix_retained_close();
+    /* The hand-off last, when only the exec is left to fail (step 5 at the top). */
+    plat_boot_handoff_t handoff;
 
+    boot_host_handoff(sel, &handoff);
+
+    if (!posix_retained_set_handoff(&handoff)) {
+        LOG_WRN(TAG, "no retained cell: the image gets no hand-off and runs as if started "
+                     "without a bootloader");
+    }
+
+    /* The flash and the cell stay open and locked: their descriptors are close-on-exec, so the
+     * exec releases both for the image, which opens them itself, and no other process can take
+     * either in between. */
     (void)fexecve(fd, argv, environ);
 
-    /* Only reached if the exec failed. */
+    /* Only reached if the exec failed. The image did not start, so its hand-off is taken back
+     * through the cell's mapping, still open and locked; main() closes the cell before the
+     * exit. */
     (void)snprintf(error, sizeof(error), "fexecve of slot %s: %s", boot_host_slot_name(sel->slot),
                    strerror(errno));
+    posix_retained_clear_handoff();
     free((void *)argv);
     (void)close(fd);
     return fail(FCN_BOOT_EXIT_JUMP, error);
@@ -503,7 +529,7 @@ static int jump(const boot_selection_t *sel, const boot_options_t *options)
 
 /* ---------------------------------------------------------------------------------- main */
 
-/* Select, write the hand-off, jump. The flash and the cell are open. */
+/* Select and jump (the jump writes the hand-off). The flash and the cell are open. */
 static int boot(const boot_options_t *options)
 {
     static boot_t s_boot;
@@ -539,16 +565,6 @@ static int boot(const boot_options_t *options)
     }
 
     log_selection(&sel);
-
-    plat_boot_handoff_t handoff;
-
-    boot_host_handoff(&sel, &handoff);
-
-    if (!posix_retained_set_handoff(&handoff)) {
-        LOG_WRN(TAG, "no retained cell: the image gets no hand-off and runs as if started "
-                     "without a bootloader");
-    }
-
     return jump(&sel, options);
 }
 

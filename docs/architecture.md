@@ -228,7 +228,10 @@ node, rather than the tester, stood still.
   `select_write_error`, and `rolled_back` (the evidence of UPDATE_ROLLBACK);
 - `confirm` (phase 4): the confirm of a trial ([app/update.h](../app/update.h)): `state`
   (NOT_NEEDED, WAITING, CONFIRMING, CONFIRMED, FAILED), `confirm_after_s`, `periods_needed`,
-  `periods` judged, `healthy_periods`, `window_restarts`, `requested_period`, `status` (lib/boot's
+  `periods` judged, `healthy_periods`, `window_restarts`, `requested_period`, the periods that
+  failed each condition of good health (`unsupervised_periods`, `not_active_periods`,
+  `bus_off_periods`, `unacked_periods`), the frames acknowledged in the window so far
+  (`window_acked`) and the fewest in one of its periods (`fewest_acked`), `status` (lib/boot's
   result), and the flash task's own counts in `flash_task`: `flash`, `boot_init`, `described`
   and what the metadata said at start (`have_record`, `seq`, `active_slot`, `trial_slot`,
   `attempts_used`, `records_valid`), `confirms`, `confirm_status` and `confirm_ns`, how long the
