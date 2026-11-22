@@ -15,6 +15,15 @@
  *
  * ONE BOARD, ONE CELL. The file is locked with flock() while it is open, and a second node
  * that names it fails to start: two nodes writing one cell would make each other's cause up.
+ *
+ * THE LOCK BELONGS TO THE OPEN FILE DESCRIPTION, not to the descriptor (flock(2)), and the
+ * mapping refers to that description as the descriptor does. Without flock(LOCK_UN) the lock
+ * goes only with the last reference: closing the descriptor leaves it held while the mapping
+ * exists, and the mapping of a process image that has exec'd or exited exists until the last
+ * reference to the old memory map goes, which another process can hold (a read of
+ * /proc/<pid>/stat or /proc/<pid>/maps takes one). posix_retained_unlock() releases the lock at
+ * once, whatever still refers to the description; while it is released nothing here writes
+ * into the cell (s_locked), until posix_retained_relock() has it again.
  */
 #include "posix_retained.h"
 
@@ -30,7 +39,9 @@
 #include "crc/crc.h"
 
 static plat_retained_cell_t *s_cell; /* the mapping, or NULL */
-static int s_fd = -1;                /* open, and locked, while the cell is mapped */
+static int s_fd = -1;                /* open while the cell is mapped */
+static bool s_locked; /* s_fd holds the lock: from the open to the close, except between
+                         posix_retained_unlock() and a posix_retained_relock() that took it */
 static posix_retained_info_t s_info = {.open = false,
                                        .cause = PLAT_RESET_POWER_ON,
                                        .resets = 0U,
@@ -339,6 +350,7 @@ static bool open_cell(const char *path, bool keep_reason, char *error, size_t er
 
     s_cell = (plat_retained_cell_t *)map;
     s_fd = fd;
+    s_locked = true;
 
     {
         const char *verdict = (size_verdict != NULL) ? size_verdict : judge(s_cell);
@@ -386,7 +398,7 @@ bool posix_retained_set_handoff(const plat_boot_handoff_t *handoff)
 {
     bool written = false;
 
-    if ((s_cell != NULL) && (handoff != NULL)) {
+    if ((s_cell != NULL) && s_locked && (handoff != NULL)) {
         uint32_t words[PLAT_RETAINED_RESERVED_WORDS];
         plat_boot_handoff_t check;
 
@@ -406,10 +418,29 @@ bool posix_retained_set_handoff(const plat_boot_handoff_t *handoff)
 void posix_retained_clear_handoff(void)
 {
     /* What take_handoff() removes: four words whose first is the magic. */
-    if ((s_cell != NULL) && (s_cell->reserved[0] == PLAT_HANDOFF_MAGIC)) {
+    if ((s_cell != NULL) && s_locked && (s_cell->reserved[0] == PLAT_HANDOFF_MAGIC)) {
         (void)memset(s_cell->reserved, 0, sizeof(s_cell->reserved));
         seal(s_cell);
     }
+}
+
+void posix_retained_unlock(void)
+{
+    if ((s_cell != NULL) && s_locked) {
+        /* LOCK_UN removes the lock of the open file description at once, also while the
+         * mapping (or any copy of the descriptor) still refers to the description. */
+        (void)flock(s_fd, LOCK_UN);
+        s_locked = false;
+    }
+}
+
+bool posix_retained_relock(void)
+{
+    if ((s_cell != NULL) && !s_locked && (flock(s_fd, LOCK_EX | LOCK_NB) == 0)) {
+        s_locked = true;
+    }
+
+    return (s_cell != NULL) && s_locked;
 }
 
 bool plat_boot_handoff(plat_boot_handoff_t *out)
@@ -428,7 +459,7 @@ void posix_retained_note_reset(plat_reset_reason_t reason)
 {
     plat_retained_cell_t *const cell = s_cell;
 
-    if (cell != NULL) {
+    if ((cell != NULL) && s_locked) {
         if (reason == PLAT_RESET_POWER_LOSS) {
             (void)memset(cell, 0, sizeof(*cell)); /* RAM does not survive a loss of supply */
         } else {
@@ -446,6 +477,7 @@ void posix_retained_close(void)
         s_cell = NULL;
         (void)close(s_fd); /* releases the lock */
         s_fd = -1;
+        s_locked = false;
     }
 }
 

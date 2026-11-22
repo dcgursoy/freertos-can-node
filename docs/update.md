@@ -212,9 +212,10 @@ left as it is. The file is mapped shared (`MAP_SHARED`): every program and erase
 kernel's page cache as soon as it is done and is seen by the next process that maps it, also
 after `_exit()` in the middle of a run, as the retained cell is. While it is open the file is
 locked (`flock`), and a second process that names it fails to start: two processes driving one
-flash would each change it under the other. Without `--flash-file` there is no flash:
-`plat_flash_device()` returns NULL, the simulation commands answer that there is none, and the
-node runs as it did before phase 4.
+flash would each change it under the other. The bootloader releases its lock directly before
+it starts the image, which locks the file again (the jump, below). Without `--flash-file` there
+is no flash: `plat_flash_device()` returns NULL, the simulation commands answer that there is
+none, and the node runs as it did before phase 4.
 
 ### Timing
 
@@ -309,9 +310,10 @@ process, which ends with status 12 and the FATAL line and leaves the retained ce
 times the flash file is byte for byte what lib/flash's model leaves when it runs the same script
 with the same cut on a copy of the earlier content. A cut beyond the script's end never fires.
 It also checks the layout table, the file (created erased, kept across a restart of the
-process, a file of another size or kind refused and left alone, the lock), the syntax of a cut,
-every reply of both commands, and the commands served by another thread while operations run
-(also under ThreadSanitizer). [tests/platform/flash_selftest.c](../tests/platform/flash_selftest.c)
+process, a file of another size or kind refused and left alone, the lock, and the lock released
+by the bootloader's `posix_flash_unlock()` while the file is still open and mapped, which a
+forked process can then take), the syntax of a cut, every reply of both commands, and the
+commands served by another thread while operations run (also under ThreadSanitizer). [tests/platform/flash_selftest.c](../tests/platform/flash_selftest.c)
 does the cut under the FreeRTOS scheduler as well, where the run ends through `plat_reset()`
 and the log line written just before the script must be in the log file.
 [tests/system/test_flash_file.py](../tests/system/test_flash_file.py) runs the node with and
@@ -862,13 +864,24 @@ It does what a bootloader on a microcontroller does, in the same order:
 5. **The hand-off.** Only now, when nothing but the exec is left to fail, it writes the
    hand-off into the cell's reserved words (see the next section), so that an image it does not
    start leaves no hand-off for a later start without the bootloader.
-6. **The jump.** It calls `fexecve()`.
-   - The flash and the cell stay open, and locked, up to the exec. Their descriptors are
-     close-on-exec, so the exec itself closes (and so unlocks) them for the image, which opens
-     both, and no other process can take either in between.
-   - If the exec fails, it zeroes the hand-off's words and seals the cell again through its
-     mapping, still open and locked (`posix_retained_clear_handoff()`; the reset reason and the
-     rest of the cell stay as they were), closes the cell and ends with 42.
+6. **The jump.** It releases its locks of the flash and the cell and calls `fexecve()`.
+   - The image opens and locks both files itself. Up to the release, directly before the exec,
+     fcn_boot holds both locks. The exec alone does not free them for the image in time: a
+     `flock` lock belongs to the open file description, and the old process image's mappings
+     refer to it as its descriptors do. The exec closes the descriptors (close-on-exec), but the
+     mappings go only with the last reference to the old memory map, and another process can
+     hold one past the exec: a read of `/proc/<pid>/stat` or `/proc/<pid>/maps` takes one
+     ([bug 010](bug-log.md#010-the-image-found-the-files-still-locked-by-the-bootloader-it-had-replaced)).
+     So fcn_boot releases both locks with `flock(LOCK_UN)` (`posix_flash_unlock()`,
+     `posix_retained_unlock()`), which acts at once whatever else refers to the descriptions,
+     and keeps the descriptors and mappings for a failed exec.
+   - If the exec fails, it takes the cell's lock back (`posix_retained_relock()`), then zeroes
+     the hand-off's words and seals the cell again through its mapping
+     (`posix_retained_clear_handoff()`; the reset reason and the rest of the cell stay as they
+     were), closes the cell and ends with 42. If another process locked the cell after the
+     release, the cell is that process's: fcn_boot writes nothing into it, writes
+     `fcn_boot: the hand-off could not be taken back: --retained-file R is in use by another
+     process` and ends with 42.
    - The process keeps its id, so the bench sees one process, the node, with the node's exit
      status. `FCN_DIE_WITH_PARENT` (the test harness's) makes the kernel kill it with its
      parent, and the setting survives the exec.
@@ -892,8 +905,9 @@ leaves it as it was, or (a flash file that cannot be used) after the open of ste
 zeroed an earlier hand-off. 12, 40 and 41 end in or before the select, before the hand-off is
 written. 42 ends before it is written (the header read back, the copy, its digest, the seal,
 the image's arguments) or after a failed exec, which takes it back. Of the bootloader's own
-ends, only a kill between the write and the exec leaves one: the remaining window in the next
-section.
+ends, only a kill between the write and the exec leaves one, and another program that opens
+the cell between the release of its lock and the image's own open finds it: the remaining
+window in the next section.
 
 **The log.** Lines are in lib/log's format, stamped with CLOCK_MONOTONIC like the node's, and
 are appended to `--log-file` (default stderr). Errors also go to stderr as `fcn_boot: ...`. A
@@ -980,6 +994,16 @@ cell's path is one of its options. A node started directly on that cell, without
 would take that hand-off as its own; the next start through fcn_boot zeroes it when it opens the
 cell (step 1 above). On a target the bootloader runs at every reset, so there is no start
 without it.
+
+The lock of the cell is the other part of the window. fcn_boot releases it (and the flash's)
+directly before the exec (step 6 above), and the image locks the cell again when it opens it.
+From the release until that open, another program started on the same cell at that moment can
+take it. The image then fails to start (`in use by another node`, status 1), as it would have
+if that program had come first, and that program finds the hand-off: a node started directly
+takes it as its own (as above), another fcn_boot zeroes it. If the exec failed, fcn_boot cannot
+take the lock back, writes nothing into the cell and says that the hand-off could not be taken
+back. Only two programs started on one cell at the same moment get there; a target has one
+reset vector.
 
 ## The node's side of an update
 
@@ -1203,7 +1227,7 @@ race the node is put in from its start (`--flash-cut`, `--can-fault`).
 
 | Test file | What it shows |
 |---|---|
-| [test_boot.py](../tests/system/test_boot.py) | a factory flash starts slot A as the confirmed image (ActiveSlot A, BootMode CONFIRMED, its version) and writes nothing; an erased flash ends fcn_boot with 40 and starts nothing; without a retained cell there is no hand-off (ActiveSlot SNA, BootMode NONE); and the reset cause reaches the image through the bootloader: the node reset by its watchdog and started again through fcn_boot reports WATCHDOG in BMS_NodeInfo, its statistics and RESET_WATCHDOG; an image fcn_boot cannot start (a trial whose payload is no program: 42) leaves no hand-off, so a node started then directly on its flash and cell finds none, writes nothing and confirms nothing, and the next start through fcn_boot gives the trial its second attempt; and a trial, the node or a test payload, that ends at its own start-up checks (a `--log-file` it cannot write: 1) has taken its hand-off all the same |
+| [test_boot.py](../tests/system/test_boot.py) | a factory flash starts slot A as the confirmed image (ActiveSlot A, BootMode CONFIRMED, its version) and writes nothing; an erased flash ends fcn_boot with 40 and starts nothing; without a retained cell there is no hand-off (ActiveSlot SNA, BootMode NONE); and the reset cause reaches the image through the bootloader: the node reset by its watchdog and started again through fcn_boot reports WATCHDOG in BMS_NodeInfo, its statistics and RESET_WATCHDOG; an image fcn_boot cannot start (a trial whose payload is no program: 42) leaves no hand-off, so a node started then directly on its flash and cell finds none, writes nothing and confirms nothing, and the next start through fcn_boot gives the trial its second attempt; and a trial, the node or a test payload, that ends at its own start-up checks (a `--log-file` it cannot write: 1) has taken its hand-off all the same; and the node started through `fcn_boot_held` ([tests/tools/boot_held.c](../tests/tools/boot_held.c): fcn_boot whose exec leaves its old memory map, and with it the open file descriptions of both files, alive until the image has ended) locks the cell and the flash and runs, because fcn_boot released its locks before the exec ([bug 010](bug-log.md#010-the-image-found-the-files-still-locked-by-the-bootloader-it-had-replaced)) |
 | [test_update.py](../tests/system/test_update.py) | an image staged into slot B starts as a trial, confirms itself after 50 healthy health periods (BMS_BootInfo WAITING with its seconds, then CONFIRMED), and is the confirmed image after a restart; a trial that crashes (13) or hangs until the watchdog's time (11) is started exactly three times and rolled back to A, which reports UPDATE_ROLLBACK in its first BMS_Fault and only in that run; no update can begin while a trial is pending (after a run of the trial that ended by itself before its confirm, lib/boot refuses every address and nothing of the flash changes; while its next run runs, until the test stops it, the tool cannot open the flash the node holds); a trial with one bit flipped in its header or its payload is rejected and never started (REJECT, the DTC); a confirmed image with one bit flipped falls back to the one before it (FALLBACK, the DTC), and the next update goes to the damaged slot; a confirmed image with one bit flipped and nothing before it is not started (40); a trial whose frames nobody acknowledges (started with `--can-fault noack`, simulation control's `can.fault noack` from its start) stays error passive at 128, never bus off, and does not confirm itself in more periods than a window (the node's counts; the flash still holds the trial), and once it is acknowledged again (`can.fault none`) it confirms itself after a whole window that follows every period with the bus lost. Marked `timing`: the confirm is asked for 5 s after the node's start, by its own CLOCK_MONOTONIC log stamps, never earlier than 4.9 s and at most 0.2 s late, in period 50 with no window restart; no period cuts the window short with nothing on the bus but a listener, with the telemetry switched off by a tester, or at 125 kbit/s under a flood above the bus capacity; and the bus lost at run time (`can.fault noack`) once the window has begun cuts it short, and the trial confirms itself after a whole new window once it is acknowledged again (if the command came only after the confirm was asked for, the test process fell behind the node: a missed tolerance) |
 | [test_update_cuts.py](../tests/system/test_update_cuts.py) | power cuts on the system, below |
 | [test_flash_file.py](../tests/system/test_flash_file.py) | the flash in the running node: the option, the file, the statistics, the simulation commands |
@@ -1260,7 +1284,7 @@ has not been counted yet is missing from them, and the cut does not count it eit
 | Level | Tests |
 |---|---|
 | unit (Unity, under ASan and UBSan, and for coverage) | [test_flash.c](../tests/unit/test_flash.c) (the interface and the NOR model, above); [test_sha256.c](../tests/unit/test_sha256.c) (the FIPS 180-4 examples, every length from 0 to 320 bytes against hashlib, every split, the padding boundaries, the 64-bit length); [test_image.c](../tests/unit/test_image.c) (every field at its offset, every rejection in the order of the checks, every flipped bit of an image, steps against the one call, interleaved validations, a failed read at every read); [test_bootimg.c](../tests/unit/test_bootimg.c) (the id, the steps, the results); [test_boot.c](../tests/unit/test_boot.c) (the record bytes, every operation in every state against the reference model, random runs, the ring, the slot writer, the counts above) and [test_boot_cuts.c](../tests/unit/test_boot_cuts.c) (the campaign above), each on two flash models; [test_update.c](../tests/unit/test_update.c) (the confirm's window), [test_fault.c](../tests/unit/test_fault.c) and [test_telemetry.c](../tests/unit/test_telemetry.c) (UPDATE_ROLLBACK, BMS_BootInfo, ActiveSlot) |
-| platform | [test_posix_flash.c](../tests/platform/test_posix_flash.c) and [flash_selftest.c](../tests/platform/flash_selftest.c) (the host's flash, above); [test_posix_retained.c](../tests/platform/test_posix_retained.c) (the hand-off: taken once and zeroed, the rules, the bootloader's open that keeps the reason, and the bootloader taking back the hand-off of an image it could not start: none left, the reason and the count kept, nothing changed where there is none) |
+| platform | [test_posix_flash.c](../tests/platform/test_posix_flash.c) and [flash_selftest.c](../tests/platform/flash_selftest.c) (the host's flash, above); [test_posix_retained.c](../tests/platform/test_posix_retained.c) (the hand-off: taken once and zeroed, the rules, the bootloader's open that keeps the reason, and the bootloader taking back the hand-off of an image it could not start: none left, the reason and the count kept, nothing changed where there is none; the lock against a forked process: a mapping keeps it after its descriptor is closed, the bootloader's release lets another process take the cell while it is still open and mapped and writes nothing while released, and the lock comes back only while nobody else holds the cell) |
 | Python | [test_image.py](../tests/python/test_image.py) (fcn_tools.image against the text and against the C code), [test_sha256_table.py](../tests/python/test_sha256_table.py), [test_flash_tool.py](../tests/python/test_flash_tool.py) (what fcn_flash refuses and leaves), [test_flash_decoder.py](../tests/python/test_flash_decoder.py) (above), [test_simctl.py](../tests/python/test_simctl.py) (the flash commands' client), [test_node.py](../tests/python/test_node.py) (the harness: the bootloader's command line, the restart, the power-loss rule) |
 | system | the table above |
 

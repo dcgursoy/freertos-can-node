@@ -29,6 +29,7 @@ scripts/buglog-verify.sh
 | [007](#007-the-receive-task-took-fewer-frames-per-tick-than-a-full-1-mbits-bus-delivers) | 1 | The receive task took at most 16 frames per tick, fewer than a full 1 Mbit/s bus delivers: the receive FIFO overran for as long as such a load lasted | flood at 1 Mbit/s during the review of phase 1; system test added with the fix |
 | [008](#008-a-can-transport-that-went-away-went-unnoticed) | 1 | A SocketCAN interface deleted under the running node went unnoticed: frames were still reported sent, nothing was logged, and the node exited 0 | run that deleted the node's interface during the review of phase 1; system test added with the fix |
 | [009](#009-the-stack-report-left-out-the-frame-of-the-task-function) | 0 | The stack depth was counted from the frame of `plat_task_enter()`, so a buffer in a task function's own body never appeared in the report | review of phase 1 (a buffer planted in a task's body); stack self-test added with the fix |
+| [010](#010-the-image-found-the-files-still-locked-by-the-bootloader-it-had-replaced) | 4 | The bootloader kept the flash and the retained cell locked up to its exec and left their release to the exec; when another process held a reference to the bootloader's memory map at that moment, the locks outlived the exec and the image it had started found both files "in use" | asan run of the system tests on CI (GitHub's ubuntu-24.04 runner); platform and system tests added with the fix |
 
 ---
 
@@ -502,3 +503,152 @@ start fits the stack it was created with, plus one signal frame.
 [patch that re-creates the bug](buglog/009-task-frame-left-out-of-stack-depth/reintroduce.patch).
 With the patch the body task is reported at 512 bytes, the floor. The bug is in commits
 `7a347ab` to `a4039fa`.
+
+---
+
+## 010 The image found the files still locked by the bootloader it had replaced
+
+**Found** 2026-11-21, Phase 4, by CI run 44956788218 on GitHub's ubuntu-24.04 runner (commit
+`1bd6024`). In `scripts/test-system.sh` the functional run against the release build passed
+(1038 tests) and so did the timing run (39). The run against the asan build failed 5 tests.
+Each failed because the image that fcn_boot had just started found a file still locked:
+
+```
+FAILED tests/system/test_boot.py::test_without_a_retained_cell_the_image_gets_no_hand_off - AssertionError: node ended with 1
+fcn_node: --flash-file .../flash.bin is in use by another process
+FAILED tests/system/test_update.py::test_a_trial_that_fails_is_started_three_times_and_rolled_back_with_its_dtc[watchdog-11] - AssertionError: rolled-back ended with 1
+fcn_node: --retained-file .../cell.bin is in use by another node
+FAILED tests/system/test_update.py::test_a_trial_with_one_bit_flipped_is_rejected_and_never_started[payload] - AssertionError: node ended with 1
+fcn_node: --retained-file .../cell.bin is in use by another node
+FAILED tests/system/test_update_cuts.py::test_a_cut_anywhere_in_staging_leaves_the_confirmed_image_and_the_next_update_works - AssertionError: cut-2-0 ended with 1
+fcn_node: --retained-file .../cut-2-0.cell is in use by another node
+FAILED tests/system/test_update_cuts.py::test_a_cut_in_an_attempt_counts_against_the_trial_and_never_gives_it_a_fourth_start - AssertionError: run-0 ended with status 1, not a reset
+payload crash: --retained-file .../cell.bin is in use by another node
+========== 5 failed, 1033 passed, 39 deselected in 269.11s (0:04:29) ===========
+```
+
+fcn_boot itself had opened and locked the same files in each of these starts, so the lock the
+image ran into was the one fcn_boot held before its exec. On the development laptop (WSL2) the
+same tree had passed the asan functional run in each gate before the commit.
+
+**Cause.** `1bd6024` (the fix of review finding r4-loader-1, a failed exec that left the
+hand-off in the cell) made fcn_boot keep the flash and the cell open, mapped and locked up to
+`fexecve()`. It left their release to the exec, because both descriptors are close-on-exec.
+The same commit made the node and the test payloads open the cell first. A `flock` lock
+belongs to the open file description, not to the descriptor. It goes with `flock(LOCK_UN)` or
+with the last reference to the description, and a `MAP_SHARED` mapping is such a reference. The
+exec closes the descriptor. The mapping goes only with the old memory map, when the last
+reference to that map is dropped. Another process can hold such a reference at the moment of
+the exec: the kernel takes one for each read of `/proc/<pid>/stat` or `/proc/<pid>/maps`.
+Then the old map, its mappings and the locks outlive the exec until that process lets go, and
+the image, already running, finds the files locked. When nothing else holds the map, the exec's
+own release is the last one: the mappings and the descriptions go inside the `execve()` call,
+before the image's first instruction, and the image always finds the files free. That is why
+the laptop never showed it.
+
+What held the reference on the runner is not known. The tests that failed read no `/proc` file
+of the node or of fcn_boot. The reproduction below shows that a reader of those files is
+enough, and that a reader of `/proc/<pid>/comm` (which takes no reference to the memory map)
+is not.
+
+**Reproduction** on the laptop (8 CPUs, kernel 6.6.87.2-microsoft-standard-WSL2). The asan
+fcn_boot was started 2000 times in a row, with `ASAN_OPTIONS` as `scripts/test-system.sh` sets
+them. Each time it started the crash payload, the confirmed image in slot A of its flash, which
+opens the cell first and ends with 13. The reader was a small C program. It found every
+fcn_boot process in `/proc` and read the given files of it in a tight loop until a little after
+its exec. Starts in which the image found a file still locked:
+
+| fcn_boot | Other load | Before the fix | With the fix |
+|---|---|---|---|
+| asan | none | 0 of 2000 | |
+| asan | a busy loop on each of the 8 CPUs | 0 of 2000 | |
+| asan | reader of `stat` and `maps` | 120 of 2000 | 0 of 2000 |
+| asan | reader of `stat` only | 40 of 2000 | 0 of 2000 |
+| asan | reader of `comm` only | 0 of 2000 | |
+| release | reader of `stat` and `maps` | 23 of 2000 | 0 of 2000 |
+
+Three earlier runs of the asan fcn_boot before the fix, whose failures were not yet sorted by
+which program found the lock, had 87 of 2000 (reader of `stat` and `maps`), 34 of 2000 (`stat`
+only) and 97 of 2000 (`maps` only).
+
+The same holds without chance. `fcn_boot_held` (the regression test below) holds fcn_boot's
+old memory map past the exec every time, through a process that shares the map and has no
+descriptor of either file, only the map's two shared mappings. Started 500 times on the crash
+payload (release build), it failed all 500 starts with the jump of `1bd6024` (`boot_main.c`
+without the two releases) and none with the fix.
+
+**Fix.** fcn_boot releases both locks with `flock(LOCK_UN)` directly before `fexecve()`
+(`posix_flash_unlock()`, `posix_retained_unlock()`). `LOCK_UN` removes the description's lock
+at once, whatever else still refers to the description. It keeps the descriptors (still
+close-on-exec) and the mappings. If the exec fails, it takes the cell's lock back without
+waiting (`posix_retained_relock()`) before it takes the hand-off back through the mapping.
+While the lock is released, `posix_retained` writes nothing into the cell. If another process
+has locked the cell in the meantime, fcn_boot writes nothing into it, says that the hand-off
+could not be taken back, and ends with 42 as before. Every other program opens and closes the
+files as it did.
+
+The window this leaves runs from the release until the image has opened and locked the files
+itself. Another program started on the same files at that moment could take one. The image
+then fails to open it, as before `1bd6024`, and a hand-off left in a cell that another program
+opens is the case described in [plat_retained.h](../platform/include/plat_retained.h) and
+[update.md](update.md#the-hand-off) (THE REMAINING WINDOW). This is host only: two programs
+started on one cell at the same moment, where a target has one reset vector.
+
+The alternative was to hand the locked descriptors to the image: fcn_boot would clear
+close-on-exec, and the image would take the files from descriptors named on its command line
+instead of opening them again. That leaves no window at all, but every image (the node and
+both payloads) would need a second way into each file, with its own checks, and the image's
+command line would change. It would remove a window that only two programs started on one cell
+at the same moment can reach. The explicit release costs two calls and keeps the interface.
+
+The fix does not cover a lock held by an image that ends without closing the files: a reset
+or a power cut, which end with `_exit()` (`plat_reset()`, the test payloads), or SIGKILL. That
+lock also goes only with the image's memory map. (The node's orderly end unmaps and closes
+both files itself before it exits.) In the release loop with the reader, 6 of the 2000 starts
+found the cell still locked by the payload that had just ended: `fcn_boot: --retained-file ...
+is in use by another node`. That was before the fix and again with it. No CI run has shown
+this so far.
+
+In a second run of the same loop on the fixed code the image never found a file still locked
+by fcn_boot: 3000 starts (asan, reader of `stat` and `maps`), 2000 (asan, `stat` only) and 2000
+(release, `stat` and `maps`); in the last, 4 starts found the cell still locked by the payload
+that had just ended. The same loop on `1bd6024`, run right after it as a control (asan, `stat`
+and `maps`), had the image find the cell locked in 53 of 1000 starts, and fcn_boot after the
+payload's end in 1.
+
+**Regression test.** Four platform tests and a system test, none of which depends on the host's
+timing:
+- `tests/platform/test_posix_retained.c`:
+  - `test_a_mapping_keeps_the_lock_after_its_descriptor_is_closed` shows the kernel's side. A
+    forked process cannot lock the file while a mapping of a closed descriptor exists, and can
+    after the `munmap`.
+  - `test_a_lock_released_while_the_cell_stays_open_lets_another_process_take_it` checks the
+    release. With the cell still open and mapped, so that its description exists as after the
+    exec on CI, a forked process cannot lock the file before `posix_retained_unlock()` and can
+    after it. Nothing is written into the cell while the lock is released.
+  - `test_the_lock_comes_back_only_while_nobody_else_holds_the_cell` checks the retake. It
+    succeeds when nobody else took the cell. It fails while a forked process holds the cell,
+    and then the clear, a reset and a new hand-off leave the file unchanged. It succeeds again
+    once that process has ended.
+- `tests/platform/test_posix_flash.c`:
+  `test_a_lock_released_while_the_file_stays_open_lets_another_process_take_it` checks the
+  release for the flash.
+- `tests/system/test_boot.py`:
+  `test_the_image_locks_both_files_while_the_bootloaders_old_memory_map_lives_on` checks that
+  fcn_boot itself releases both locks before its exec. The platform tests call the release
+  functions directly, so they pass whether or not `boot_main.c` calls them. Here the node is
+  started through `fcn_boot_held` ([tests/tools/boot_held.c](../tests/tools/boot_held.c)):
+  `boot_main.c` linked with `-Wl,--wrap=fexecve`, whose exec first starts a process that
+  shares fcn_boot's memory map (`clone()` with `CLONE_VM`) and holds it until the image has
+  ended. That is what a reader of `/proc/<pid>/stat` does by chance for a moment, here every
+  time: the old map's mappings of the flash and the cell outlive the exec. The node then has
+  to lock the cell and the flash and run to the end of its `--duration-s 1`.
+
+`tests/system/test_boot.py::test_an_image_that_cannot_be_started_leaves_no_hand_off_behind`
+still covers a failed exec end to end: the lock is taken back and the hand-off is gone.
+
+**Evidence.** [failing output](buglog/010-image-found-files-still-locked/failing-output.txt),
+[patch that re-creates the bug](buglog/010-image-found-files-still-locked/reintroduce.patch).
+The patch takes the `flock(LOCK_UN)` out of `posix_retained_unlock()` and
+`posix_flash_unlock()`, so that the locks go only with the last reference to their
+descriptions, as in `1bd6024`. The bug is in commit `1bd6024`.

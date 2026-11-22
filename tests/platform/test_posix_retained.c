@@ -7,6 +7,12 @@
  * the test reads and writes the file itself, as the bench does, from its own reading of the
  * layout in plat_retained.h.
  *
+ * The lock is tested against another process: the test forks, and the child opens the file
+ * anew and tries to lock it (or holds the lock until the test lets it go). The bootloader's
+ * release of the lock before its exec (posix_retained_unlock()) is shown to work while the open
+ * file description, and with it the mapping, still exists: that is the state an exec leaves
+ * when another process holds a reference to the old memory map (docs/bug-log.md, 010).
+ *
  * What a real reset of the node does to the cell (plat_reset() from a task, and from the
  * hardware watchdog's thread) is tested by tests/platform/wdg_selftest.c, and a cell written by
  * Python from its own CRC by tests/system/test_retained.py.
@@ -19,7 +25,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "crc/crc.h"
@@ -138,6 +147,105 @@ static void reset(plat_reset_reason_t reason)
 {
     posix_retained_note_reset(reason);
     posix_retained_close();
+}
+
+/* ---------------------------------------------------------------------- another process */
+
+/* What lock_from_another_process() found. */
+#define LOCKED 0 /* the other process got the lock */
+#define IN_USE 1 /* flock() refused it with EWOULDBLOCK: another description holds it */
+#define BROKEN 2 /* the file could not be opened, or flock() failed otherwise */
+
+/* Another process tries to lock the cell's file: a child opens it anew (an open file
+ * description of its own) and tries flock(LOCK_EX | LOCK_NB), then ends, which gives up a lock
+ * it got. */
+static int lock_from_another_process(void)
+{
+    int status = -1;
+    const pid_t pid = fork();
+
+    TEST_ASSERT_TRUE(pid >= 0);
+
+    if (pid == 0) {
+        const int fd = open(s_path, O_RDWR | O_CLOEXEC);
+        int found = BROKEN;
+
+        if (fd >= 0) {
+            if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+                found = LOCKED;
+            } else if (errno == EWOULDBLOCK) {
+                found = IN_USE;
+            } else {
+                found = BROKEN;
+            }
+        }
+
+        _exit(found);
+    }
+
+    TEST_ASSERT_EQUAL_INT(pid, waitpid(pid, &status, 0));
+    TEST_ASSERT_TRUE(WIFEXITED(status));
+    return WEXITSTATUS(status);
+}
+
+/* A child that holds the lock of the cell's file until release_holder(). */
+typedef struct {
+    pid_t pid;
+    int release; /* the write end of a pipe the child reads until it is closed */
+} holder_t;
+
+static holder_t hold_from_another_process(void)
+{
+    int ready[2];
+    int release[2];
+    char answer = 'n';
+
+    TEST_ASSERT_EQUAL_INT(0, pipe(ready));
+    TEST_ASSERT_EQUAL_INT(0, pipe(release));
+
+    const pid_t pid = fork();
+
+    TEST_ASSERT_TRUE(pid >= 0);
+
+    if (pid == 0) {
+        const int fd = open(s_path, O_RDWR | O_CLOEXEC);
+
+        (void)close(ready[0]);
+        (void)close(release[1]);
+        answer = ((fd >= 0) && (flock(fd, LOCK_EX | LOCK_NB) == 0)) ? 'y' : 'n';
+        (void)!write(ready[1], &answer, 1U);
+
+        if (answer == 'y') {
+            (void)!read(release[0], &answer, 1U); /* 0 bytes once the parent closes its end */
+        }
+
+        _exit(0);
+    }
+
+    (void)close(ready[1]);
+    (void)close(release[0]);
+
+    const ssize_t got = read(ready[0], &answer, 1U);
+
+    (void)close(ready[0]);
+
+    if ((got != 1) || (answer != 'y')) {
+        (void)close(release[1]);
+        (void)waitpid(pid, NULL, 0);
+        TEST_FAIL_MESSAGE("another process could not lock the cell's file");
+    }
+
+    return (holder_t){.pid = pid, .release = release[1]};
+}
+
+/* Let the holder go: it ends, and its lock goes with its descriptor. */
+static void release_holder(holder_t holder)
+{
+    int status = -1;
+
+    (void)close(holder.release);
+    TEST_ASSERT_EQUAL_INT(holder.pid, waitpid(holder.pid, &status, 0));
+    TEST_ASSERT_TRUE(WIFEXITED(status) && (WEXITSTATUS(status) == 0));
 }
 
 #define ASSERT_START(cause_name, verdict_text, reset_count, info)                                  \
@@ -649,7 +757,7 @@ static void test_a_hand_off_that_cannot_be_written_changes_nothing(void)
     TEST_ASSERT_EQUAL_MEMORY(&fresh, &after, sizeof(fresh));
 }
 
-/* The trial the bootloader hands over in the next two tests. */
+/* The trial the bootloader hands over in the tests below. */
 static const plat_boot_handoff_t s_trial = {.slot = 1U,
                                             .mode = PLAT_BOOT_TRIAL,
                                             .attempt = 1U,
@@ -733,6 +841,134 @@ static void test_taking_back_a_hand_off_where_there_is_none_changes_nothing(void
     TEST_ASSERT_FALSE(info.have_handoff);
 }
 
+/* Why the bootloader releases the lock itself (posix_retained.c, THE LOCK BELONGS TO THE OPEN
+ * FILE DESCRIPTION), on the kernel's own terms: a shared mapping refers to the open file
+ * description as the descriptor does, so with the descriptor closed the lock is still held, as
+ * long as the mapping exists; it goes with the munmap. */
+static void test_a_mapping_keeps_the_lock_after_its_descriptor_is_closed(void)
+{
+    const plat_retained_cell_t cell = make_cell((uint32_t)PLAT_RESET_POWER_ON, 0U);
+
+    write_bytes(&cell, sizeof(cell));
+
+    const int fd = open(s_path, O_RDWR | O_CLOEXEC);
+
+    TEST_ASSERT_TRUE(fd >= 0);
+    TEST_ASSERT_EQUAL_INT(0, flock(fd, LOCK_EX | LOCK_NB));
+
+    void *const map = mmap(NULL, sizeof(cell), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+    TEST_ASSERT_TRUE(map != MAP_FAILED);
+    TEST_ASSERT_EQUAL_INT(0, close(fd));
+    TEST_ASSERT_EQUAL_INT(IN_USE, lock_from_another_process());
+    TEST_ASSERT_EQUAL_INT(0, munmap(map, sizeof(cell)));
+    TEST_ASSERT_EQUAL_INT(LOCKED, lock_from_another_process());
+}
+
+/* The bootloader's release before the exec: while the cell is still open and mapped, so that
+ * its open file description exists (as after an exec whose old memory map another process
+ * still holds), posix_retained_unlock() lets another process lock the file; before it, that
+ * process cannot. While the lock is released nothing writes into the cell, and the close
+ * afterwards is the close of any open cell. */
+static void test_a_lock_released_while_the_cell_stays_open_lets_another_process_take_it(void)
+{
+    posix_retained_info_t info;
+
+    TEST_ASSERT_TRUE_MESSAGE(posix_retained_open_boot(s_path, s_error, sizeof(s_error)), s_error);
+    TEST_ASSERT_TRUE(posix_retained_set_handoff(&s_trial));
+    TEST_ASSERT_EQUAL_INT(IN_USE, lock_from_another_process());
+
+    posix_retained_unlock();
+    posix_retained_get_info(&info);
+    TEST_ASSERT_TRUE(info.open);
+    TEST_ASSERT_EQUAL_INT(LOCKED, lock_from_another_process());
+    posix_retained_unlock(); /* a second release changes nothing */
+    TEST_ASSERT_EQUAL_INT(LOCKED, lock_from_another_process());
+
+    const plat_retained_cell_t handed = read_cell();
+    plat_boot_handoff_t other = s_trial;
+
+    other.attempt = 2U;
+    TEST_ASSERT_FALSE(posix_retained_set_handoff(&other));
+    posix_retained_clear_handoff();
+    posix_retained_note_reset(PLAT_RESET_REQUESTED);
+
+    const plat_retained_cell_t after = read_cell();
+
+    TEST_ASSERT_EQUAL_HEX32(PLAT_HANDOFF_MAGIC, handed.reserved[0]);
+    TEST_ASSERT_EQUAL_MEMORY(&handed, &after, sizeof(handed));
+    posix_retained_close();
+
+    /* The image's open after it: the hand-off is there to be taken. */
+    info = start();
+    TEST_ASSERT_TRUE(info.have_handoff);
+    TEST_ASSERT_EQUAL_UINT8(1U, info.handoff.attempt);
+}
+
+/* After a failed exec the bootloader takes the lock back before it takes the hand-off back:
+ * the lock comes back when nobody else holds the cell (and then nobody else can take it), and
+ * does not while another process holds it; then the clear, a reset and a new hand-off write
+ * nothing. Once that process has ended, the lock comes back and the hand-off is taken back.
+ * Without a cell there is no lock to take. */
+static void test_the_lock_comes_back_only_while_nobody_else_holds_the_cell(void)
+{
+    const plat_retained_cell_t before = make_cell((uint32_t)PLAT_RESET_WATCHDOG, 5U);
+
+    write_bytes(&before, sizeof(before));
+    TEST_ASSERT_TRUE_MESSAGE(posix_retained_open_boot(s_path, s_error, sizeof(s_error)), s_error);
+    TEST_ASSERT_TRUE(posix_retained_relock()); /* never released: held */
+    TEST_ASSERT_TRUE(posix_retained_set_handoff(&s_trial));
+    posix_retained_unlock();
+
+    /* Nobody took it. */
+    TEST_ASSERT_TRUE(posix_retained_relock());
+    TEST_ASSERT_EQUAL_INT(IN_USE, lock_from_another_process());
+    posix_retained_clear_handoff();
+    TEST_ASSERT_EQUAL_HEX32(0U, read_cell().reserved[0]);
+
+    /* Another process holds it. */
+    TEST_ASSERT_TRUE(posix_retained_set_handoff(&s_trial));
+    posix_retained_unlock();
+
+    const holder_t holder = hold_from_another_process();
+    const plat_retained_cell_t handed = read_cell();
+    plat_boot_handoff_t other = s_trial;
+
+    other.attempt = 2U;
+    TEST_ASSERT_FALSE(posix_retained_relock());
+    posix_retained_clear_handoff();
+    posix_retained_note_reset(PLAT_RESET_REQUESTED);
+    TEST_ASSERT_FALSE(posix_retained_set_handoff(&other));
+    TEST_ASSERT_FALSE(posix_retained_relock());
+
+    const plat_retained_cell_t untouched = read_cell();
+
+    TEST_ASSERT_EQUAL_HEX32(PLAT_HANDOFF_MAGIC, handed.reserved[0]);
+    TEST_ASSERT_EQUAL_MEMORY(&handed, &untouched, sizeof(handed));
+
+    /* It has ended. */
+    release_holder(holder);
+    TEST_ASSERT_TRUE(posix_retained_relock());
+    posix_retained_clear_handoff();
+
+    const plat_retained_cell_t after = read_cell();
+
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)PLAT_RESET_WATCHDOG, after.reset_reason);
+    TEST_ASSERT_EQUAL_UINT32(5U, after.resets);
+
+    for (uint32_t w = 0U; w < PLAT_RETAINED_RESERVED_WORDS; w++) {
+        TEST_ASSERT_EQUAL_HEX32(0U, after.reserved[w]);
+    }
+
+    TEST_ASSERT_EQUAL_HEX32(expected_crc(&after), after.crc);
+    posix_retained_close();
+
+    TEST_ASSERT_TRUE(posix_retained_open_boot(NULL, s_error, sizeof(s_error)));
+    posix_retained_unlock();
+    TEST_ASSERT_FALSE(posix_retained_relock());
+    posix_retained_close();
+}
+
 /* Every hand-off the rules allow comes back from its words as it went in. */
 static void test_every_valid_hand_off_survives_its_encoding(void)
 {
@@ -809,6 +1045,9 @@ int main(void)
     RUN_TEST(test_a_hand_off_that_cannot_be_written_changes_nothing);
     RUN_TEST(test_a_hand_off_taken_back_leaves_none_and_keeps_the_reason);
     RUN_TEST(test_taking_back_a_hand_off_where_there_is_none_changes_nothing);
+    RUN_TEST(test_a_mapping_keeps_the_lock_after_its_descriptor_is_closed);
+    RUN_TEST(test_a_lock_released_while_the_cell_stays_open_lets_another_process_take_it);
+    RUN_TEST(test_the_lock_comes_back_only_while_nobody_else_holds_the_cell);
     RUN_TEST(test_every_valid_hand_off_survives_its_encoding);
 
     const int status = UNITY_END();

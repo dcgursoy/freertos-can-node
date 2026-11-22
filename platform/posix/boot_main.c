@@ -24,12 +24,19 @@
  *      confirmed, attempt, image version, the state change it made. It does so only now, when
  *      nothing but the exec is left to fail, so that an image it does not start leaves no
  *      hand-off for a later start without the bootloader.
- *   6. fexecve()s the memory file. The process keeps its id: the test harness that started
- *      fcn_boot sees one process, the node, and its exit status. The flash file and the cell
- *      stay open, and locked, up to the exec; their descriptors are close-on-exec, so the exec
- *      itself closes (unlocks) them for the image, which opens both. If the exec fails, the
- *      hand-off's words are zeroed again through the cell's mapping, still open and locked
- *      (posix_retained_clear_handoff()), before the run ends with 42.
+ *   6. Releases its locks of the flash file and the cell (posix_flash_unlock(),
+ *      posix_retained_unlock()) and fexecve()s the memory file. The process keeps its id: the
+ *      test harness that started fcn_boot sees one process, the node, and its exit status. The
+ *      image opens and locks both files itself. The exec alone would not free them for it in
+ *      time: a lock belongs to the open file description, which the old process image's
+ *      mappings refer to as well, and those can outlast the exec (while another process holds
+ *      a reference to the old memory map: posix_retained.c, THE LOCK BELONGS TO THE OPEN FILE
+ *      DESCRIPTION). So the locks go first, by flock(LOCK_UN), and the descriptors (close-on-
+ *      exec) and mappings stay for a failed exec: then fcn_boot takes the cell's lock again
+ *      (posix_retained_relock()) and zeroes the hand-off's words through the mapping
+ *      (posix_retained_clear_handoff()) before the run ends with 42. If another process locked
+ *      the cell in between, fcn_boot writes nothing into it and says that the hand-off could
+ *      not be taken back (plat_retained.h, THE REMAINING WINDOW).
  *      Phase 7's bootloader on the Cortex-M3 sets VTOR and the main stack pointer from the
  *      slot's vector table and branches to its reset handler instead.
  *
@@ -44,8 +51,9 @@
  * zeroed an earlier hand-off; 12, 40 and 41 end in or before select, before the hand-off is
  * written; 42 ends before it is written (the header read back, the copy, its digest, the
  * seal, the image's arguments) or after a failed exec, which zeroes its words again. Of its own
- * ends, only a kill between the write and the exec leaves one (plat_retained.h, THE REMAINING
- * WINDOW).
+ * ends, only a kill between the write and the exec leaves one behind; and another program that
+ * opens the cell between the unlock and the image's own open takes it as its own
+ * (plat_retained.h, THE REMAINING WINDOW).
  *
  * THE LOG. Lines in lib/log's format, stamped with CLOCK_MONOTONIC like the node's, appended to
  * --log-file (default stderr): the start (reset cause, cell, flash), the metadata as found, the
@@ -459,6 +467,7 @@ static int load_payload(const boot_selection_t *sel, char *error, size_t error_l
 static int jump(const boot_selection_t *sel, const boot_options_t *options)
 {
     char error[256];
+    char message[512];
     uint32_t payload_size = 0U;
     const int fd = load_payload(sel, error, sizeof(error), &payload_size);
 
@@ -506,22 +515,40 @@ static int jump(const boot_selection_t *sel, const boot_options_t *options)
 
     boot_host_handoff(sel, &handoff);
 
-    if (!posix_retained_set_handoff(&handoff)) {
+    const bool handed_over = posix_retained_set_handoff(&handoff);
+
+    if (!handed_over) {
         LOG_WRN(TAG, "no retained cell: the image gets no hand-off and runs as if started "
                      "without a bootloader");
     }
 
-    /* The flash and the cell stay open and locked: their descriptors are close-on-exec, so the
-     * exec releases both for the image, which opens them itself, and no other process can take
-     * either in between. */
+    /* The locks go now, whatever still refers to the files' open descriptions after the exec
+     * (step 6 at the top): the image locks both files itself. The descriptors, close-on-exec,
+     * and the mappings stay for a failed exec. */
+    posix_flash_unlock();
+    posix_retained_unlock();
     (void)fexecve(fd, argv, environ);
 
     /* Only reached if the exec failed. The image did not start, so its hand-off is taken back
-     * through the cell's mapping, still open and locked; main() closes the cell before the
-     * exit. */
+     * through the cell's mapping once the cell's lock is ours again; a cell another process
+     * locked in the meantime is that process's, and nothing is written into it. main() closes
+     * the cell before the exit. */
     (void)snprintf(error, sizeof(error), "fexecve of slot %s: %s", boot_host_slot_name(sel->slot),
                    strerror(errno));
-    posix_retained_clear_handoff();
+
+    if (posix_retained_relock()) {
+        posix_retained_clear_handoff();
+    } else if (handed_over) {
+        (void)snprintf(message, sizeof(message),
+                       "the hand-off could not be taken back: --retained-file %s is in use by "
+                       "another process",
+                       options->retained_path);
+        LOG_ERR(TAG, "%s", message);
+        (void)fprintf(stderr, "fcn_boot: %s\n", message);
+    } else {
+        /* no hand-off was written (no cell): nothing to take back */
+    }
+
     free((void *)argv);
     (void)close(fd);
     return fail(FCN_BOOT_EXIT_JUMP, error);

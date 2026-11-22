@@ -5,8 +5,9 @@ it was handed (docs/update.md, the bootloader and the hand-off).
 
 These tests are about the start: a factory flash, a flash with nothing to start, a start
 without a retained cell, the reset cause, which the bootloader leaves in the cell for the
-image, and an image the bootloader cannot start, or that ends at its own start-up checks, which
-leaves no hand-off behind. An update's life (a trial, its confirm, its rollback, a damaged
+image, an image the bootloader cannot start, or that ends at its own start-up checks, which
+leaves no hand-off behind, and the image's lock of the flash and the cell while the
+bootloader's old memory map outlives the exec. An update's life (a trial, its confirm, its rollback, a damaged
 slot) is in test_update.py, power cuts in test_update_cuts.py; tests/system/update_bench.py is
 the bench they share.
 """
@@ -17,6 +18,7 @@ import time
 import pytest
 
 from fcn_tools import image as image_format
+from fcn_tools import paths
 from fcn_tools.node import BOOT_JUMP_FAILED, BOOT_NOTHING_BOOTABLE, EXIT_OK, RESET_WATCHDOG
 
 from update_bench import (RUN_WAIT_S, Boot, check_frames_of, check_handoff, decoded, factory,
@@ -169,6 +171,30 @@ def test_an_image_that_cannot_be_started_leaves_no_hand_off_behind(start_node, w
     assert again.wait(timeout=RUN_WAIT_S) == BOOT_JUMP_FAILED
     assert "select: slot B as a trial, attempt 2 of 3, image 1.5.0" in again.boot_log()
     assert info(flash)["metadata"]["attempts_used"] == 2
+
+
+def test_the_image_locks_both_files_while_the_bootloaders_old_memory_map_lives_on(start_node,
+                                                                                 workdir,
+                                                                                 images):
+    """fcn_boot releases its locks of the flash and the cell directly before the exec, so that
+    the image can lock both files whatever still refers to the open file descriptions fcn_boot
+    locked (docs/bug-log.md, 010). fcn_boot_held (tests/tools/boot_held.c) is fcn_boot whose
+    exec leaves its old memory map, with its shared mappings of both files, alive until the
+    image has ended, as a process that reads /proc/<pid>/stat of fcn_boot at the moment of the
+    exec does now and then: here every time. The node opens and locks the cell, then the
+    flash, and runs; had fcn_boot left the release of its locks to the exec, the node would end
+    at once with 1 (a file "in use")."""
+    flash, cell = workdir / "flash.bin", workdir / "cell.bin"
+    factory(flash, images["node-1.0.0"])
+    # The fcn_boot_held of the build whose fcn_boot runs (the asan one in the asan run).
+    held = paths.boot_binary().with_name("fcn_boot_held")
+
+    node = start_node("--duration-s", "1", flash_file=flash, retained_file=cell,
+                      boot_binary=held)
+    assert node.wait(timeout=RUN_WAIT_S) == EXIT_OK, node.stderr()
+    assert "jump: slot A at 0x002000" in node.boot_log()
+    assert "started by the bootloader: slot A, the confirmed image, image 1.0.0" in node.log()
+    assert node.stats()["handoff"]["present"] is True
 
 
 @pytest.mark.parametrize("image", ["node-1.1.0", "crash"])

@@ -2,7 +2,9 @@
 /*
  * The flash of the host build (platform/posix/posix_flash.c) without a kernel: the layout
  * table; the file (created erased, kept across a restart of the process, a file of another size
- * or kind refused and left alone, locked while open); the syntax of a cut; the device's rules
+ * or kind refused and left alone, locked while open, and free for another process once the
+ * bootloader's posix_flash_unlock() has released the lock while the file is still open and
+ * mapped); the syntax of a cut; the device's rules
  * and counters; the wait function; the simulation commands flash.status and flash.cut with
  * every reply; a cut that ends the process with the status of a power loss (12), leaves exactly
  * the tear that lib/flash's model gives for its seed on a copy, and takes the retained cell
@@ -425,6 +427,62 @@ static void test_the_file_is_locked_while_it_is_open(void)
     TEST_ASSERT_NULL(plat_flash_device());
     (void)close(fd);
     open_flash(&FAST);
+}
+
+/* Another process tries to lock the flash file: a child opens it anew (an open file
+ * description of its own) and tries flock(LOCK_EX | LOCK_NB). Its exit status: 0 it got the
+ * lock (given up when it ends), 1 EWOULDBLOCK (another description holds it), 2 otherwise. */
+static int lock_from_another_process(void)
+{
+    int status = -1;
+    const pid_t pid = fork();
+
+    TEST_ASSERT_TRUE(pid >= 0);
+
+    if (pid == 0) {
+        const int fd = open(s_path, O_RDWR | O_CLOEXEC);
+        int found = 2;
+
+        if (fd >= 0) {
+            if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+                found = 0;
+            } else if (errno == EWOULDBLOCK) {
+                found = 1;
+            } else {
+                found = 2;
+            }
+        }
+
+        _exit(found);
+    }
+
+    TEST_ASSERT_EQUAL_INT(pid, waitpid(pid, &status, 0));
+    TEST_ASSERT_TRUE(WIFEXITED(status));
+    return WEXITSTATUS(status);
+}
+
+/* The bootloader's release before the exec: with the flash still open and mapped, so that its
+ * open file description exists (as after an exec whose old memory map another process still
+ * holds), posix_flash_unlock() lets another process lock the file; before it, that process
+ * cannot. The file stays open until the close; a second release, and one without a flash,
+ * change nothing. */
+static void test_a_lock_released_while_the_file_stays_open_lets_another_process_take_it(void)
+{
+    open_flash(&FAST);
+    TEST_ASSERT_EQUAL_INT(1, lock_from_another_process());
+
+    posix_flash_unlock();
+    TEST_ASSERT_TRUE(flash_info().open);
+    TEST_ASSERT_NOT_NULL(plat_flash_device());
+    TEST_ASSERT_EQUAL_INT(0, lock_from_another_process());
+    posix_flash_unlock();
+    TEST_ASSERT_EQUAL_INT(0, lock_from_another_process());
+    posix_flash_close();
+    TEST_ASSERT_FALSE(flash_info().open);
+
+    posix_flash_unlock();
+    open_flash(&FAST);
+    TEST_ASSERT_EQUAL_INT(1, lock_from_another_process());
 }
 
 /* ------------------------------------------------------------------------- the cut syntax */
@@ -930,6 +988,7 @@ int main(void)
     RUN_TEST(test_a_file_of_another_size_is_refused_and_left_alone);
     RUN_TEST(test_a_file_that_cannot_be_used_is_refused_with_the_reason);
     RUN_TEST(test_the_file_is_locked_while_it_is_open);
+    RUN_TEST(test_a_lock_released_while_the_file_stays_open_lets_another_process_take_it);
     RUN_TEST(test_a_cut_is_written_n_or_n_colon_seed);
     RUN_TEST(test_the_device_follows_flash_h_and_counts_what_it_did);
     RUN_TEST(test_an_operation_waits_through_the_wait_function_until_its_time_has_passed);

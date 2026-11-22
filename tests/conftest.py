@@ -191,24 +191,26 @@ def started_nodes():
 @pytest.fixture
 def start_node(workdir, node_binary, ports, started_nodes):
     """Factory: start_node(*args, name="node", can=None, retained_file=None, flash_file=None,
-    boot_args=()) returns a running NodeProcess.
+    boot_args=(), boot_binary=None) returns a running NodeProcess.
 
     Without `can` the node gets the test's own UDP bus. The first node of a test serves
     simulation control on the test's port; further nodes of the same test do not, except runs
     started by restart_node, which take the place of the run they follow. `retained_file` is
     the node's retained-RAM cell (--retained-file). With a `flash_file` the node is started
-    through the bootloader, fcn_boot, with `boot_args` as its own options: the image the
-    bootloader selects in the flash runs, and `args` are its options (NodeProcess).
+    through the bootloader, fcn_boot (or `boot_binary`), with `boot_args` as its own options:
+    the image the bootloader selects in the flash runs, and `args` are its options
+    (NodeProcess).
     """
 
     def _start(*args: str, name: str = "node", can: str | None = None,
                retained_file: Path | None = None, flash_file: Path | None = None,
-               boot_args: tuple[str, ...] = ()) -> NodeProcess:
+               boot_args: tuple[str, ...] = (), boot_binary: Path | None = None) -> NodeProcess:
         node = NodeProcess(
             workdir=workdir, args=args, binary=node_binary, name=name,
             can=can or f"udp:{ports.bus}",
             sim_port=None if started_nodes else ports.sim,
             retained_file=retained_file, flash_file=flash_file, boot_args=boot_args,
+            **({} if boot_binary is None else {"boot_binary": boot_binary}),
         ).start()
         started_nodes.append(node)
         return node

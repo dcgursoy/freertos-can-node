@@ -17,9 +17,10 @@
  * size: its content would not be a flash of this layout. It is mapped shared (MAP_SHARED), so
  * every program and erase is in the file as soon as it is done, whether or not the process
  * ends in order, and the next process (the bootloader after the node, the node after a reset)
- * finds it there. It is locked (flock) while it is open: two processes driving one flash would
- * each change it under the other. Without the option there is no flash: plat_flash_device()
- * returns NULL and nothing else changes.
+ * finds it there. It is locked (flock) while it is open, but for the bootloader's
+ * posix_flash_unlock(): two processes driving one flash would each change it under the other.
+ * Without the option there is no flash: plat_flash_device() returns NULL and nothing else
+ * changes.
  *
  * TIMING. Each program and erase waits the time the modelled part takes before it returns
  * (the figures below, or the ones given to posix_flash_open()): a read takes none. With no wait
@@ -160,6 +161,18 @@ void posix_flash_set_power_loss(posix_flash_power_loss_fn end);
 /** Unmap the flash and release the file; the flash stays in it. The counters stay readable.
  *  Main thread, after the last operation. */
 void posix_flash_close(void);
+
+/**
+ * Release the lock of the open flash file at once (flock LOCK_UN), keeping the file open and
+ * mapped. The lock belongs to the open file description (flock(2)), which the mapping refers
+ * to as the descriptor does: without this call it lasts as long as any reference to the
+ * description, also one that outlives the process image (an exec while another process holds
+ * a reference to the old memory map, posix_retained.c). From the call on, another process can
+ * open the file, so the caller operates the device no more; posix_flash_close() or the exec
+ * closes it. Does nothing without a flash. The bootloader, directly before the exec of the
+ * image, which opens and locks the file itself. Main thread.
+ */
+void posix_flash_unlock(void);
 
 /** What the flash counted so far. Any thread. */
 void posix_flash_get_info(posix_flash_info_t *out);

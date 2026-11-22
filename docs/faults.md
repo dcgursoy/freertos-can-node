@@ -558,10 +558,12 @@ is `taken`; `invalid` for one that breaks a rule, `none` without one), and the f
 zeroed, so that a later start without the bootloader finds none. The bootloader (fcn_boot) opens
 the cell before the image does with `posix_retained_open_boot()`, which leaves the recorded
 reason in it for the image (and zeroes a hand-off an earlier start left), and writes the
-hand-off with `posix_retained_set_handoff()` directly before it starts the image; if the start
-fails, `posix_retained_clear_handoff()` takes it back (update.md, the hand-off, which also states
-the window on the host in which a hand-off can stay behind). A cell
-that is not valid it writes afresh first, as after power-on, so the image of a start after
+hand-off with `posix_retained_set_handoff()` directly before it starts the image. It then
+releases its lock of the cell (`posix_retained_unlock()`) for the image, which locks it itself;
+if the start fails, it takes the lock back (`posix_retained_relock()`) and
+`posix_retained_clear_handoff()` takes the hand-off back (update.md, the hand-off, which also
+states the window on the host in which a hand-off can stay behind or reach another program). A
+cell that is not valid it writes afresh first, as after power-on, so the image of a start after
 power-on finds a valid cell with no reset and its hand-off (verdict `no reset`).
 
 "Written afresh" means every word 0 (reason POWER_ON) with a valid header and CRC. Because the

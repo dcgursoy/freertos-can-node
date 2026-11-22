@@ -50,10 +50,10 @@ typedef struct {
  * not the magic) are kept as before.
  *
  * The file is created if it does not exist and given the cell's size if it has another; it is
- * locked (flock) for as long as it is open, so that two nodes cannot share one cell. Returns
- * false with a message for the user in `error` if the file cannot be opened, locked, sized or
- * mapped, or a cell is already open; nothing is changed then. Main thread, once, before
- * anything that could call plat_reset().
+ * locked (flock) for as long as it is open (but for the bootloader's posix_retained_unlock()),
+ * so that two nodes cannot share one cell. Returns false with a message for the user in
+ * `error` if the file cannot be opened, locked, sized or mapped, or a cell is already open;
+ * nothing is changed then. Main thread, once, before anything that could call plat_reset().
  */
 bool posix_retained_open(const char *path, char *error, size_t error_len);
 
@@ -69,20 +69,45 @@ bool posix_retained_open_boot(const char *path, char *error, size_t error_len);
 
 /**
  * Write `handoff` into the reserved words of the open cell (plat_retained.h, THE HAND-OFF) and
- * seal the cell with its CRC. Returns false, changing nothing, without a cell, for a NULL
- * `handoff`, or for one that breaks the rules. The bootloader, after posix_retained_open_boot(),
- * directly before it starts the image.
+ * seal the cell with its CRC. Returns false, changing nothing, without a cell, while its lock is
+ * released (posix_retained_unlock()), for a NULL `handoff`, or for one that breaks the rules.
+ * The bootloader, after posix_retained_open_boot(), directly before it starts the image.
  */
 bool posix_retained_set_handoff(const plat_boot_handoff_t *handoff);
 
 /**
  * Take the hand-off back out of the open cell: if reserved word 0 is PLAT_HANDOFF_MAGIC, zero
  * the four reserved words and seal the cell again with its CRC; the reset reason, the count
- * and the rest of the cell stay as they are. Does nothing without a cell or without the magic
- * in word 0. The bootloader, when the image it wrote the hand-off for could not be started (a
- * failed exec), before it closes the cell: a later start then finds no hand-off.
+ * and the rest of the cell stay as they are. Does nothing without a cell, while its lock is
+ * released, or without the magic in word 0. The bootloader, when the image it wrote the
+ * hand-off for could not be started (a failed exec), after posix_retained_relock() and before
+ * it closes the cell: a later start then finds no hand-off.
  */
 void posix_retained_clear_handoff(void);
+
+/**
+ * Release the lock of the open cell at once (flock LOCK_UN), keeping the file open and mapped.
+ * The lock belongs to the open file description (flock(2)), which the mapping refers to as the
+ * descriptor does: without this call it lasts as long as any reference to the description,
+ * also one that outlives the process image (posix_retained.c, THE LOCK BELONGS TO THE OPEN
+ * FILE DESCRIPTION). From the call on, another process can open the cell, and nothing here
+ * writes into it (posix_retained_set_handoff(), posix_retained_clear_handoff() and
+ * posix_retained_note_reset() do nothing) until posix_retained_relock() has taken the lock
+ * again. Does nothing without a cell or if the lock is released already. The bootloader, after
+ * the hand-off is written and directly before the exec of the image, which opens and locks the
+ * cell itself (plat_retained.h, THE REMAINING WINDOW). Main thread.
+ */
+void posix_retained_unlock(void);
+
+/**
+ * Take the lock of the open cell again after posix_retained_unlock(), without waiting
+ * (flock LOCK_EX | LOCK_NB). Returns true if this process holds the lock (taken now, or never
+ * released), false without a cell or if another process has locked the file in the meantime:
+ * the cell is that process's then, and nothing here writes into it. True says only that nobody
+ * else holds the cell now, not that nobody opened it after the unlock. The bootloader, after a
+ * failed exec, before it takes the hand-off back. Main thread.
+ */
+bool posix_retained_relock(void);
 
 /** The four reserved words of `handoff` (THE HAND-OFF). Pure; any thread. */
 void posix_handoff_encode(const plat_boot_handoff_t *handoff,
@@ -100,9 +125,10 @@ const char *posix_handoff_decode(const uint32_t words[PLAT_RETAINED_RESERVED_WOR
 /**
  * Record a reset in the cell (plat_reset() calls it): the reason and one more reset, with the
  * CRC over them; for PLAT_RESET_POWER_LOSS the cell is destroyed instead (every byte 0), so the
- * next start is a power-on. Does nothing without a cell. Only plain stores to the mapped
- * memory: it takes no lock and makes no system call, so any context may call it, a signal
- * handler included. The caller makes sure that only one call happens (plat_reset() does).
+ * next start is a power-on. Does nothing without a cell or while its lock is released
+ * (posix_retained_unlock()). Only plain loads and stores of memory: it takes no lock and makes
+ * no system call, so any context may call it, a signal handler included. The caller makes sure
+ * that only one call happens (plat_reset() does).
  */
 void posix_retained_note_reset(plat_reset_reason_t reason);
 

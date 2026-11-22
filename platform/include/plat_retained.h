@@ -64,6 +64,18 @@
  * would take that hand-off as its own. The next start through fcn_boot zeroes it when it opens
  * the cell. On a target the bootloader runs at every reset, so there is no start without it.
  *
+ * The lock of the cell is the other part of the window. fcn_boot holds it (and the flash's)
+ * until directly before the exec and then releases it (posix_retained_unlock()), so that the
+ * image can lock the cell whatever still refers to the old process image's open file
+ * descriptions after the exec; the image locks it again when it opens it. From the release
+ * until that open, another program started on the same cell at that moment can take it. The
+ * image then fails to start ("in use by another node", status 1), as it would have if that
+ * program had come first, and that program finds the hand-off: a node started directly takes
+ * it as its own (as above), another fcn_boot zeroes it. If the exec failed, fcn_boot cannot
+ * take the lock back (posix_retained_relock()), writes nothing into the cell and says that the
+ * hand-off could not be taken back. Only two programs started on one cell at the same moment
+ * get there; a target has one reset vector.
+ *
  * ON A TARGET. A software reset (assert, stack overflow, a requested reset) writes its reason
  * into the cell, then triggers the reset (SCB AIRCR SYSRESETREQ). A watchdog reset writes
  * nothing, because no code runs before it: the start-up code finds IWDGRSTF set in RCC_CSR and

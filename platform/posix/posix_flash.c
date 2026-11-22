@@ -106,7 +106,7 @@ static nor_t s_nor;
 static uint32_t s_erase_counts[SECTOR_COUNT];
 static flash_dev_t s_dev;
 static uint8_t *s_map; /* the mapping, or NULL */
-static int s_fd = -1;  /* open, and locked, while the file is mapped */
+static int s_fd = -1;  /* open while the file is mapped; locked but after posix_flash_unlock() */
 static uint32_t s_armed_seed;
 static posix_flash_wait_fn s_wait;             /* NULL: sleep */
 static posix_flash_power_loss_fn s_power_loss; /* NULL: the end without a kernel */
@@ -724,6 +724,15 @@ void posix_flash_close(void)
         s_map = NULL;
         (void)close(s_fd); /* releases the lock */
         s_fd = -1;
+    }
+}
+
+void posix_flash_unlock(void)
+{
+    if (atomic_load(&s_open)) {
+        /* LOCK_UN removes the lock of the open file description at once, also while the
+         * mapping still refers to the description. A second call finds no lock to remove. */
+        (void)flock(s_fd, LOCK_UN);
     }
 }
 

@@ -39,3 +39,13 @@ foreach(kind crash watchdog)
 endforeach()
 target_compile_definitions(fcn_payload_crash PRIVATE PAYLOAD_KIND=1 _POSIX_C_SOURCE=200809L)
 target_compile_definitions(fcn_payload_watchdog PRIVATE PAYLOAD_KIND=2 _POSIX_C_SOURCE=200809L)
+
+# fcn_boot_held: the bootloader (the same boot_main.c as fcn_boot) whose exec keeps its old
+# memory map, and with it the open file descriptions of the flash and the cell, alive until the
+# image has ended (boot_held.c, by -Wl,--wrap=fexecve), for tests/system/test_boot.py.
+add_executable(fcn_boot_held "${CMAKE_SOURCE_DIR}/platform/posix/boot_main.c" boot_held.c)
+target_compile_definitions(fcn_boot_held PRIVATE _GNU_SOURCE FCN_VERSION="${PROJECT_VERSION}")
+target_link_libraries(fcn_boot_held PRIVATE fcn_boot_host)
+target_link_options(fcn_boot_held PRIVATE -Wl,--wrap=fexecve)
+set_target_properties(fcn_boot_held PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+fcn_target_defaults(fcn_boot_held NO_COVERAGE)
