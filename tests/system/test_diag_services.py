@@ -20,7 +20,8 @@ has no message of 0 bytes), and a write or exit that lib/boot refuses (only a fa
 makes it, and a cut of its supply ends the run: test_download_cuts.py).
 
 Functional tests decide from the node's answers and counters; the cadence of responsePending,
-P2server and a session kept alive by TesterPresent are timing tolerances (marked `timing`).
+P2server, a session kept alive by TesterPresent and requests that come while an erase is pending
+are timing tolerances (marked `timing`).
 """
 from __future__ import annotations
 
@@ -53,6 +54,33 @@ def dtc_records(answer: bytes) -> list[tuple[int, int]]:
     assert answer[2] == 0xFF and (len(answer) - 3) % 4 == 0, show(answer)
     return [(int.from_bytes(answer[at:at + 3], "big"), answer[at + 3])
             for at in range(3, len(answer), 4)]
+
+
+def erase_with_probes(uds: Uds, erase: str, size: int, probes: list[str]) -> list[bytes]:
+    """An eraseMemory of `size` bytes asked for with the SPRMIB (`31 81 ` and `erase`, the rest
+    of the request), and, once its first responsePending is in, each of the requests `probes`,
+    the next once the one before is answered. Returns the final answers in the order they came,
+    the erase's among them; its responsePendings are counted in `uds`."""
+    uds.send("31 81 " + erase)
+    first = uds.receive(timeout=2.0)
+    assert first == hexbytes("7F 31 78"), show(first)
+    uds.pendings += 1
+    if probes:
+        uds.send(probes[0])
+    arrived = []
+    deadline = time.monotonic() + diag.erase_timeout_s(size)
+    while len(arrived) < 1 + len(probes):
+        message = uds.receive(timeout=max(0.0, deadline - time.monotonic()))
+        assert message is not None, f"answers so far: {[show(m) for m in arrived]}"
+        if message == hexbytes("7F 31 78"):
+            uds.pendings += 1
+            continue
+        uds.answers.append(message)
+        arrived.append(message)
+        answered = len([m for m in arrived if m[0] != 0x71])
+        if message[0] != 0x71 and answered < len(probes):
+            uds.send(probes[answered])
+    return arrived
 
 
 # ------------------------------------------------------------------ the sessions without flash
@@ -208,9 +236,9 @@ def test_the_download_services_check_their_requests_in_order(can_spec, start_nod
     in slot A): every check of eraseMemory, RequestDownload, TransferData, RequestTransferExit,
     checkProgrammingDependencies and requestRoutineResults in its order, the refusals of lib/boot
     behind them (no slot at the address, the running slot, a size of 0 or beyond the slot, a
-    trial pending), a request while the erase is pending (busyRepeatRequest before any other
-    check), the repeated block, transferDataSuspended, which ends the download, and a whole
-    download that commits the trial."""
+    trial pending), an erase asked for with the SPRMIB, the repeated block,
+    transferDataSuspended, which ends the download, and a whole download that commits the
+    trial. (A request while the erase is pending: test_requests_while_an_erase_is_pending_...)"""
     flash = workdir / "flash.bin"
     factory(flash, images["node-1.0.0"])
     data = images["data"].read_bytes()
@@ -266,41 +294,12 @@ def test_the_download_services_check_their_requests_in_order(can_spec, start_nod
             ("31 03 FF 00 00", "7F 31 13"),
         ])
 
-        # A request while the erase is pending gets busyRepeatRequest, whatever it is (step 1,
-        # before the SID's check). The erase of 32 sectors takes 1.4 s at the part's typical
-        # time; the requests go out once its first responsePending is in (40 ms). The erase is
-        # asked for with the SPRMIB (31 81): once a responsePending has gone out, its final
-        # positive answer comes all the same.
+        # An erase of 32 sectors asked for with the SPRMIB (31 81): once a responsePending has
+        # gone out, its final positive answer comes all the same. (Requests while it is pending:
+        # the timing test below.)
         big = 32 * 4096
-        uds.send("31 81 " + erase(SLOT_B, big)[6:])
-        first = uds.receive(timeout=2.0)
-        assert first == hexbytes("7F 31 78"), show(first)
-        uds.pendings += 1
-        probes = [("3E 00", "7F 3E 21", "7E 00"), ("27 01", "7F 27 21", "7F 27 11")]
-        uds.send(probes[0][0])
-        arrived = []        # the final answers, in the order they came
-        deadline = time.monotonic() + diag.erase_timeout_s(big)
-        while len(arrived) < 3:
-            message = uds.receive(timeout=max(0.0, deadline - time.monotonic()))
-            assert message is not None, f"answers so far: {[show(m) for m in arrived]}"
-            if message == hexbytes("7F 31 78"):
-                uds.pendings += 1
-                continue
-            uds.answers.append(message)
-            arrived.append(message)
-            if message[0] != 0x71 and len([m for m in arrived if m[0] != 0x71]) == 1:
-                uds.send(probes[1][0])      # the second once the first is answered
-        erased_at = next(i for i, m in enumerate(arrived) if m[0] == 0x71)
-        assert arrived[erased_at] == hexbytes("71 01 FF 00 00 00"), show(arrived[erased_at])
-        answers = [m for m in arrived if m[0] != 0x71]
-        for number, (answer, (_, busy, normal)) in enumerate(zip(answers, probes)):
-            # The node answers in the order it processes, so a probe answered before the
-            # erase's final answer was processed while the erase was pending.
-            before = arrived.index(answer) < erased_at
-            assert answer == hexbytes(busy if before else normal), (number, show(answer))
-        if erased_at < 2:
-            check_timing(False, "the erase had ended before the tester's second request came: "
-                                "the host held the tester up for more than the erase's 1.4 s")
+        assert erase_with_probes(uds, erase(SLOT_B, big)[6:], big, probes=[]) == [
+            hexbytes("71 01 FF 00 00 00")]
 
         last_counter, last = image_blocks[-1]
         check_table(uds, [
@@ -397,6 +396,41 @@ def test_response_pending_comes_40_ms_after_the_request_and_then_every_2_s(
 
 @UDP_ONLY
 @pytest.mark.timing
+def test_requests_while_an_erase_is_pending_get_busy_repeat_request(can_spec, start_node, images,
+                                                                    workdir):
+    """While an erase is pending a request gets busyRepeatRequest, whatever it is (step 1, before
+    the SID's check): a TesterPresent and an unknown SID, the first sent once the erase's first
+    responsePending is in (40 ms), the second once the first is answered; the erase of 32 sectors
+    takes 1.4 s at the part's typical time. Each answer is checked against the order in which the
+    node answered (one that came before the erase's final answer was processed while it was
+    pending), which no host can change. That both came while it was pending is a timing
+    tolerance: a host that holds the tester up for longer than the erase leaves nothing pending."""
+    flash = workdir / "flash.bin"
+    factory(flash, images["node-1.0.0"])
+    node = start_ready(start_node, can_spec, flash_file=flash, retained_file=workdir / "cell.bin")
+    big = 32 * 4096
+    probes = [("3E 00", "7F 3E 21", "7E 00"), ("27 01", "7F 27 21", "7F 27 11")]
+    with Uds(can_spec) as uds:
+        assert uds.request("10 03").positive and uds.request("10 02").positive
+        arrived = erase_with_probes(uds, erase_request(SLOT_B, big).hex(" ")[6:], big,
+                                    [request for request, _, _ in probes])
+        assert not uds.isotp_errors, uds.isotp_errors
+    assert node.stop() == EXIT_OK
+    check_counts(node.stats(), uds)
+    erased_at = next(i for i, m in enumerate(arrived) if m[0] == 0x71)
+    assert arrived[erased_at] == hexbytes("71 01 FF 00 00 00"), show(arrived[erased_at])
+    answers = [m for m in arrived if m[0] != 0x71]
+    for number, (answer, (_, busy, normal)) in enumerate(zip(answers, probes)):
+        # The node answers in the order it processes, so a probe answered before the erase's
+        # final answer was processed while the erase was pending.
+        before = arrived.index(answer) < erased_at
+        assert answer == hexbytes(busy if before else normal), (number, show(answer))
+    check_timing(erased_at == 2, "the erase had ended before the tester's second request came: "
+                                 "the host held the tester up for more than the erase's 1.4 s")
+
+
+@UDP_ONLY
+@pytest.mark.timing
 def test_tester_present_keeps_the_session_and_silence_ends_it(can_spec, start_node):
     """In the extended session, a suppressed TesterPresent every second keeps the session past
     S3server (5 s) without an answer to any of them; then, after more than S3server of silence,
@@ -435,8 +469,8 @@ def test_read_dtc_information_and_the_clear_agree_with_bms_fault(can_spec, start
     status byte (testFailed, confirmedDTC), lists it by those masks and counts it, while the
     other DTCs agree with the frame too. Once the cell is back, BMS_Fault and 0x19 agree that it
     is no longer active and still confirmed; ClearDiagnosticInformation is answered once the
-    health task has cleared it, and the next BMS_Fault (FaultClearCount 1) and 0x19 both say it
-    is confirmed no more."""
+    health task has cleared it (0x19 straight after the answer, with no wait, finds it confirmed
+    no more), and the next BMS_Fault (FaultClearCount 1) and 0x19 both say so as well."""
     bus = open_bus(can_spec)
     try:
         with BusReader(bus) as reader:
@@ -491,7 +525,14 @@ def test_read_dtc_information_and_the_clear_agree_with_bms_fault(can_spec, start
                 assert uds.request("19 01 08").response == hexbytes("59 01 FF 01 00 01")
 
                 assert uds.request("14 FF FF FF").response == hexbytes("54")
-                # The answer came once the clear was made: the frame of its period has it.
+                # The answer came once the clear was made: the very next read, with no wait,
+                # finds the DTC confirmed no more. (After the clear a confirmed bit comes back
+                # only with a fault, and the cell is back: this holds however late the read
+                # comes. A node that answered before the clear still has it confirmed here,
+                # unless the health task's next period, which makes the clear, falls between.)
+                assert dtc_records(uds.request("19 02 08").response) == []
+                assert uds.request("19 01 08").response == hexbytes("59 01 FF 01 00 00")
+                # And the frame of the clear's period has it.
                 wait_until(lambda: latest()[2] == 1, "BMS_Fault with FaultClearCount 1",
                            running=lambda: node.running)
                 active, confirmed, clears = steady()

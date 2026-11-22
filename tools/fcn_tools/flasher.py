@@ -48,27 +48,39 @@ and the data per block, every step with its start (seconds from the first reques
 monotonic clock), its duration, whether it succeeded and, if not, the NRC (name and code) or the
 error, the time of every TransferData block, the transfer's bytes and throughput, the boot
 information before, of the trial and after the confirm, who confirmed (the routine or the node
-itself), "result" ("confirmed", "committed", "trial", or "failed") and the failed step. Times are
-the tester's: they include the bus and both hosts.
+itself), "result" ("confirmed", "committed", "trial", or "failed") and the failed step, or, when
+the flasher stopped between two steps on an error of its own, no failed step and "error"
+("error" also says why the bus could not be closed after the sequence, if it could not). Times
+are the tester's: they include the bus and both hosts.
 
-EXIT STATUS: 0 for a result that is not "failed"; 1 for a usage error (an image that cannot be
-read or is no image); 2 when a step failed (a negative response, a timeout, an answer that is
-not what the sequence needs).
+EXIT STATUS: 0 for a result that is not "failed"; 1 when the flasher cannot start, before its
+first request and without a report: an argument it refuses (argparse's own status for that, 2,
+is not used), a report file that cannot be written, an image that cannot be read or is no
+image, a bus that cannot be opened (the report file is opened first, and removed again after
+these last two); 2 when the sequence failed, with its report: a step failed (a negative
+response, a timeout, an answer that is not what the sequence needs: one udsoncan finds
+unexpected or invalid, or one the flasher cannot use; an error of the bus or the transport), or
+the flasher stopped between two steps on an error of its own, or the bus could not be closed
+after the sequence. An interrupt (KeyboardInterrupt) ends it as Python ends a program, and the
+report is not written.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, NoReturn, Sequence
 
+import can
 import udsoncan
 from udsoncan import MemoryLocation
-from udsoncan.exceptions import NegativeResponseException, TimeoutException
+from udsoncan.exceptions import (InvalidResponseException, NegativeResponseException,
+                                 TimeoutException, UnexpectedResponseException)
 
 from . import diag
 from . import image as image_format
@@ -156,22 +168,33 @@ def _nrc_of(error: NegativeResponseException) -> dict[str, Any]:
 
 def run_step(report: Report, name: str, action: Callable[[], Any],
              request: str = "") -> Any:
-    """Make one step: its record in the report, timed, and its result; StepFailed if it fails."""
+    """Make one step: its record in the report, timed, and its result; StepFailed if it fails,
+    whatever Exception the action raised, with the error in the record. KeyboardInterrupt and
+    SystemExit go through; the record, appended all the same, then says ok False."""
     start = time.monotonic()
     record: dict[str, Any] = {"name": name, "request": request,
-                              "start_s": round(start - report.origin, 6)}
+                              "start_s": round(start - report.origin, 6), "ok": False}
     try:
         result = action()
         record["ok"] = True
         return result
     except NegativeResponseException as error:
-        record.update(ok=False, **_nrc_of(error), error=str(error))
+        record.update(**_nrc_of(error), error=str(error))
         raise StepFailed(name) from error
     except TimeoutException as error:
-        record.update(ok=False, error=f"timeout: {error}")
+        record.update(error=f"timeout: {error}")
+        raise StepFailed(name) from error
+    except UnexpectedResponseException as error:   # a valid answer, but not to this request
+        record.update(error=f"unexpected response: {error}")
+        raise StepFailed(name) from error
+    except InvalidResponseException as error:      # an answer udsoncan cannot decode
+        record.update(error=f"invalid response: {error}")
         raise StepFailed(name) from error
     except (StepFailed, ValueError, KeyError) as error:
-        record.update(ok=False, error=str(error))
+        record.update(error=str(error))
+        raise StepFailed(name) from error
+    except Exception as error:  # noqa: BLE001 (the bus, the transport: python-can, isotp, OSError)
+        record.update(error=f"{type(error).__name__}: {error}")
         raise StepFailed(name) from error
     finally:
         record["duration_s"] = round(time.monotonic() - start, 6)
@@ -214,16 +237,32 @@ def _wait_for_trial(client: udsoncan.client.Client, slot: str, wait_s: float) ->
 def flash(spec: str, image_path: Path, address: int | None = None, reset: bool = True,
           confirm: bool = True, trial_wait_s: float = TRIAL_WAIT_S) -> Report:
     """The programming sequence (see the module's text) on the bus `spec`; the report. A step
-    that fails ends the sequence; the report says which."""
+    that fails ends the sequence; the report says which. An error of the flasher between two
+    steps ends it too, with result "failed" and the error in the report, and so does an error
+    closing the bus after the sequence; KeyboardInterrupt and SystemExit go through. Before the
+    first request it raises OSError or ValueError for an image that cannot be read or is no
+    image, and what fcn_tools.diag.connect() raises for a bus that cannot be opened
+    (ValueError, OSError, can.CanError)."""
     data, image = describe_image(image_path)
     size = len(data)
     report = Report(can=spec, image=image)
-    with diag.connect(spec) as client:
+    with contextlib.ExitStack() as connection:
+        client = connection.enter_context(diag.connect(spec))
         try:
             _sequence(client, report, data, size, address, reset, confirm, trial_wait_s)
         except StepFailed as failed:
             report.result = "failed"
             report.failed_step = report.steps[-1]["name"] if report.steps else str(failed)
+        except Exception as error:  # noqa: BLE001 (raised outside any step: still a report)
+            report.result = "failed"
+            report.extra["error"] = f"{type(error).__name__}: {error}"
+        try:
+            connection.close()      # here, so that an error closing the bus is in the report
+        except Exception as error:  # noqa: BLE001 (after the requests: still a report)
+            closing = f"closing the bus: {type(error).__name__}: {error}"
+            earlier = report.extra.get("error")
+            report.result = "failed"
+            report.extra["error"] = f"{earlier}; {closing}" if earlier else closing
     return report
 
 
@@ -253,10 +292,13 @@ def _sequence(client: udsoncan.client.Client, report: Report, data: bytes, size:
                                         + size.to_bytes(4, "big"))),
                      f"31 01 FF 00 44 {address:08X} {size:08X}")
     report.extra["erase_status_record"] = _routine_record(erase)
-    download = run_step(report, "request_download",
-                        lambda: client.request_download(location), "34 00 44 ...")
-    max_length = int(download.service_data.max_length)
-    blocks = plan_blocks(size, max_length)
+
+    def request_download() -> tuple[int, list[tuple[int, int, int]]]:
+        # A maxNumberOfBlockLength that leaves no data (ValueError) fails this step.
+        max_length = int(client.request_download(location).service_data.max_length)
+        return max_length, plan_blocks(size, max_length)
+
+    max_length, blocks = run_step(report, "request_download", request_download, "34 00 44 ...")
     report.extra.update(max_block_length=max_length, block_data=max_length - BLOCK_OVERHEAD,
                         blocks=len(blocks))
 
@@ -323,14 +365,34 @@ def _fail(message: str) -> Callable[[], None]:
     return action
 
 
+class _Parser(argparse.ArgumentParser):
+    """argparse's parser, except that an argument it refuses exits with status 1, the flasher's
+    usage error: argparse's own 2 is the flasher's failed sequence."""
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
+def _address(text: str) -> int:
+    """--address: a number in any base int() reads, of 32 bits (ALFID 0x44)."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not 0 <= value <= 0xFFFFFFFF:
+        raise argparse.ArgumentTypeError(f"{text} is not an address of 32 bits")
+    return value
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m fcn_tools.flasher",
-                                     description="Update the node over the bus (UDS download).")
+    parser = _Parser(prog="python -m fcn_tools.flasher",
+                     description="Update the node over the bus (UDS download).")
     parser.add_argument("image", type=Path, help="image file (python -m fcn_tools.image pack)")
     parser.add_argument("--can", required=True, help="the bus: udp[:<base port>] or "
                                                      "socketcan:<interface>")
     parser.add_argument("--report", type=Path, help="write the JSON report here (default stdout)")
-    parser.add_argument("--address", type=lambda text: int(text, 0),
+    parser.add_argument("--address", type=_address,
                         help="the slot's start address (default: the slot that does not run)")
     parser.add_argument("--no-reset", action="store_true",
                         help="stop after the check routine: no ECUReset")
@@ -340,20 +402,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help=f"how long to wait for the trial after the reset (default "
                              f"{TRIAL_WAIT_S:g})")
     args = parser.parse_args(argv)
-    try:
-        report = flash(args.can, args.image, address=args.address, reset=not args.no_reset,
-                       confirm=not args.no_confirm, trial_wait_s=args.trial_wait_s)
-    except (OSError, ValueError) as error:
-        print(f"fcn_tools.flasher: {error}", file=sys.stderr)
-        return 1
-    text = json.dumps(report.as_json(), indent=1)
-    if args.report is not None:
-        args.report.write_text(text + "\n")
-    else:
-        print(text)
+    with contextlib.ExitStack() as files:
+        out = sys.stdout
+        try:
+            if args.report is not None:
+                # Opened before the first request, so that a report file that cannot be
+                # written is a usage error and not a node updated without its report.
+                out = files.enter_context(args.report.open("w"))
+            report = flash(args.can, args.image, address=args.address, reset=not args.no_reset,
+                           confirm=not args.no_confirm, trial_wait_s=args.trial_wait_s)
+        except (OSError, ValueError, can.CanError) as error:
+            print(f"fcn_tools.flasher: {error}", file=sys.stderr)
+            if out is not sys.stdout:       # the image or the bus: nothing was sent, no report
+                files.close()
+                args.report.unlink(missing_ok=True)
+            return 1
+        out.write(json.dumps(report.as_json(), indent=1) + "\n")
+    # Every record has "ok" and "duration_s" (run_step), whatever ended its step.
     for step in report.steps:
         state = "ok" if step["ok"] else f"FAILED {step.get('nrc_name') or step.get('error')}"
         print(f"{step['name']:24s} {step['duration_s']:10.3f} s  {state}", file=sys.stderr)
+    if "error" in report.extra:
+        print(f"error: {report.extra['error']}", file=sys.stderr)
     print(f"result: {report.result}", file=sys.stderr)
     return 2 if report.result == "failed" else 0
 

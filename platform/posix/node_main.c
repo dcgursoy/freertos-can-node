@@ -93,6 +93,9 @@ static void print_usage(const char *program)
                  "                         default 0) says; the run ends as a power loss (12)\n"
                  "  --flash-hang N         make the N-th flash program or erase of this run hang\n"
                  "                         (1 to %u): its busy flag never clears\n"
+                 "  --confirm-periods N    a trial confirms itself after N healthy health periods\n"
+                 "                         of %u ms in a row, 1 to 4294967295 (default %u, the\n"
+                 "                         product's %u s): a test hook the product does not have\n"
                  "  --tick-mode MODE       locked (default) or stock\n"
                  "  --irq-mode MODE        signal (default) or poll\n"
                  "  --log-file PATH        write the log to PATH instead of stderr\n"
@@ -105,7 +108,9 @@ static void print_usage(const char *program)
                  "(platform/include/platform.h)\n",
                  program, (unsigned int)CAN_UDP_DEFAULT_PORT, (unsigned int)DEFAULT_BITRATE,
                  (unsigned int)POSIX_SENSOR_DEFAULT_SEED, (unsigned int)POSIX_FLASH_CUT_MAX,
-                 (unsigned int)POSIX_FLASH_CUT_MAX, POSIX_EXIT_CAN_TRANSPORT_LOST,
+                 (unsigned int)POSIX_FLASH_CUT_MAX, (unsigned int)APP_HEALTH_PERIOD_MS,
+                 (unsigned int)(UPDATE_CONFIRM_AFTER_S * (1000U / APP_HEALTH_PERIOD_MS)),
+                 (unsigned int)UPDATE_CONFIRM_AFTER_S, POSIX_EXIT_CAN_TRANSPORT_LOST,
                  POSIX_EXIT_SHUTDOWN_TIMEOUT);
 }
 
@@ -167,6 +172,7 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         OPT_FLASH,
         OPT_FLASH_CUT,
         OPT_FLASH_HANG,
+        OPT_CONFIRM_PERIODS,
         OPT_VERSION,
         OPT_HELP
     };
@@ -186,6 +192,7 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         {"flash-file", required_argument, NULL, OPT_FLASH},
         {"flash-cut", required_argument, NULL, OPT_FLASH_CUT},
         {"flash-hang", required_argument, NULL, OPT_FLASH_HANG},
+        {"confirm-periods", required_argument, NULL, OPT_CONFIRM_PERIODS},
         {"version", no_argument, NULL, OPT_VERSION},
         {"help", no_argument, NULL, OPT_HELP},
         {NULL, 0, NULL, 0}};
@@ -296,6 +303,14 @@ static int parse_options(int argc, char **argv, node_options_t *options)
             } else {
                 (void)fprintf(stderr, "invalid --flash-hang: %s (1 to %u)\n", optarg,
                               (unsigned int)POSIX_FLASH_CUT_MAX);
+                result = 2;
+            }
+            break;
+        case OPT_CONFIRM_PERIODS:
+            if (parse_number(optarg, 4294967295UL, &number) && (number != 0UL)) {
+                options->app.confirm_periods = (uint32_t)number;
+            } else {
+                (void)fprintf(stderr, "invalid --confirm-periods: %s (1 to 4294967295)\n", optarg);
                 result = 2;
             }
             break;
@@ -1404,6 +1419,12 @@ int main(int argc, char **argv)
 
     if ((options.can_fault != NULL) && (strcmp(options.can_fault, "none") != 0)) {
         LOG_INF("main", "bus fault %s from the start (--can-fault)", options.can_fault);
+    }
+
+    if (options.app.confirm_periods != 0U) {
+        LOG_INF("main",
+                "a trial confirms itself after %lu healthy health periods (--confirm-periods)",
+                (unsigned long)options.app.confirm_periods);
     }
     app_start(&options.app);
 

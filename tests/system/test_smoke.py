@@ -58,6 +58,8 @@ def test_help_lists_every_option(node_binary):
     (["--sensor-seed", "4294967296"], "invalid --sensor-seed"),
     (["--sensor-seed", "-1"], "invalid --sensor-seed"),
     (["--sensor-seed", "0x10"], "invalid --sensor-seed"),
+    (["--confirm-periods", "0"], "invalid --confirm-periods"),
+    (["--confirm-periods", "4294967296"], "invalid --confirm-periods"),
 ])
 def test_a_bad_command_line_is_a_usage_error(node_binary, args, message):
     out = subprocess.run([str(node_binary), *args], capture_output=True, text=True, timeout=10)

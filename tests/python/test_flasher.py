@@ -3,18 +3,24 @@
 information record, the request timeouts from the part's maximum times, and the programming
 sequence against a fake UDS client that answers as the node's server does (lib/uds/uds.h) or as
 the test makes it answer: the steps in their order, the report, a refusal, a trial that confirmed
-itself before the routine, an answer of the old image while the node resets, and the exit
-statuses of the command line. The node itself is the system tests' (tests/system/test_download.py)."""
+itself before the routine, an answer of the old image while the node resets, answers udsoncan
+finds unexpected or invalid and errors of the bus, each a failed step with its report, an error
+closing the bus after the sequence, also with its report, and the exit statuses of the command
+line. The node itself is the system tests'
+(tests/system/test_download.py)."""
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import can
 import pytest
 import udsoncan
-from udsoncan.exceptions import NegativeResponseException, TimeoutException
+from udsoncan.exceptions import (InvalidResponseException, NegativeResponseException,
+                                 TimeoutException, UnexpectedResponseException)
 
 from fcn_tools import diag, flasher
 from fcn_tools import image as image_format
@@ -281,3 +287,193 @@ def test_the_command_line_writes_the_report_and_says_how_it_went(fake, image_fil
     not_an_image.write_bytes(bytes(1000))
     assert flasher.main(["--can", "udp:1", str(not_an_image)]) == 1
     assert flasher.main(["--can", "udp:1", str(tmp_path / "missing.img")]) == 1
+
+
+def _raising(error: BaseException):
+    def action():
+        raise error
+    return action
+
+
+#: Each request of the sequence (the FakeClient's name of its answer) and the step it is in.
+REQUESTS_AND_STEPS = [("did_FD00", "boot_info"), ("session_1", "default_session"),
+                      ("session_3", "extended_session"), ("session_2", "programming_session"),
+                      ("routine_FF00", "erase"), ("download", "request_download"),
+                      ("transfer_2", "transfer"), ("exit", "transfer_exit"),
+                      ("routine_FF01", "check"), ("reset_1", "ecu_reset"),
+                      ("did_FD00 after the reset", "wait_for_trial"),
+                      ("did_F189", "read_version"), ("routine_F000", "confirm")]
+
+
+def _answer_with(fake: FakeClient, request: str, error: BaseException) -> None:
+    if request == "did_FD00 after the reset":
+        before_the_reset = fake.read_data_by_identifier
+
+        def read(did):
+            if did == diag.DID_BOOT_INFO and fake.reset_done:
+                raise error
+            return before_the_reset(did)
+        fake.read_data_by_identifier = read
+    else:
+        fake.answers[request] = _raising(error)
+
+
+def _failed_run(image_file: Path, tmp_path: Path, capsys) -> tuple[dict, str]:
+    """main() with a report file: status 2; the report and what went to stderr."""
+    path = tmp_path / "report.json"
+    assert flasher.main(["--can", "udp:1", "--report", str(path), str(image_file)]) == 2
+    return json.loads(path.read_text()), capsys.readouterr().err
+
+
+@pytest.mark.parametrize("request_name, step", REQUESTS_AND_STEPS,
+                         ids=[step for _, step in REQUESTS_AND_STEPS])
+def test_an_unexpected_answer_fails_its_step_with_the_report(fake, image_file, tmp_path, capsys,
+                                                             request_name, step):
+    # A valid answer that is not the one to the request, as udsoncan reports it with
+    # exception_on_unexpected_response (fcn_tools.diag); at every request the exception that
+    # client.transfer_data() raises for 76 with the counter of another block.
+    error = UnexpectedResponseException(
+        udsoncan.Response.from_payload(bytes([0x76, 0x03])),
+        "Block sequence number of response (0x03) does not match request block sequence "
+        "number (0x02)")
+    _answer_with(fake, request_name, error)
+    report, err = _failed_run(image_file, tmp_path, capsys)
+    assert report["result"] == "failed" and report["failed_step"] == step
+    record = report["steps"][-1]
+    assert (record["name"], record["ok"]) == (step, False)
+    assert record["error"] == f"unexpected response: {error}"
+    assert "does not match request block sequence number (0x02)" in record["error"]
+    assert all(earlier["ok"] for earlier in report["steps"][:-1])
+    assert f"FAILED unexpected response: {error}" in err and "result: failed" in err
+
+
+def _too_short_routine_answer() -> None:
+    # 71 01 FF: a RoutineControl answer without the second byte of its RID, decoded as udsoncan
+    # decodes it (exception_on_invalid_response raises what this raises).
+    udsoncan.services.RoutineControl.interpret_response(
+        udsoncan.Response.from_payload(bytes([0x71, 0x01, 0xFF])))
+
+
+@pytest.mark.parametrize("request_name, step, error, text", [
+    ("routine_FF01", "check", None, "invalid response: RoutineControl service execution "
+                                    "returned an invalid response"),
+    ("exit", "transfer_exit", OSError(errno.ENETDOWN, "Network is down"),
+     f"OSError: [Errno {errno.ENETDOWN}] Network is down"),
+    # As python-can's SocketCAN bus raises it for a send(2) that fails.
+    ("transfer_2", "transfer", can.CanOperationError("Failed to transmit: No buffer space "
+                                                     "available", errno.ENOBUFS),
+     f"CanOperationError: Failed to transmit: No buffer space available [Error Code "
+     f"{errno.ENOBUFS}]"),
+], ids=["invalid-answer", "oserror", "can-error"])
+def test_an_invalid_answer_or_an_error_of_the_bus_fails_its_step_with_the_report(
+        fake, image_file, tmp_path, capsys, request_name, step, error, text):
+    if error is None:
+        with pytest.raises(InvalidResponseException):        # what udsoncan raises for it
+            _too_short_routine_answer()
+        fake.answers[request_name] = _too_short_routine_answer
+    else:
+        _answer_with(fake, request_name, error)
+    report, err = _failed_run(image_file, tmp_path, capsys)
+    assert report["result"] == "failed" and report["failed_step"] == step
+    record = report["steps"][-1]
+    assert (record["name"], record["ok"]) == (step, False)
+    assert record["error"].startswith(text), record["error"]
+    assert f"FAILED {text}" in err
+
+
+def test_a_block_length_that_leaves_no_data_fails_request_download(fake, image_file, tmp_path,
+                                                                   capsys):
+    fake.answers["download"] = lambda: SimpleNamespace(service_data=SimpleNamespace(max_length=2))
+    report, _ = _failed_run(image_file, tmp_path, capsys)
+    assert report["failed_step"] == "request_download"
+    assert report["steps"][-1]["error"] == "maxNumberOfBlockLength 2 leaves no data"
+    assert not [call for call in fake.calls if call[0].startswith("transfer")]
+
+
+def test_an_error_of_the_flasher_between_two_steps_ends_it_with_the_report(
+        fake, image_file, tmp_path, capsys, monkeypatch):
+    def defect(response):
+        raise RuntimeError("a defect after the erase")
+    monkeypatch.setattr(flasher, "_routine_record", defect)
+    report, err = _failed_run(image_file, tmp_path, capsys)
+    assert report["result"] == "failed" and report["failed_step"] is None
+    assert report["error"] == "RuntimeError: a defect after the erase"
+    assert [step["name"] for step in report["steps"]][-1] == "erase"
+    assert all(step["ok"] for step in report["steps"])
+    assert "error: RuntimeError: a defect after the erase" in err
+
+
+def test_an_error_closing_the_bus_after_the_sequence_ends_it_with_the_report(
+        monkeypatch, image_file, tmp_path, capsys):
+    client = FakeClient()
+
+    @contextlib.contextmanager
+    def connect(spec, **kwargs):
+        yield client
+        # After the last request, as shutting the bus down could fail.
+        raise OSError(errno.EBADF, "Bad file descriptor")
+    monkeypatch.setattr(diag, "connect", connect)
+    monkeypatch.setattr(flasher, "TRIAL_POLL_S", 0.0)
+    report, err = _failed_run(image_file, tmp_path, capsys)
+    text = f"closing the bus: OSError: [Errno {errno.EBADF}] Bad file descriptor"
+    assert report["result"] == "failed" and report["failed_step"] is None
+    assert report["error"] == text
+    assert [step["name"] for step in report["steps"]][-1] == "boot_info_confirmed"
+    assert all(step["ok"] for step in report["steps"])
+    assert report["confirmed_by"] == "routine"
+    assert f"error: {text}" in err
+
+
+def test_an_interrupt_goes_through_and_its_step_still_has_a_complete_record(fake, image_file):
+    report = flasher.Report(can="udp:1", image={})
+    with pytest.raises(KeyboardInterrupt):
+        flasher.run_step(report, "transfer", _raising(KeyboardInterrupt()))
+    assert (report.steps[-1]["name"], report.steps[-1]["ok"]) == ("transfer", False)
+    assert "duration_s" in report.steps[-1]
+    fake.answers["transfer_2"] = _raising(KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        flasher.main(["--can", "udp:1", str(image_file)])
+
+
+@pytest.mark.parametrize("arguments", [
+    [], ["--address", "zz"], ["--address", "0x100000000"], ["--address", "-1"], ["--bogus"],
+    ["--trial-wait-s", "soon"],
+], ids=["no-arguments", "address-not-a-number", "address-too-big", "address-negative",
+        "unknown-option", "wait-not-a-number"])
+def test_an_argument_the_flasher_refuses_is_status_1_before_any_request(fake, image_file,
+                                                                        capsys, arguments):
+    argv = ["--can", "udp:1", *arguments, str(image_file)] if arguments else []
+    with pytest.raises(SystemExit) as stopped:
+        flasher.main(argv)
+    assert stopped.value.code == 1
+    assert fake.calls == []
+    assert "python -m fcn_tools.flasher: error: " in capsys.readouterr().err
+
+
+def test_a_report_file_that_cannot_be_written_is_status_1_before_any_request(fake, image_file,
+                                                                             tmp_path):
+    report = tmp_path / "no such directory" / "report.json"
+    assert flasher.main(["--can", "udp:1", "--report", str(report), str(image_file)]) == 1
+    assert fake.calls == []
+
+
+def test_a_bus_that_cannot_be_opened_is_status_1(monkeypatch, image_file, tmp_path, capsys):
+    @contextlib.contextmanager
+    def cannot_open(spec, **kwargs):
+        # As fcn_tools.udpbus raises it when its socket cannot bind.
+        raise can.CanInitializationError("cannot bind 127.0.0.1:1 for the UDP bus: "
+                                         "Permission denied", errno.EACCES)
+        yield  # a generator, as contextmanager needs
+    monkeypatch.setattr(diag, "connect", cannot_open)
+    report = tmp_path / "report.json"
+    assert flasher.main(["--can", "udp:1", "--report", str(report), str(image_file)]) == 1
+    assert "cannot bind 127.0.0.1:1" in capsys.readouterr().err
+    assert not report.exists()               # opened first, and removed again
+
+
+def test_an_image_that_cannot_be_read_leaves_no_report_file(fake, tmp_path):
+    report = tmp_path / "report.json"
+    report.write_text("a report of an earlier run\n")
+    assert flasher.main(["--can", "udp:1", "--report", str(report),
+                         str(tmp_path / "missing.img")]) == 1
+    assert not report.exists() and fake.calls == []

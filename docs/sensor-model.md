@@ -77,7 +77,7 @@ reports it, as does the node's log line at start-up.
 ## Faults
 
 Faults are applied from outside through [simulation control](can-simulation.md#simulation-control),
-as a test bench works on a real device. The application has no test hooks and cannot tell a
+as a test bench works on a real device. The application has no hook for them and cannot tell a
 fault from real hardware trouble. Channels are named `current`, `cell1` to `cell8` and `temp1`
 to `temp4`; `cell1` is bit 0 of the invalid mask, and the cell signal `Cell1Voltage` on the bus.
 

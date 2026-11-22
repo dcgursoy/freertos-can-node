@@ -17,11 +17,15 @@ N_Bs and N_Cr 1000 ms, up to 4 flow control WAITs accepted in a row, every frame
 padded with 0xCC.
 
 Functional tests: they decide from the frames and the counters. A pause that looks for a frame
-that must not come (diag_bench.QUIET_S) cannot fail a correct node, and most such checks need none:
-the node answers in the order it receives, so an answer that must not come would come before
-the next one the test waits for. The tests that let a timer of the node
-run out wait BEYOND_TIMEOUT_S, twice the timer, before they count on it. Only the separation
-time between the node's consecutive frames is a timing tolerance (marked `timing`).
+that must not come (diag_bench.QUIET_S) finds none from a correct node, and most such checks
+need none: the node answers in the order it receives, so an answer that must not come would come
+before the next one the test waits for. The tests that let a timer of the node run out wait
+BEYOND_TIMEOUT_S, twice the timer, before they count on it. Only the separation time between the
+node's consecutive frames is a timing tolerance (marked `timing`). What the tests need from the
+host is what the protocol asks of any tester: its next frame within the node's timer while the
+node waits for it (N_Bs, N_Cr: 1000 ms). A pause while the node waits for the tester's flow
+control (test_the_node_keeps_to_the_tester_s_flow_control: after a block, after the WAITs and in
+full duplex) leaves the host the timer less the pause, 0.7 s.
 """
 from __future__ import annotations
 

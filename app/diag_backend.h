@@ -8,7 +8,8 @@
  *   uds_backend_t     what it does                                           answers
  *   ecu_reset         accepts hardReset in every session and state: lib/boot  DONE at once
  *                     leaves an unfinished slot WRITING, and the reset comes
- *                     after the response (diag.h, ECURESET)
+ *                     after the response or at its deadline, whichever is
+ *                     first (diag.h, ECURESET)
  *   boot_info         the hand-off and the confirm state, from the node       DONE at once
  *                     (diag_node_t.boot_info)
  *   dtc_snapshot      a copy of the DTCs the health task published after its  DONE at once

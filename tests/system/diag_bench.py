@@ -20,7 +20,11 @@ the node's connection, and the download as a sequence of plain requests.
 Every wait here is a bound, never a timing tolerance: a test decides from what the node
 answered and counted, and a tester that waits longer than a bound has found the node silent.
 Waits that a correct node can never make fail (a frame that must not come, looked for during a
-pause) only make a test less sensitive on a host that stalls, never wrong.
+pause) only make a test less sensitive on a host that stalls. What every exchange needs from the
+host is what the protocol asks of any tester: its next frame within the node's timer while the
+node waits for it (N_Bs and N_Cr, 1000 ms; S3server, 5000 ms, between two requests in a session
+other than the default one); a pause that runs while the node waits for the tester uses up part
+of that timer.
 """
 from __future__ import annotations
 

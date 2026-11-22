@@ -102,20 +102,20 @@ static void test_without_a_trial_nothing_is_confirmed(void)
     const update_health_t good = healthy();
     const plat_boot_handoff_t confirmed = handoff(PLAT_BOOT_CONFIRMED, 0U, PLAT_BOOT_EVENT_NONE);
 
-    TEST_ASSERT_TRUE(update_init(&s_monitor, NULL, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, NULL, PER_SECOND, 0U));
     TEST_ASSERT_FALSE(s_monitor.have_handoff);
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_NOT_NEEDED, s_monitor.state);
     TEST_ASSERT_EQUAL_UINT32(0U, run(&good, 10U * WINDOW));
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_NOT_NEEDED, s_monitor.state);
     TEST_ASSERT_EQUAL_UINT32(0U, update_healthy_seconds(&s_monitor, PER_SECOND));
 
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &confirmed, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &confirmed, PER_SECOND, 0U));
     TEST_ASSERT_TRUE(s_monitor.have_handoff);
     TEST_ASSERT_EQUAL_HEX32(0x01020003U, s_monitor.handoff.image_version);
     TEST_ASSERT_EQUAL_UINT32(0U, run(&good, 10U * WINDOW));
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_NOT_NEEDED, s_monitor.state);
 
-    TEST_ASSERT_FALSE(update_init(NULL, &confirmed, PER_SECOND));
+    TEST_ASSERT_FALSE(update_init(NULL, &confirmed, PER_SECOND, 0U));
 }
 
 /* A trial that stays healthy asks for its confirm exactly once, in the period that completes
@@ -125,7 +125,7 @@ static void test_a_healthy_trial_asks_once_when_the_window_is_full(void)
     const update_health_t good = healthy();
     const plat_boot_handoff_t trial = handoff(PLAT_BOOT_TRIAL, 1U, PLAT_BOOT_EVENT_NONE);
 
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_WAITING, s_monitor.state);
     TEST_ASSERT_EQUAL_UINT32(WINDOW, s_monitor.periods_needed);
 
@@ -160,7 +160,7 @@ static void test_one_acknowledged_frame_a_period_keeps_the_window(void)
     const plat_boot_handoff_t trial = handoff(PLAT_BOOT_TRIAL, 1U, PLAT_BOOT_EVENT_NONE);
     update_health_t failed = good;
 
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
     TEST_ASSERT_EQUAL_UINT32(0U, run(&good, WINDOW / 2U));
     TEST_ASSERT_EQUAL_UINT32(0U, run_acked(&good, 1U, (WINDOW / 2U) - 1U));
     TEST_ASSERT_EQUAL_UINT64(1U, s_monitor.fewest_acked);
@@ -178,7 +178,7 @@ static void test_one_acknowledged_frame_a_period_keeps_the_window(void)
 
     /* After a restart the window's counts start again with it. */
     failed.supervision = WDGM_GLOBAL_STATUS_FAILED;
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
     TEST_ASSERT_EQUAL_UINT32(0U, run_acked(&good, 1U, 3U));
     TEST_ASSERT_EQUAL_UINT32(0U, run(&failed, 1U));
     TEST_ASSERT_EQUAL_UINT64(0U, s_monitor.window_acked);
@@ -198,7 +198,7 @@ static void check_bad_period_restarts(const update_health_t *bad, uint64_t acked
     const plat_boot_handoff_t trial = handoff(PLAT_BOOT_TRIAL, 2U, PLAT_BOOT_EVENT_NONE);
     update_health_t after = healthy();
 
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
     TEST_ASSERT_EQUAL_UINT32(0U, run(&after, WINDOW - 1U));
     TEST_ASSERT_EQUAL_UINT32_MESSAGE(0U, run_acked(bad, acked, 1U), "a bad period");
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_WAITING, s_monitor.state);
@@ -246,7 +246,7 @@ static void test_error_passive_restarts_the_window_and_asks_for_no_confirm(void)
     check_bad_period_restarts(&off, FRAMES_PER_PERIOD);
     check_failed(0U, 1U, 0U, 0U);
 
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
     TEST_ASSERT_EQUAL_UINT32(0U, run(&passive, 10U * WINDOW));
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_WAITING, s_monitor.state);
     TEST_ASSERT_EQUAL_UINT32(0U, s_monitor.healthy_periods);
@@ -286,7 +286,7 @@ static void test_a_trial_that_nobody_acknowledges_never_confirms_itself(void)
     update_health_t lost = good;
 
     lost.can_state = CAN_FC_ERROR_PASSIVE;
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
     TEST_ASSERT_EQUAL_UINT32(0U, run(&good, 10U));
     TEST_ASSERT_EQUAL_UINT32(0U, run_acked(&lost, 0U, 10U * WINDOW));
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_WAITING, s_monitor.state);
@@ -308,7 +308,7 @@ static void test_restarts_count_the_windows_that_were_cut_short(void)
     update_health_t failed = good;
 
     failed.supervision = WDGM_GLOBAL_STATUS_FAILED;
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
     TEST_ASSERT_EQUAL_UINT32(0U, run(&failed, 3U));
     TEST_ASSERT_EQUAL_UINT32(0U, s_monitor.window_restarts);
     TEST_ASSERT_EQUAL_UINT32(0U, run(&good, 7U));
@@ -328,7 +328,7 @@ static void test_the_result_of_the_confirm_decides_its_state(void)
     const update_health_t good = healthy();
     const plat_boot_handoff_t trial = handoff(PLAT_BOOT_TRIAL, 1U, PLAT_BOOT_EVENT_NONE);
 
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
     update_confirm_done(&s_monitor, BOOT_OK); /* nothing asked yet */
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_WAITING, s_monitor.state);
     TEST_ASSERT_EQUAL_UINT32(1U, run(&good, WINDOW));
@@ -339,7 +339,7 @@ static void test_the_result_of_the_confirm_decides_its_state(void)
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_CONFIRMED, s_monitor.state);
 
     for (size_t i = 0U; i < (sizeof(failures) / sizeof(failures[0])); i++) {
-        TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+        TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
         TEST_ASSERT_EQUAL_UINT32(1U, run(&good, WINDOW));
         update_confirm_done(&s_monitor, failures[i]);
         TEST_ASSERT_EQUAL(UPDATE_CONFIRM_FAILED, s_monitor.state);
@@ -396,11 +396,39 @@ static void test_the_window_follows_the_periods_per_second(void)
     const update_health_t good = healthy();
     const plat_boot_handoff_t trial = handoff(PLAT_BOOT_TRIAL, 1U, PLAT_BOOT_EVENT_NONE);
 
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, 0U));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, 0U, 0U));
     TEST_ASSERT_EQUAL_UINT32(UPDATE_CONFIRM_AFTER_S, s_monitor.periods_needed);
     TEST_ASSERT_EQUAL_UINT32(0U, run(&good, UPDATE_CONFIRM_AFTER_S - 1U));
     TEST_ASSERT_EQUAL_UINT32(UPDATE_CONFIRM_AFTER_S - 1U, update_healthy_seconds(&s_monitor, 0U));
     TEST_ASSERT_EQUAL_UINT32(1U, run(&good, 1U));
+}
+
+/* A window given in periods (the host's --confirm-periods, app_config_t) replaces the
+ * product's: the trial asks for its confirm in the period that completes it, not one earlier,
+ * and its healthy seconds count up to the window's; 0 gives the product's window. */
+static void test_a_window_given_in_periods_replaces_the_product_s(void)
+{
+    const update_health_t good = healthy();
+    const plat_boot_handoff_t trial = handoff(PLAT_BOOT_TRIAL, 1U, PLAT_BOOT_EVENT_NONE);
+    const uint32_t longer = (3U * WINDOW) + 7U;
+
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, longer));
+    TEST_ASSERT_EQUAL_UINT32(longer, s_monitor.periods_needed);
+    TEST_ASSERT_EQUAL_UINT32(0U, run(&good, longer - 1U));
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_WAITING, s_monitor.state);
+    TEST_ASSERT_EQUAL_UINT32((longer - 1U) / PER_SECOND,
+                             update_healthy_seconds(&s_monitor, PER_SECOND));
+    TEST_ASSERT_EQUAL_UINT32(1U, run(&good, 1U));
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_CONFIRMING, s_monitor.state);
+    TEST_ASSERT_EQUAL_UINT32(longer, s_monitor.requested_period);
+
+    /* Shorter than the product's as well: one period. */
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 1U));
+    TEST_ASSERT_EQUAL_UINT32(1U, run(&good, 1U));
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_CONFIRMING, s_monitor.state);
+
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
+    TEST_ASSERT_EQUAL_UINT32(WINDOW, s_monitor.periods_needed);
 }
 
 /* The tester's confirm routine confirms the trial from WAITING and CONFIRMING; a confirm of the
@@ -412,7 +440,7 @@ static void test_the_confirm_routine_confirms_a_waiting_or_confirming_trial(void
     const plat_boot_handoff_t confirmed = handoff(PLAT_BOOT_CONFIRMED, 0U, PLAT_BOOT_EVENT_NONE);
 
     /* WAITING: confirmed at once, and the window asks for nothing any more. */
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
     TEST_ASSERT_EQUAL_UINT32(0U, run(&good, 3U));
     update_routine_confirmed(&s_monitor);
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_CONFIRMED, s_monitor.state);
@@ -423,7 +451,7 @@ static void test_the_confirm_routine_confirms_a_waiting_or_confirming_trial(void
 
     /* CONFIRMING: the window asked, the routine came first; the window's late answer (the flash
      * task found the trial confirmed: BOOT_OK, or a failure) changes nothing. */
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
     TEST_ASSERT_EQUAL_UINT32(1U, run(&good, WINDOW));
     update_routine_confirmed(&s_monitor);
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_CONFIRMED, s_monitor.state);
@@ -433,7 +461,7 @@ static void test_the_confirm_routine_confirms_a_waiting_or_confirming_trial(void
     TEST_ASSERT_TRUE(s_monitor.by_routine);
 
     /* Confirmed by its window first: the routine changes nothing (and lib/boot refuses it). */
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
     TEST_ASSERT_EQUAL_UINT32(1U, run(&good, WINDOW));
     update_confirm_done(&s_monitor, BOOT_OK);
     update_routine_confirmed(&s_monitor);
@@ -441,16 +469,16 @@ static void test_the_confirm_routine_confirms_a_waiting_or_confirming_trial(void
     TEST_ASSERT_FALSE(s_monitor.by_routine);
 
     /* FAILED, and no trial at all: unchanged. */
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND, 0U));
     TEST_ASSERT_EQUAL_UINT32(1U, run(&good, WINDOW));
     update_confirm_done(&s_monitor, BOOT_E_FLASH);
     update_routine_confirmed(&s_monitor);
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_FAILED, s_monitor.state);
     TEST_ASSERT_FALSE(s_monitor.by_routine);
-    TEST_ASSERT_TRUE(update_init(&s_monitor, &confirmed, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &confirmed, PER_SECOND, 0U));
     update_routine_confirmed(&s_monitor);
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_NOT_NEEDED, s_monitor.state);
-    TEST_ASSERT_TRUE(update_init(&s_monitor, NULL, PER_SECOND));
+    TEST_ASSERT_TRUE(update_init(&s_monitor, NULL, PER_SECOND, 0U));
     update_routine_confirmed(&s_monitor);
     TEST_ASSERT_EQUAL(UPDATE_CONFIRM_NOT_NEEDED, s_monitor.state);
     TEST_ASSERT_FALSE(s_monitor.by_routine);
@@ -525,6 +553,7 @@ int main(void)
     RUN_TEST(test_which_events_are_a_rollback);
     RUN_TEST(test_the_names_are_those_of_the_dbc);
     RUN_TEST(test_the_window_follows_the_periods_per_second);
+    RUN_TEST(test_a_window_given_in_periods_replaces_the_product_s);
     RUN_TEST(test_the_boot_configuration_is_the_platform_layout);
     return UNITY_END();
 }

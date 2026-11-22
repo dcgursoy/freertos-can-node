@@ -15,26 +15,36 @@ the download is wrong:
     BOOT_E_STATE: the trial's fallback would be overwritten), accepted after the confirm;
   - a tester that falls silent in the middle of a download (S3server) or resets the node in the
     middle of one (ECUReset): the download is abandoned, slot B stays WRITING, which the
-    bootloader never starts, the old image stays active, and the next download succeeds.
+    bootloader never starts, the old image stays active, and the next download succeeds;
+  - a tester that sends ECUReset while it still receives an earlier answer, which it holds with
+    its flow control: the node resets at the ECUReset's deadline, 2 s after the request, and
+    starts again through fcn_boot.
 
-Functional tests: they decide from the node's answers, counters, frames and flash. The one place
-where the host's clock could decide (a trial that confirms itself 5 s after its start, before the
-tester's requests) is decided from the node's confirm state instead and reported as a missed
-timing tolerance.
+Functional tests: they decide from the node's answers, counters, frames and flash. A trial that
+would confirm itself 5 s after its start, before the tester's requests, is taken out of that
+race: it runs with a window longer than the test (--confirm-periods,
+update_bench.TRIAL_WINDOW_PERIODS), so that only the tester's routine confirms it. When the
+reset behind a held answer comes, which depends on how the host times the tester's flow
+control, is checked by a test of its own, marked timing.
 """
 from __future__ import annotations
 
+import itertools
 import time
+from dataclasses import dataclass
 
-from diag_bench import (BEYOND_S3_S, SLOT_A, SLOT_B, Uds, check_counts, download, erase_request,
-                        hexbytes, run_flasher, show, start_ready, steps_of, wait_until)
+import pytest
+
+from diag_bench import (BEYOND_S3_S, NODE_TIMEOUT_S, SLOT_A, SLOT_B, RawLink, Uds, check_counts,
+                        download, erase_request, flow_control, hexbytes, run_flasher, show,
+                        single_frame, start_ready, steps_of, wait_until)
 from fcn_tools import diag
 from fcn_tools.bus import BusReader, is_status, open_bus, wait_for
-from fcn_tools.node import EXIT_OK, RESET_IMAGE_FAULT, RESET_REQUESTED
+from fcn_tools.node import Board, EXIT_OK, NodeProcess, RESET_IMAGE_FAULT, RESET_REQUESTED
 from fcn_tools.timing import check_timing
-from update_bench import (MAX_ATTEMPTS, ROLLBACK_BIT, RUN_WAIT_S, Boot, check_frames_of,
-                          check_handoff, check_invariants, decoded, factory, info, listen, stage,
-                          states)
+from update_bench import (MAX_ATTEMPTS, NO_SELF_CONFIRM, ROLLBACK_BIT, RUN_WAIT_S,
+                          TRIAL_WINDOW_PERIODS, Boot, check_frames_of, check_handoff,
+                          check_invariants, decoded, factory, info, listen, stage, states)
 
 #: UPDATE_ROLLBACK's DTC (app/fault.h) and BMS_Fault's bit for it.
 ROLLBACK_DTC = 0x1B0600
@@ -175,15 +185,16 @@ def test_a_download_is_refused_while_a_trial_runs_and_accepted_after_its_confirm
     """A trial staged with the flash tool runs, started by fcn_boot as attempt 1. An eraseMemory
     of either slot is refused with conditionsNotCorrect: slot B is the trial that runs, slot A
     its fallback. After the tester's confirm routine the trial is the confirmed image, and a
-    download into slot A, which then holds the image before it, succeeds. Whether the trial was
-    still waiting for its confirm when the erases came is read from the node (DID 0xFD00): the
-    trial confirms itself after 5 s of good health, and a tester the host held up that long is
-    a missed timing tolerance."""
+    download into slot A, which then holds the image before it, succeeds. The trial runs with a
+    window longer than the test (--confirm-periods, TRIAL_WINDOW_PERIODS): it is still waiting
+    for its confirm when the erases come, however late they come, and only the routine
+    confirms it."""
     flash = workdir / "flash.bin"
     factory(flash, images["node-1.0.0"])
     stage(flash, images["node-1.1.0"])
     spec = f"udp:{ports.bus}"
-    node = start_ready(start_node, spec, flash_file=flash, retained_file=workdir / "cell.bin")
+    node = start_ready(start_node, spec, *NO_SELF_CONFIRM, flash_file=flash,
+                       retained_file=workdir / "cell.bin")
     data = images["data"].read_bytes()
     with Uds(spec) as uds:
         before = boot_info(uds)
@@ -192,11 +203,8 @@ def test_a_download_is_refused_while_a_trial_runs_and_accepted_after_its_confirm
         refused = [uds.request(erase_request(address, len(data))).response
                    for address in (SLOT_B, SLOT_A)]
         assert uds.request("10 01").positive and uds.request("10 03").positive
-        waiting = boot_info(uds).confirm_state == "WAITING"
+        assert boot_info(uds).confirm_state == "WAITING"
         confirmed = uds.request("31 01 F0 00").response
-        if not waiting:
-            check_timing(False, "the trial had confirmed itself before the tester's erases: "
-                                f"{[show(answer) for answer in refused]}")
         assert refused == [hexbytes("7F 31 22")] * 2, [show(answer) for answer in refused]
         assert confirmed == hexbytes("71 01 F0 00 00 00"), show(confirmed)
         after = boot_info(uds)
@@ -205,6 +213,7 @@ def test_a_download_is_refused_while_a_trial_runs_and_accepted_after_its_confirm
     assert node.stop() == EXIT_OK
     stats = node.stats()
     check_counts(stats, uds)
+    assert stats["confirm"]["periods_needed"] == TRIAL_WINDOW_PERIODS
     assert stats["confirm"]["flash_task"]["confirmed_by_routine"] is True
     assert stats["diag"]["backend"]["jobs"]["erase"]["posted"] == 3
     flash_info = info(flash)
@@ -298,3 +307,140 @@ def test_an_ecu_reset_in_the_middle_of_a_download_leaves_the_old_image_and_the_n
     flash_info = info(flash)
     check_invariants(flash_info)
     assert states(flash_info) == ("confirmed", "trial")
+
+
+# -------------------------------------------------------- an ECUReset behind a held answer
+
+
+#: The tester's flow control while it holds the node's answer to 19 0A in the two tests below:
+#: two WAITs, then a CTS for one consecutive frame (BS 1, STmin 0), over and over, one every
+#: HOLD_STEP_S after the one before. Each comes within the node's N_Bs (NODE_TIMEOUT_S) of the one
+#: before, with the difference as the host's margin, and never more than two WAITs in a row, fewer
+#: than the node accepts (app/diag.h, DIAG_TX_WFT_MAX): the node keeps sending the answer for as
+#: long as the tester holds it.
+HOLD_PATTERN = (flow_control(status=1), flow_control(status=1), flow_control(block_size=1))
+HOLD_STEP_S = 0.4
+
+#: How long the tester holds the answer at most: a bound only. With the node's deadline the run
+#: ends about RESET_DEADLINE_S after the request; without it, only once the whole answer is sent.
+HOLD_LIMIT_S = 30.0
+
+#: The node's deadline for an accepted ECUReset (app/diag.h, DIAG_RESET_DEADLINE_US, 2 x N_As),
+#: and the host's margin on it in the timing test: the deadline starts when the diagnostic task
+#: takes the request, after the tester sent it, and the run's end is seen when the test notices it.
+RESET_DEADLINE_S = 2 * NODE_TIMEOUT_S
+RESET_MARGIN_S = 0.5
+
+
+@dataclass
+class HeldReset:
+    """What reset_behind_a_held_answer() saw."""
+    first: NodeProcess    # the run that got 11 01
+    request_at: float     # when the tester sent 11 01 (time.monotonic())
+    ended_at: float       # when the test saw that run end
+    frames: list[bytes]   # the node's frames after the first frame of its answer to 19 0A
+    answer_cfs: int       # the consecutive frames of that whole answer, by its first frame
+    ctses: int            # the CTSes the tester sent
+
+
+def wait_for_status_frame(spec: str) -> None:
+    """Wait for a status frame of the run that runs now, on a bus opened after its start."""
+    reader = open_bus(spec)
+    try:
+        assert wait_for(reader, is_status, timeout=10.0) is not None
+    finally:
+        reader.shutdown()
+
+
+def reset_behind_a_held_answer(board: Board, spec: str) -> HeldReset:
+    """The tester of the two tests below: 19 0A, whose answer needs a first frame and several
+    consecutive frames; at its first frame, 11 01 at once, without waiting for the rest; then
+    that answer held with HOLD_PATTERN until the run ends (HOLD_LIMIT_S, a bound). Checks what
+    holds however the host ran: the run ends with the requested reset, after its log line; the
+    node's frames after the first frame are consecutive frames of the answer in their order,
+    no more than the CTSes asked for, and then at most the 51 01, as the last frame."""
+    first = board.runs[0]
+    wait_for_status_frame(spec)
+    with RawLink(spec) as link:
+        link.send(single_frame(hexbytes("19 0A")))
+        ff = link.next()
+        assert ff[0] >> 4 == 1, show(ff)
+        board.expect_resets(1)
+        link.send(single_frame(hexbytes("11 01")))
+        request_at = time.monotonic()
+        sent = ctses = 0
+        due = request_at + HOLD_STEP_S
+        while first.running:
+            now = time.monotonic()
+            assert now - request_at < HOLD_LIMIT_S, f"no reset {HOLD_LIMIT_S} s after 11 01"
+            if now >= due:
+                flow = HOLD_PATTERN[sent % len(HOLD_PATTERN)]
+                link.send(flow)
+                sent += 1
+                ctses += flow[0] == 0x30
+                due = time.monotonic() + HOLD_STEP_S
+            time.sleep(0.002)
+        ended_at = time.monotonic()
+        frames = link.quiet()
+    assert first.wait(timeout=RUN_WAIT_S) == RESET_REQUESTED
+    assert "ECUReset: resetting (requested by the tester)" in first.log()
+    answer_cfs = -(-((((ff[0] & 0x0F) << 8) | ff[1]) - 6) // 7)
+    assert 2 < answer_cfs < 16, show(ff)
+    cfs = list(itertools.takewhile(lambda frame: frame[0] >> 4 == 2, frames))
+    shown = [show(frame) for frame in frames]
+    assert [frame[0] & 0x0F for frame in cfs] == list(range(1, len(cfs) + 1)), shown
+    assert len(cfs) <= min(ctses, answer_cfs), (ctses, shown)
+    assert frames[len(cfs):] in ([], [hexbytes("02 51 01 CC CC CC CC CC")]), shown
+    print(f"the run ended {ended_at - request_at:.3f} s after 11 01, after {sent} flow controls "
+          f"({ctses} CTS); the node's frames after the first: {shown}")
+    return HeldReset(first, request_at, ended_at, frames, answer_cfs, ctses)
+
+
+def test_an_ecu_reset_behind_an_answer_the_tester_holds_resets_and_the_node_starts_again(
+        start_board, images, workdir, ports):
+    """A tester that sends ECUReset (11 01) while it still receives the answer to its request
+    before (19 0A), and holds that answer with its flow control, WAITs and blocks of one
+    consecutive frame, as long as it likes. The node resets at the ECUReset's deadline (app/diag.h,
+    ECURESET) and starts again through fcn_boot, with the image of slot A, after a requested
+    reset. Functional: the order of the node's frames, the reset and the next start, which hold
+    however the host ran (a host that holds up a flow control beyond N_Bs ends the answer early,
+    and the 51 01 then goes out before the reset); that the reset came at its deadline, before
+    the end of the answer, is the timing test's after this one."""
+    flash, cell = workdir / "flash.bin", workdir / "cell.bin"
+    factory(flash, images["node-1.0.0"])
+    spec = f"udp:{ports.bus}"
+    board = start_board(flash_file=flash, retained_file=cell, can=spec)
+    reset_behind_a_held_answer(board, spec)
+    second = board.wait_for_run(2, timeout=RUN_WAIT_S)
+    wait_for_status_frame(spec)
+    with Uds(spec) as uds:
+        boot = boot_info(uds)
+        assert (boot.slot, boot.mode, boot.attempt, boot.event) == ("A", "confirmed", 0, 0), boot
+    assert board.stop() == EXIT_OK
+    stats = second.stats()
+    assert stats["reset"]["cause"] == "REQUESTED"
+    assert (stats["handoff"]["slot"], stats["handoff"]["mode"]) == ("A", "confirmed")
+
+
+@pytest.mark.timing
+def test_an_ecu_reset_behind_an_answer_the_tester_holds_comes_at_its_deadline(
+        start_board, images, workdir, ports):
+    """The tester of the test before, timed: the run ends with the requested reset within
+    RESET_DEADLINE_S (2 x N_As) and RESET_MARGIN_S of the request, with the held answer cut and
+    no 51 01, however much longer the tester would have held the answer. Timing: the host's
+    clock times the tester's flow control and the reset."""
+    flash, cell = workdir / "flash.bin", workdir / "cell.bin"
+    factory(flash, images["node-1.0.0"])
+    spec = f"udp:{ports.bus}"
+    board = start_board(flash_file=flash, retained_file=cell, can=spec)
+    held = reset_behind_a_held_answer(board, spec)
+    board.wait_for_run(2, timeout=RUN_WAIT_S)
+    assert board.stop() == EXIT_OK
+    took = held.ended_at - held.request_at
+    check_timing(took <= RESET_DEADLINE_S + RESET_MARGIN_S,
+                 f"the reset {took:.3f} s after 11 01, not within {RESET_DEADLINE_S} s + "
+                 f"{RESET_MARGIN_S} s")
+    shown = [show(frame) for frame in held.frames]
+    check_timing(len(held.frames) < held.answer_cfs
+                 and hexbytes("02 51 01 CC CC CC CC CC") not in held.frames,
+                 f"the answer was not held until the reset: {shown}")

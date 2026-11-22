@@ -151,15 +151,19 @@ offer more than the bus can carry, the model's queue of their frames (64 frames,
 of [can_ctrl.h](../lib/can/can_ctrl.h)) overflows and drops frames whatever their priority
 (`can.controller.wire_overruns`): a tester's UDS_Request frames (0x7E0) are lost with those of a
 flood of lower priority, where on a real bus they would win the arbitration. Phase 5's flood test
-therefore stays at 0.4 of the bus's capacity ([diagnostics.md](diagnostics.md)). CAN FD is not
-supported.
+therefore stays at 0.4 of the bus's capacity. Even there the queue has little room, since the
+flood and the tester keep the bus close to full, and the frames read in one pass of the node
+share one time stamp: a host that holds up the node's reads of the bus by 30 ms bunched enough
+of them to overflow it, while 25 ms did not (the measurement, with the command, is in
+[diagnostics.md](diagnostics.md)). So that test is marked `timing`: a wire overrun makes its
+run a missed timing tolerance. CAN FD is not supported.
 
 ## Simulation control
 
 On a real bench, faults are applied to the hardware around the device under test, not through
 its firmware. The same holds here: the simulated hardware has a control channel of its own, a
 UDP port on the loopback interface (`--sim-port`, off by default), and the application has no
-test hooks and never sees these commands.
+hook for these faults and never sees these commands.
 
 One request per datagram, one reply to the sender, ASCII:
 

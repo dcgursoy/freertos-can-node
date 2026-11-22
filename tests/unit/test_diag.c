@@ -9,7 +9,9 @@
  * and its response out; a response produced while another is in transmission waits for it, and
  * one that finds both buffers in use is dropped; the confirmations: passed for the oldest frame,
  * dropped at and after its N_As, records of frames never reported forgotten, reports for no frame
- * dropped; the ECUReset due after its response's transmission ended, or at once; a frame the
+ * dropped; the ECUReset due after its response's transmission ended, or at once, or at its
+ * deadline behind an earlier response the tester's flow control holds, and never before its
+ * response for a tester that waits for each response; a frame the
  * transmit path refuses; and the backend: a flash job posted and answered when it is done, a job
  * the flash task does not take, the clear that waits for the health task, the boot information
  * and a missing DTC snapshot.
@@ -518,6 +520,86 @@ static void test_an_ecureset_without_a_response_is_due_at_once_or_at_n_as(void)
     TEST_ASSERT_EQUAL_UINT32(0U, s_out_count);
 }
 
+/* A tester that waits for each response gets its 51 01 before the reset, on a bus that is slow
+ * but carries every frame within N_As. Nothing ahead: the 51 01 confirmed 1 us before its N_As
+ * runs out, the reset due then and not before. Behind the last frame of the previous response,
+ * which the tester has received but whose confirmation comes 1 us before its N_As: the 51 01
+ * goes out after it and is confirmed 1 us before its own N_As, nearly 2 x N_As after that frame's
+ * hand-out, and the reset is due then, not before: its deadline, 2 x N_As after the request,
+ * comes later. */
+static void test_an_ecureset_of_a_tester_that_waits_is_due_only_after_its_response(void)
+{
+    static const uint8_t ok[8] = {0x02, 0x51, 0x01, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
+    uint64_t handed_out = s_now;
+
+    request_sf((const uint8_t[]){0x11, 0x01}, 2U);
+    expect_frame(0U, ok);
+    TEST_ASSERT_EQUAL_UINT64(handed_out + DIAG_TIMEOUT_US, diag_next_deadline(&s_diag));
+    s_now = handed_out + DIAG_TIMEOUT_US - 1U;
+    diag_poll(&s_diag, s_now);
+    TEST_ASSERT_FALSE(diag_reset_due(&s_diag));
+    report(0U);
+    TEST_ASSERT_TRUE(diag_reset_due(&s_diag));
+    TEST_ASSERT_EQUAL_UINT32(1U, diag_stats(&s_diag)->responses_sent);
+
+    setUp();
+    handed_out = s_now;
+    request_sf((const uint8_t[]){0x3E, 0x00}, 2U); /* 7E 00, which the tester receives */
+    s_now = handed_out + MS;
+    request_sf((const uint8_t[]){0x11, 0x01}, 2U); /* before the node has the confirmation */
+    TEST_ASSERT_EQUAL_UINT32(1U, s_out_count);
+    s_now = handed_out + DIAG_TIMEOUT_US - 1U;
+    report(0U);
+    TEST_ASSERT_EQUAL_UINT32(2U, s_out_count);
+    expect_frame(1U, ok);
+    s_now += DIAG_TIMEOUT_US - 1U;
+    diag_poll(&s_diag, s_now);
+    TEST_ASSERT_FALSE_MESSAGE(diag_reset_due(&s_diag), "the 51 01 is not confirmed yet");
+    report(1U);
+    TEST_ASSERT_TRUE(diag_reset_due(&s_diag));
+    TEST_ASSERT_EQUAL_UINT32(2U, diag_stats(&s_diag)->responses_sent);
+    TEST_ASSERT_EQUAL_UINT32(0U, diag_stats(&s_diag)->responses_failed);
+}
+
+/* ECUReset from a tester that did not wait for the response before, which it holds with its flow
+ * control (FC WAIT, each within N_Bs): the 51 01 waits in the second buffer, and the reset is due
+ * at its deadline, 2 x N_As after the request, not 1 us before, with the earlier response cut
+ * after its first frame and the 51 01 never handed out. Once the earliest, the deadline is the
+ * connection's next one. */
+static void test_an_ecureset_behind_a_held_response_is_due_at_its_deadline(void)
+{
+    static const uint8_t wait[8] = {0x31, 0x00, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
+    const diag_stats_t *stats = diag_stats(&s_diag);
+    uint64_t requested;
+
+    request_sf((const uint8_t[]){0x22, 0xFD, 0x00}, 3U); /* 15 bytes: a first frame first */
+    TEST_ASSERT_EQUAL_UINT32(1U, s_out_count);
+    report(0U);
+    s_now += MS;
+    requested = s_now;
+    request_sf((const uint8_t[]){0x11, 0x01}, 2U);
+    TEST_ASSERT_EQUAL_UINT32(1U, s_out_count);
+    TEST_ASSERT_EQUAL_UINT32(1U, stats->resets);
+
+    /* Two WAITs 900 ms apart; after the second, N_Bs runs to 2.8 s after the request. */
+    for (uint64_t i = 1U; i <= 2U; i++) {
+        s_now = requested + (i * 900U * MS);
+        deliver(wait, 8U);
+        TEST_ASSERT_FALSE(diag_reset_due(&s_diag));
+    }
+
+    TEST_ASSERT_EQUAL_UINT64(requested + DIAG_RESET_DEADLINE_US, diag_next_deadline(&s_diag));
+    diag_poll(&s_diag, requested + DIAG_RESET_DEADLINE_US - 1U);
+    TEST_ASSERT_FALSE(diag_reset_due(&s_diag));
+    diag_poll(&s_diag, requested + DIAG_RESET_DEADLINE_US);
+    TEST_ASSERT_TRUE(diag_reset_due(&s_diag));
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(1U, s_out_count, "the 51 01 was never handed out");
+    TEST_ASSERT_EQUAL_UINT32(2U, diag_isotp_stats(&s_diag)->frames_in[ISOTP_FRAME_FC_WAIT]);
+    TEST_ASSERT_EQUAL_UINT32(2U, stats->responses);
+    TEST_ASSERT_EQUAL_UINT32(0U, stats->responses_sent + stats->responses_failed +
+                                     stats->responses_dropped);
+}
+
 /* A frame the transmit path refuses ends the response with N_ERROR at once. */
 static void test_a_frame_the_transmit_path_refuses_ends_the_response(void)
 {
@@ -752,6 +834,8 @@ int main(void)
     RUN_TEST(test_a_full_record_drops_its_oldest_entry);
     RUN_TEST(test_an_ecureset_is_due_after_its_response);
     RUN_TEST(test_an_ecureset_without_a_response_is_due_at_once_or_at_n_as);
+    RUN_TEST(test_an_ecureset_of_a_tester_that_waits_is_due_only_after_its_response);
+    RUN_TEST(test_an_ecureset_behind_a_held_response_is_due_at_its_deadline);
     RUN_TEST(test_a_frame_the_transmit_path_refuses_ends_the_response);
     RUN_TEST(test_the_backend_answers_a_job_it_could_not_post_and_a_refused_one);
     RUN_TEST(test_the_clear_waits_until_the_health_task_has_made_it);

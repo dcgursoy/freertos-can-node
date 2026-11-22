@@ -201,9 +201,9 @@ stripped build:
 | Build | Unstripped | Stripped | Stripped fits a slot after the 256-byte header (1,048,320 bytes) |
 |---|---|---|---|
 | release (RelWithDebInfo, `-O2 -g`), phase 4 | 1,011,792 | 186,768 | yes |
-| release, phase 5 | 1,314,120 | 240,016 | yes, with 808,304 bytes to spare |
-| debug, phase 5 | 813,728 | 326,032 | yes |
-| asan, phase 5 | 3,533,792 | 2,170,688 | no |
+| release, phase 5 | 1,319,752 | 244,112 | yes, with 804,208 bytes to spare |
+| debug, phase 5 | 814,736 | 326,032 | yes |
+| asan, phase 5 | 3,537,232 | 2,172,064 | no |
 
 (`stat -c %s $FCN_BUILD_ROOT/<preset>/bin/fcn_node` and `strip -o`: the phase 4 figures as that
 phase measured them, the phase 5 ones on the build of 2026-11-22.)
@@ -1050,6 +1050,13 @@ The flash task reads the metadata once and logs
   after their fault has gone. Any other period starts the window again
   (`confirm.window_restarts`), and each condition a period failed is counted
   (`unsupervised_periods`, `not_active_periods`, `bus_off_periods`, `unacked_periods`).
+- **A test hook the product does not have.** `--confirm-periods N` on the host node's command
+  line makes the window N healthy periods instead of 50 (`confirm.periods_needed` reports the
+  window of the run; the log says `a trial confirms itself after N healthy health periods
+  (--confirm-periods)`). Phase 5's tests that leave the confirm to the tester's routine give the
+  trial a window of 36,000 periods, an hour (`update_bench.TRIAL_WINDOW_PERIODS`), so that it
+  cannot confirm itself before the routine: every wait of those tests ends long before. Every
+  other test runs with the product's window.
 - **Why 5 s, and why these conditions** (update.h, WHY 5 SECONDS). The watchdog manager finds a
   task that stops within 300 to 400 ms and the hardware watchdog resets the node 500 ms after its
   last kick, so an image that hangs or crashes in its first seconds is reset well inside the
@@ -1240,7 +1247,8 @@ tests decide from what the node itself reports, never from the host's clock, and
 far the test process has got while the node runs: a node the test acts on meanwhile runs until
 the test stops it, and where the outcome depends on whether the test acted in time (a cut armed at
 run time, below, or a bus lost at run time) the test is marked `timing`; a fault that must not
-race the node is put in from its start (`--flash-cut`, `--can-fault`).
+race the node is put in from its start (`--flash-cut`, `--can-fault`), and so is a trial window
+that must not race the tester's confirm routine (`--confirm-periods`, above).
 
 | Test file | What it shows |
 |---|---|
@@ -1332,7 +1340,7 @@ The slot writer's calls are the services' work, each a job of the flash task
 | TransferData 0x36, blocks of 1024 bytes | `boot_writer_write()` with the block's data at the offset the blocks so far add up to; a repeated block is answered and not written | a refusal ends the download: BOOT_E_SEQUENCE 0x24 requestSequenceError, BOOT_E_FLASH or BOOT_E_POWER_LOST 0x72 generalProgrammingFailure (the whole mapping: [diagnostics.md](diagnostics.md)) |
 | RequestTransferExit 0x37 | the first `boot_writer_finish_step()`: the last partial page, the start of the validation | as for TransferData |
 | RoutineControl 0xFF01 checkProgrammingDependencies | `boot_writer_finish_step()` until BOOT_OK: the validation (lib/bootimg, one 64-byte step per call) and the COMMIT record: the slot is TRIAL | an image that does not validate (BOOT_E_INVALID): 0x72, the slot stays WRITING |
-| ECUReset 0x11 | none: the node resets after its positive response, and the bootloader boots the committed trial as attempt 1 | |
+| ECUReset 0x11 | none: the node resets after its positive response, or at its deadline 2 s after the request if an earlier response still being sent holds that up ([diagnostics.md](diagnostics.md)), and the bootloader boots the committed trial as attempt 1 | |
 | RoutineControl 0xF000, the confirm routine (extended session) | `boot_confirm()` of the running trial | no trial to confirm (BOOT_E_STATE): 0x22 |
 
 - **Timing.** The calls run in the flash task, the lowest-priority task, so a sector erase (45 ms

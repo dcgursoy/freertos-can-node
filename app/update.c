@@ -10,7 +10,7 @@ _Static_assert(PLAT_HANDOFF_MAX_ATTEMPT == BOOT_MAX_ATTEMPTS, "three attempts fo
 _Static_assert(UPDATE_CONFIRM_AFTER_S > 0U, "a trial runs before it confirms itself");
 
 bool update_init(update_monitor_t *m, const plat_boot_handoff_t *handoff,
-                 uint32_t periods_per_second)
+                 uint32_t periods_per_second, uint32_t window_periods)
 {
     const bool ok = (m != NULL);
 
@@ -18,7 +18,8 @@ bool update_init(update_monitor_t *m, const plat_boot_handoff_t *handoff,
         const uint32_t per_second = (periods_per_second == 0U) ? 1U : periods_per_second;
 
         (void)memset(m, 0, sizeof(*m));
-        m->periods_needed = UPDATE_CONFIRM_AFTER_S * per_second;
+        m->periods_needed =
+            (window_periods != 0U) ? window_periods : (UPDATE_CONFIRM_AFTER_S * per_second);
         m->confirm_status = BOOT_OK;
         m->state = UPDATE_CONFIRM_NOT_NEEDED;
 

@@ -229,13 +229,30 @@ controls, at least 79 ticks.
 - **Tested under load:** `test_no_frame_is_lost_in_the_node_under_a_flood_of_lower_priority_frames`
   ([test_download.py](../tests/system/test_download.py)) floods the bus with 8-byte frames of
   0x7F0 at 0.4 of the bus's capacity during a whole download, on top of the node's full telemetry;
-  in the run of the measurement below, 39,636 flood frames went out, and every one of the
-  tester's frames reached lib/isotp.
+  in one run of `pytest tests/system/test_download.py -k flood -s` against the release build,
+  40,334 flood frames went out, and every one of the tester's frames reached lib/isotp.
 - **The bus model's limit.** The bus model keeps other nodes' frames in the order the transport
   delivers them, not in their priority ([can-simulation.md](can-simulation.md)), so a flood above
   the bus's capacity makes it drop the tester's frames with the flood's (`wire_overruns`), where a
   real bus would let the higher-priority 0x7E0 frames win the arbitration. That is a limit of
   the model, not of the node, and why the flood test stays at 0.4 of the capacity.
+- **What the flood test needs from the host.** At 0.4 the flood and the tester's frames (about
+  1.7 per ms of the 3.7 the bus carries) keep the bus close to full, so the model's queue of the
+  other nodes' frames (64 frames, `CAN_CTRL_WIRE_QUEUE`) has little room to spare, and the host
+  transport stamps every frame of one read pass with the same time: a host that holds up the
+  node's reads of its bus bunches the flood and a block of the tester into one pass, and a
+  frame of the tester can be dropped with the flood's. Measured with a stall planted in the
+  node's CAN thread of a scratch copy, every 2 s from the fourth second, about ten stalls in a
+  download (`pytest tests/system/test_download.py -k flood`, release build, the UDP bus): stalls
+  of 10 ms (1 run), 20 ms (3 runs) and 25 ms (3 runs) left every frame; stalls of 30 ms dropped
+  3, 5 and 6 frames in 3 runs, stalls of 40 ms 23 and of 60 ms 59 (1 run each), and each of
+  those downloads failed. So the test needs the node's reads of the bus to come no more than
+  about 25 ms apart for the whole download. The node counts what the model dropped, and the
+  test is marked `timing`: with a wire overrun the run is a missed timing tolerance
+  (`check_timing`), with none every count is asserted. The flood itself never bursts:
+  `update_bench.Flood` gives up the frames a delay of its thread cost it (a planted 80 ms stall
+  of that thread then dropped none; when it still made them up in a burst, as the flood of the
+  test did before, the same stall dropped 74 and failed the download).
 
 ### The flash jobs and their supervision
 
@@ -282,6 +299,12 @@ CONFIRM record:
 - DID 0xFD00's confirm state is CONFIRMED as soon as the flash task has confirmed, before the
   health task's next period. The routine also proves what the 5 s window cannot: that the trial
   receives.
+- **In the tests.** Which of the two comes first is a race between the tester and the trial's
+  window. A test that checks the routine's way gives the trial a window of an hour with the host
+  node's `--confirm-periods 36000`, a test hook the product does not have
+  ([update.md](update.md), the confirm), so that only the routine can confirm it;
+  `test_a_trial_no_tester_confirms_confirms_itself_and_the_routine_then_finds_none` checks the
+  self-confirm first, with the product's window.
 
 ### The DTC services and the reset
 
@@ -295,9 +318,20 @@ CONFIRM record:
   positive response waits until the count carried out has reached the request's. Log line:
   `DTCs cleared: ClearDiagnosticInformation (clear <n>)`.
 - **ECUReset.** The diagnostic task makes the reset once the transmission of the positive
-  response has ended, N_OK or not (lib/isotp ends every transmission within N_As of its frame,
-  and a response waits behind at most one, so at most 2 s after the request); with the SPRMIB at
-  once. The reset is `plat_reset(PLAT_RESET_REQUESTED)`: exit status 10 on the host, after the
+  response has ended, N_OK or not, or 2 s (2 x N_As) after it took the request if that comes
+  first; with the SPRMIB at once. ISO 14229-1 asks for the positive response before the reset
+  and sets no time for a hardReset. The deadline is the node's: a response that waits behind
+  another waits for the whole of that transmission, whose length the tester's flow control sets
+  (up to four WAITs per block, blocks of one frame, STmin), and a reset the tester asked for is
+  not to be held off by the tester's own flow control. For a tester that waits for each
+  response the deadline never comes first, and the reset waits for its `51 01`: ahead of it
+  there is at most the last frame of the previous response, which the tester has received, so
+  that transmission ends within N_As of the request, and the `51 01` within N_As of its
+  hand-out. A tester that sends `11 01` while it still receives an earlier response may get the
+  reset with that response cut and no `51 01`
+  ([test_download_faults.py](../tests/system/test_download_faults.py) holds one with WAITs and
+  blocks of one frame), or, if the earlier one ends just before the deadline, with its `51 01`
+  cut. The reset is `plat_reset(PLAT_RESET_REQUESTED)`: exit status 10 on the host, after the
   log line `W app: ECUReset: resetting (requested by the tester)`. A run that ends in a reset
   writes no statistics.
 
@@ -574,23 +608,34 @@ times: eraseMemory sectors × 400 ms + 409 ms + 10 s, the check (size / 64 + 8) 
 B 0x00102000. `<size>` is the image's size, header included. `--no-reset` stops after the check
 (the trial is committed, the node keeps running the old image), `--no-confirm` after
 read_version. On stderr each step prints `<name> <duration> s ok|FAILED <nrc name|error>`, then
-`result: <result>`. The report (schema `fcn.flash_report/1`) has the tool and package versions,
-the bus, the image (path, size, version, target, SHA-256), the slot, address,
-maxNumberOfBlockLength and data per block, the boot information before, of the trial and after,
-the routines' status records, who confirmed (`routine` or `node`), the transfer's bytes, blocks,
-duration and throughput, every step (name, request, start, duration, ok, and the NRC or the
-error), the time of every block, and `result` (`confirmed`, `committed`, `trial` or `failed`)
-with the failed step. Exit status: 0, 1 (a usage error, no image), or 2 (a step failed).
+`error: <error>` if the flasher stopped between two steps or could not close the bus after
+them, and `result: <result>`. The report
+(schema `fcn.flash_report/1`) has the tool and package versions, the bus, the image (path, size,
+version, target, SHA-256), the slot, address, maxNumberOfBlockLength and data per block, the
+boot information before, of the trial and after, the routines' status records, who confirmed
+(`routine` or `node`), the transfer's bytes, blocks, duration and throughput, every step (name,
+request, start, duration, ok, and the NRC or the error: `timeout: ...`, `unexpected response:
+...` or `invalid response: ...` for an answer udsoncan rejects, the type and text of an
+exception of python-can or an OSError), the time of every block, and `result` (`confirmed`,
+`committed`, `trial` or `failed`) with the failed step, or, after an error of the flasher between
+two steps, no failed step and `error` (`error` also gives an error closing the bus after the
+sequence, which fails the run as well). Exit status: 0; 1 when the flasher cannot start, before
+its first request and without a report: an argument it refuses (not argparse's own 2), a report
+file it cannot write, an image it cannot read or that is no image, a bus it cannot open (the
+report file is opened first, and removed again after these last two); 2 when the sequence
+failed, with its report: a step failed (a negative response, a timeout, an answer udsoncan
+rejects or the flasher cannot use, an error of the bus or the transport), or the flasher stopped
+between two steps on an error of its own, or it could not close the bus after the sequence.
 
-**One download, measured.** The release node of 240,272 bytes (stripped, with its header), 235
-blocks, over the UDP bus: the report of `test_a_download_confirms_the_new_image[udp]` in one run
-of `pytest tests/system/test_download_faults.py tests/system/test_download.py -m "not timing"`
-against the release build (its `report.json` in the test's log directory; the times are the
-tester's and include both hosts): erase 2.70 s (the node's log: 60 steps in 2,702,195 µs), transfer 19.37 s
-(12,401 bytes/s; the median block 82.5 ms, the slowest 84.2 ms), check 4 ms, ecu_reset 0.7 ms,
-wait_for_trial 1.20 s, confirm 2.6 ms; over SocketCAN the erase and the transfer took the same
-within 0.3 %, and the block times were the same to 0.1 ms. The block time is
-the diagnostic task's budget of 2 events per tick at work (the floor is 79 ticks); phase 6
+**One download, measured.** The release node of 244,368 bytes (stripped, with its header), 239
+blocks, over the UDP bus: the report of `test_a_download_confirms_the_new_image[udp]` in the
+release run of the system tests in one run of `scripts/check.sh` (its `report.json` in the
+test's log directory, under `system-test/logs-functional/` of the build root; the times are the
+tester's and include both hosts): erase 2.75 s (the node's log: 61 steps in 2,751,004 µs), transfer 19.70 s
+(12,404 bytes/s; the median block 82.4 ms, the slowest 84.2 ms), check 3 ms, ecu_reset 0.7 ms,
+wait_for_trial 1.20 s, confirm 2.5 ms; over SocketCAN the erase and the transfer took the same
+within 0.1 %, and the median block was the same to 0.1 ms (the slowest 85.0 ms). The block time
+is the diagnostic task's budget of 2 events per tick at work (the floor is 79 ticks); phase 6
 measures the throughput properly.
 
 **The bench.** `fcn_tools.node.Board`, started through `tests/conftest.py`'s
@@ -634,8 +679,8 @@ The services the node does not have are answered with serviceNotSupported (0x11)
   responsePending cadence, S3server) and [test_uds_download.c](../tests/unit/test_uds_download.c)
   (30: the download on a fake backend, and again on lib/boot's real slot writer over lib/flash's
   NOR model with lib/bootimg, so that every refusal is made by the code that makes it on the node);
-- [test_diag.c](../tests/unit/test_diag.c) (18: the node's connection, the confirmations matched
-  by time, the response buffers, the ECUReset) and [test_flash_job.c](../tests/unit/test_flash_job.c)
+- [test_diag.c](../tests/unit/test_diag.c) (20: the node's connection, the confirmations matched
+  by time, the response buffers, the ECUReset and its deadline) and [test_flash_job.c](../tests/unit/test_flash_job.c)
   (8: the jobs on the NOR model, the alive indications, the two confirms).
 
 Coverage in a run of `scripts/coverage.sh` (part of `scripts/check.sh`): lib/isotp/isotp.c 525 of
@@ -650,15 +695,15 @@ every one was caught.
 | Test file | What it shows |
 |---|---|
 | [test_diag_isotp.py](../tests/system/test_diag_isotp.py) | frame by frame with python-can, on both transports: single frames padded to 8 bytes and unpadded ones understood; every kind of frame the node ignores (too short, a length the protocol does not allow, a reserved type, a stray CF or FC); the node's flow control `30 10 00` after the first frame and every 16th CF, never after the last, the SN wrapping, the longest request (1026 bytes) and OVFLW for one byte more and for the escape first frame; the tester's flow control kept (a block of BS 3, four WAITs then CTS, a fifth WAIT ending with N_WFT_OVRN, OVFLW and a reserved FS ending the transmission, no FC ending it after N_Bs), a request received while the node waits for an FC; a wrong SN, an SF and an FF in the middle of a reception, and a tester that stops (N_Cr), each followed by a request that is served. Each compares lib/isotp's counters with what the tester did, exactly. Timing: STmin 20 ms kept between the node's CFs |
-| [test_diag_services.py](../tests/system/test_diag_services.py) | every request of a table of 84 in the default, extended and programming sessions without a flash, with exactly its answer: the general checks in their order (a service outside the session before any length; the sub-function and its session before the service's own length), SPRMIB suppressing positive answers and never negative ones, the session transitions, the services the node does not have, the DIDs without a hand-off, the routines' results; ReadDTCInformation's lists and counts by six masks against reportSupportedDTC; with a flash through fcn_boot, every check of the download's services and routines in its order, lib/boot's refusals behind them, busyRepeatRequest for a TesterPresent and an unknown SID while an erase is pending (an erase asked for with the SPRMIB, whose final positive answer comes all the same after its responsePending), the repeated block, transferDataSuspended ending the download, and a whole download committing the trial; ReadDTCInformation against BMS_Fault with a cell over its voltage limit, after it heals and after ClearDiagnosticInformation. Every test compares the node's UDS counters (requests by service, NRCs by code, positive, suppressed, responsePending) with what the tester saw. Timing: responsePending at 40 ms and every 2 s during an erase of 110 sectors, TesterPresent within P2server; TesterPresent every second keeping the extended session past S3server |
-| [test_download.py](../tests/system/test_download.py) | the flasher end to end on both transports: factory image, download, ECUReset, the trial started by fcn_boot, its version read and confirmed with the routine, every frame of the connection accounted for, and a restart that keeps it; the self-confirm when no tester confirms, after which the routine is refused and writes nothing; the slot writer refusing the running slot and a pending trial; a flash job that never returns ending in a watchdog reset; the DTC services read from the health task's snapshot; no frame lost under a flood of lower-priority frames. Timing: the block time |
-| [test_download_faults.py](../tests/system/test_download_faults.py) | an image damaged in transit and one for the other target, refused at the check routine (0x72), the old image started again, the next download committed; the crash payload downloaded, started on its three attempts and rolled back, the rollback in DID 0xFD00, in ReadDTCInformation (UPDATE_ROLLBACK) and in BMS_Fault, removed by ClearDiagnosticInformation; a download refused for both slots while a trial runs and accepted after the confirm routine; S3server in the middle of a download (abandoned, slot B WRITING, the next start runs slot A, the next download works); ECUReset with the SPRMIB in the middle of a download (no answer, the reset, slot A started again, the next download works) |
+| [test_diag_services.py](../tests/system/test_diag_services.py) | every request of a table of 84 in the default, extended and programming sessions without a flash, with exactly its answer: the general checks in their order (a service outside the session before any length; the sub-function and its session before the service's own length), SPRMIB suppressing positive answers and never negative ones, the session transitions, the services the node does not have, the DIDs without a hand-off, the routines' results; ReadDTCInformation's lists and counts by six masks against reportSupportedDTC; with a flash through fcn_boot, every check of the download's services and routines in its order, lib/boot's refusals behind them, an erase asked for with the SPRMIB, whose final positive answer comes all the same after its responsePending, the repeated block, transferDataSuspended ending the download, and a whole download committing the trial; ReadDTCInformation against BMS_Fault with a cell over its voltage limit, after it heals and after ClearDiagnosticInformation, whose answer comes only once the clear is made (0x19 straight after it finds the DTC confirmed no more). Every test compares the node's UDS counters (requests by service, NRCs by code, positive, suppressed, responsePending) with what the tester saw. Timing: responsePending at 40 ms and every 2 s during an erase of 110 sectors, TesterPresent within P2server; busyRepeatRequest for a TesterPresent and an unknown SID while an erase is pending (each answer is checked against the order the node answered in; that both requests came while it was pending is the host's); TesterPresent every second keeping the extended session past S3server |
+| [test_download.py](../tests/system/test_download.py) | the flasher end to end on both transports: factory image, download, ECUReset, the trial started by fcn_boot, its version read and confirmed with the routine, every frame of the connection accounted for, and a restart that keeps it; the self-confirm when no tester confirms, after which the routine is refused and writes nothing; the slot writer refusing the running slot and a pending trial; a flash job that never returns ending in a watchdog reset; the DTC services read from the health task's snapshot. Timing: the block time; no frame lost under a flood of lower-priority frames (the bus model keeps the tester's frames only while the host reads the node's bus in time: a frame it dropped makes the run a missed tolerance) |
+| [test_download_faults.py](../tests/system/test_download_faults.py) | an image damaged in transit and one for the other target, refused at the check routine (0x72), the old image started again, the next download committed; the crash payload downloaded, started on its three attempts and rolled back, the rollback in DID 0xFD00, in ReadDTCInformation (UPDATE_ROLLBACK) and in BMS_Fault, removed by ClearDiagnosticInformation; a download refused for both slots while a trial runs and accepted after the confirm routine; S3server in the middle of a download (abandoned, slot B WRITING, the next start runs slot A, the next download works); ECUReset with the SPRMIB in the middle of a download (no answer, the reset, slot A started again, the next download works); ECUReset from a tester that holds its earlier answer with WAITs and blocks of one frame (the node's frames in order, the reset, slot A started again through fcn_boot). Timing: that reset within 2 s and a margin of the request, the answer cut |
 | [test_download_cuts.py](../tests/system/test_download_cuts.py) | 11 power cuts during a download, each a test of its own with its seed: the BEGIN record and its commit field (twice), the first and the last erase, the first, a drawn and the last page (the last one programmed by RequestTransferExit), the COMMIT record and its commit field; armed on the node's command line or at run time where no flash operation can come before the tester's next request (after RequestDownload's and RequestTransferExit's answers). After each: the run ended as a loss of supply in the step the operation belongs to, decision 5's invariants of phase 4 (update.md), the next start through fcn_boot as the state machine says (its frames and hand-off), and the next download, in that run, committed. The cut after COMMIT's last transition leaves a complete trial (the crash payload), which runs three times and is rolled back first |
 
-The functional runs of these five files take a little over three minutes per build: their 34
-tests took 192 s in the release run and 194 s in the asan run of `scripts/test-system.sh`, and
-their 4 timing tests 42 s in its timing run (the JUnit reports of one run of `scripts/check.sh`
-on the development laptop). Planted defects in a scratch copy of
+The functional runs of these five files take about three minutes per build: their 34 tests took
+174 s in the release run and 175 s in the asan run of `scripts/test-system.sh`, and their 7
+timing tests 69 s in its timing run (the JUnit reports of one run of `scripts/check.sh` on the
+development laptop). Planted defects in a scratch copy of
 the node (one at a time, the release build rebuilt, the test that should see it run) were all
 caught, 13 of them: 0x00 padding, BS 0 in the node's flow control, a fifth WAIT accepted, N_Cr
 not started again by a consecutive frame, busy checked after the SID, the SPRMIB suppressing

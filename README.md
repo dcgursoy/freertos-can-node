@@ -97,7 +97,7 @@ of phase 2 it sends a status frame every 10 ms and answers a ping frame.
   interrupt handler, connected to it by task notifications.
 - **Simulation control** ([platform/posix/posix_sim.h](platform/posix/posix_sim.h)). Faults are
   applied to the simulated hardware through a channel of its own, the way a test bench works
-  on a real device; the application has no test hooks.
+  on a real device; the application has no hook for them.
 - **Tests.** Unit tests of every module of `lib/can` and `lib/crc`, each also challenged with
   planted defects; the CRCs and frame lengths are checked against published vectors, and
   `can_bits` against an independent Python implementation on more than 100,000 frames; system

@@ -28,6 +28,7 @@ not fit a slot.
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import subprocess
@@ -58,6 +59,14 @@ MAX_ATTEMPTS = 3
 #: health; the rest is room for a slow host. Not a timing tolerance: a node that does not
 #: confirm in this time fails the test (the window itself is timed in test_update.py).
 CONFIRM_WAIT_S = 30.0
+
+#: A trial's window of good health for a test that leaves the confirm to the tester's routine
+#: (--confirm-periods, a test hook of the host's node, app/update.h): 36,000 health periods of
+#: 100 ms, an hour, so that the trial cannot confirm itself before the routine: every wait of the
+#: test and of the flasher ends long before (RUN_WAIT_S, the flasher's timeouts). Every other
+#: test runs with the product's window, 50 periods.
+TRIAL_WINDOW_PERIODS = 36_000
+NO_SELF_CONFIRM = ("--confirm-periods", str(TRIAL_WINDOW_PERIODS))
 
 #: How long a test waits for a run of the node that ends by itself (--duration-s, a reset). Not
 #: a timing tolerance either: it only bounds the wait.
@@ -375,30 +384,47 @@ FLOOD_BITRATE = 125_000
 FLOOD_LOAD = 1.2
 FLOOD_FRAME = can.Message(arbitration_id=0x700, data=bytes([0x55] * 8), is_extended_id=False)
 
+#: A Flood's pass: it sleeps this long between two batches of frames, and a batch holds no more
+#: frames than FLOOD_MOST_PASSES of them ask for.
+FLOOD_PASS_S = 0.001
+FLOOD_MOST_PASSES = 5
+
 
 class Flood:
-    """Sends FLOOD_FRAME at FLOOD_LOAD times the capacity of a FLOOD_BITRATE bus, from a thread
-    and a bus of its own, until stop(). It follows the clock as test_can_flood.py's flood does:
-    every millisecond it sends as many frames as the rate and the time since its start ask for,
-    so a sender that the host delays catches up with a burst."""
+    """Sends `frame` at `load` times what a bus of `bitrate` can carry of it (by default
+    FLOOD_FRAME, FLOOD_LOAD and FLOOD_BITRATE), from a thread and a bus of its own, until stop().
+    It follows the clock: every FLOOD_PASS_S it sends the frames that the rate and the time since
+    its start ask for. A sender that the host delays does not make up for the time it lost: it
+    sends at most FLOOD_MOST_PASSES passes' worth of frames at once and gives up the rest
+    (`given_up`), so the flood never reaches the node as a burst. (A burst would also come out of
+    the bus model as one: the host transport stamps every frame of one read pass with the same
+    time, and a burst on top of the frames already waiting overflows the model's wire queue of 64
+    frames, lib/can/can_ctrl.h. test_can_flood.py's flood, above the bus's capacity, catches up
+    instead: it counts what the model drops.)"""
 
-    def __init__(self, spec: str) -> None:
-        self.rate = FLOOD_LOAD * FLOOD_BITRATE / (message_bits(FLOOD_FRAME).frame_bits
-                                                  + INTERMISSION_BITS)
+    def __init__(self, spec: str, frame: can.Message = FLOOD_FRAME, load: float = FLOOD_LOAD,
+                 bitrate: int = FLOOD_BITRATE) -> None:
+        self.frame = frame
+        self.rate = load * bitrate / (message_bits(frame).frame_bits + INTERMISSION_BITS)
         self.sent = 0
+        self.given_up = 0
         self._bus = bus_module.open_bus(spec)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="Flood", daemon=True)
         self._thread.start()
 
     def _run(self) -> None:
+        most = math.ceil(self.rate * FLOOD_PASS_S * FLOOD_MOST_PASSES)
         start = time.monotonic()
         while not self._stop.is_set():
-            due = int((time.monotonic() - start) * self.rate)
+            due = int((time.monotonic() - start) * self.rate) - self.given_up
+            if due - self.sent > most:
+                self.given_up += due - self.sent - most
+                due = self.sent + most
             while self.sent < due:
-                self._bus.send(FLOOD_FRAME)
+                self._bus.send(self.frame)
                 self.sent += 1
-            time.sleep(0.001)
+            time.sleep(FLOOD_PASS_S)
 
     def stop(self) -> None:
         self._stop.set()

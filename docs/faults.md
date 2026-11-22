@@ -24,7 +24,7 @@ of it; the CAN fault confinement, bus-off recovery and transmit buffering of pha
 The faults are applied from outside, as on a bench: sensor values and channel faults through
 the `sensor.*` commands of simulation control, bus faults through `can.*`, a front end whose
 read never returns through `sensor.hang`, a reset cause through the retained cell. The
-application has no test hook.
+application has no hook for them.
 
 | Part | Code |
 |---|---|

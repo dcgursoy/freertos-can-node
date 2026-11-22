@@ -14,6 +14,7 @@ _Static_assert(DIAG_RESPONSE_ID == CAN_DB_UDS_RESPONSE_ID, "UDS_Response of the 
 _Static_assert((DIAG_BLOCK_SIZE >= 1U) && (DIAG_BLOCK_SIZE <= 255U), "BS fits its byte, not 0");
 _Static_assert(DIAG_RX_BUFFER <= ISOTP_MAX_LENGTH, "a buffer lib/isotp uses to its end");
 _Static_assert(DIAG_RESPONSES == 2U, "a response in transmission and the one after it");
+_Static_assert(DIAG_RESET_DEADLINE_US == (2U * DIAG_TIMEOUT_US), "the reset's deadline: 2 x N_As");
 _Static_assert(DIAG_HANDOUTS >= ISOTP_PIPELINE_DEPTH, "a record for every frame in the pipeline");
 _Static_assert(DIAG_N_CS_US >= ISOTP_STMIN_RESERVED_US, "the N_Cs target allows every STmin");
 
@@ -82,6 +83,12 @@ static void take_output(diag_t *d, diag_response_t *slot, const uds_output_t *ou
 
     if (out->reset) {
         d->stats.resets++;
+
+        /* Due at the latest at this deadline, whatever is then still being sent (ECURESET); an
+         * earlier accepted ECUReset keeps its own, which is earlier. */
+        if (d->reset_deadline_us == UINT64_MAX) {
+            d->reset_deadline_us = d->call_us + DIAG_RESET_DEADLINE_US;
+        }
     }
 
     if (reset_now) {
@@ -110,12 +117,17 @@ static void end_transmission(diag_t *d)
     d->tx_ended = false;
 }
 
-/* After every call of lib/isotp or lib/uds: end a transmission whose confirmation came, and
- * start the next response while the transport is free. A start that lib/isotp ends at once (the
- * first frame refused: N_ERROR, through the confirmation inside isotp_send()) ends here too, so
- * the loop runs at most once per buffer. Nothing is sent once a reset is due. */
+/* After every call of lib/isotp or lib/uds: make an accepted ECUReset due at its deadline, end a
+ * transmission whose confirmation came, and start the next response while the transport is free.
+ * A start that lib/isotp ends at once (the first frame refused: N_ERROR, through the confirmation
+ * inside isotp_send()) ends here too, so the loop runs at most once per buffer. No response is
+ * started once a reset is due. */
 static void settle(diag_t *d)
 {
+    if (d->call_us >= d->reset_deadline_us) {
+        d->reset_due = true;
+    }
+
     for (uint32_t i = 0U; i <= DIAG_RESPONSES; i++) {
         if (d->sending && d->tx_ended) {
             end_transmission(d);
@@ -211,6 +223,7 @@ bool diag_init(diag_t *d, const diag_port_t *port, const uds_backend_t *backend)
 
         (void)memset(d, 0, sizeof(*d));
         d->port = *port;
+        d->reset_deadline_us = UINT64_MAX;
         d->tx_result = ISOTP_RESULT_OK;
         ok = isotp_init(&d->tp, &config, &callbacks, d->rx_buffer, (uint16_t)DIAG_RX_BUFFER) &&
              uds_init(&d->uds, backend);
@@ -291,8 +304,10 @@ uint64_t diag_next_deadline(const diag_t *d)
     if (ready(d)) {
         const uint64_t transport = isotp_next_deadline(&d->tp);
         const uint64_t server = uds_next_deadline(&d->uds);
+        const uint64_t reset = d->reset_due ? UINT64_MAX : d->reset_deadline_us;
 
         deadline = (transport < server) ? transport : server;
+        deadline = (reset < deadline) ? reset : deadline;
     }
 
     return deadline;

@@ -16,18 +16,30 @@ The other system tests of phase 5 (docs/diagnostics.md, How it is tested): the t
 frame (test_diag_isotp.py), every service and NRC (test_diag_services.py), downloads broken on
 purpose (test_download_faults.py) and power cuts during a download (test_download_cuts.py).
 
-Functional tests: nothing here decides from the host's clock. The times in the tester's report
-are printed for the record.
+Functional tests, but for the two marked `timing`: they decide from the tester's report and the
+node's answers, statistics, log and flash, and where the node's own clock could race the tester,
+the race is removed or decided by the node. The download whose trial the tester's routine
+confirms starts the trial with a window longer than any run here (--confirm-periods
+TRIAL_WINDOW_PERIODS), so that only the routine can confirm it; the trial that confirms itself
+does so with the product's window and is followed through DID 0xFD00 until the node says it is
+confirmed; the DTC test expects the one status that changes in the node's first seconds
+(CAN_BUS_OFF's, at 5 s of its uptime) as the node's own reads before and after found it. Marked
+`timing`: the block time, and the flood, whose download needs the host to read the node's bus
+in time (LOW_FLOOD_LOAD): the node counts a frame its bus model dropped (wire overruns), and the
+run is then a missed timing tolerance. The times in the tester's report are printed for the
+record.
 """
 from __future__ import annotations
 
+import can
 import pytest
 
 from diag_bench import Uds, hexbytes, run_flasher, show, steps_of, wait_until
 from fcn_tools import diag as diag_module
 from fcn_tools.node import EXIT_OK, RESET_REQUESTED, RESET_WATCHDOG
-from update_bench import (Boot, check_frames_of, check_handoff, check_invariants, factory, info,
-                          listen, stage, states, wait_for_alive)
+from update_bench import (NO_SELF_CONFIRM, TRIAL_WINDOW_PERIODS, Boot, check_frames_of,
+                          check_handoff, check_invariants, factory, info, listen, stage, states,
+                          wait_for_alive)
 
 #: How long a test waits for the run the bench started after the reset, and for a reset.
 RUN_WAIT_S = 30.0
@@ -47,11 +59,11 @@ def test_a_download_confirms_the_new_image(can_spec, start_board, restart_node, 
     """Factory image 1.0.0 in slot A; the flasher downloads 1.1.0 into slot B, resets the node,
     finds the trial and confirms it with the routine. Checked from the tester's report, the two
     runs' logs and statistics, and the flash read both ways; and a restart afterwards keeps the
-    new image."""
+    new image. The trial's window is TRIAL_WINDOW_PERIODS: only the routine confirms it."""
     flash, cell = workdir / "flash.bin", workdir / "cell.bin"
     factory(flash, images["node-1.0.0"])
     image_size = images["node-1.1.0"].stat().st_size
-    board = start_board(flash_file=flash, retained_file=cell, can=can_spec)
+    board = start_board(*NO_SELF_CONFIRM, flash_file=flash, retained_file=cell, can=can_spec)
     board.expect_resets(1)
 
     status, report, _ = run_flasher(can_spec, images["node-1.1.0"], workdir / "report.json")
@@ -101,6 +113,7 @@ def test_a_download_confirms_the_new_image(can_spec, start_board, restart_node, 
     assert (handoff["slot"], handoff["mode"], handoff["attempt"], handoff["image_version"]) == (
         "B", "trial", 1, "1.1.0")
     assert stats["reset"]["cause"] == "REQUESTED"
+    assert stats["confirm"]["periods_needed"] == TRIAL_WINDOW_PERIODS
     assert stats["confirm"]["state"] == "CONFIRMED"
     assert stats["confirm"]["flash_task"]["confirmed_by_routine"] is True
     assert stats["confirm"]["flash_task"]["jobs"]["confirm"]["run"] == 1
@@ -244,18 +257,25 @@ def test_a_flash_job_that_never_returns_ends_in_a_watchdog_reset(start_board, re
     assert states(flash_info)[0] == "confirmed"
 
 
-#: The status of every DTC after 2 s of a run without a fault (tests/system/test_faults.py):
-#: the 4 reset faults, UPDATE_ROLLBACK, the supervision, error passive and the faults of the
-#: samples have passed (0x00); CAN_BUS_OFF passes only after 5 s (testNotCompleted bits, 0x50).
+#: The status of every DTC from the node's second second on, in a run without a fault
+#: (tests/system/test_faults.py): the 4 reset faults, UPDATE_ROLLBACK, the supervision, error
+#: passive and the faults of the samples have passed (0x00). CAN_BUS_OFF passes only after 50
+#: health cycles without a bus-off, at 5 s of the node's uptime: before, its testNotCompleted
+#: bits are set (0x50), and from then on it is 0x00 as well.
 AFTER_2_S = 0x00
-BUS_OFF_AFTER_2_S = 0x50
+BUS_OFF_BEFORE_5_S = 0x50
 
 
 @pytest.mark.slow
 def test_the_dtc_services_read_the_health_task_s_snapshot_and_clear(start_node, ports):
     """ReadDTCInformation 0x0A, 0x02 and 0x01 answer the DTCs as the health task left them in its
     last period (the snapshot it publishes), in the order and with the numbers of the fault table;
-    ClearDiagnosticInformation is made by the health task, and answered only once it is."""
+    ClearDiagnosticInformation is made by the health task. (That it is answered only once the
+    clear is made is shown where a DTC is confirmed before it: test_diag_services.py.) The reads
+    come after 2 s of the node's uptime, as its log counts it, and CAN_BUS_OFF changes at 5 s:
+    reportSupportedDTC is read before and after the list and the count by mask, and CAN_BUS_OFF,
+    the list and the count are expected as those two reads found it, never from how long the
+    test process took."""
     from fcn_tools import diag
     from update_bench import wait_for_alive
 
@@ -265,6 +285,7 @@ def test_the_dtc_services_read_the_health_task_s_snapshot_and_clear(start_node, 
         supported = client.get_supported_dtc().service_data.dtcs
         matching = client.get_dtc_by_status_mask(0xFF).service_data.dtcs
         count = client.get_number_of_dtc_by_status_mask(0xFF).service_data.dtc_count
+        again = client.get_supported_dtc().service_data.dtcs
         client.change_session(3)
         client.clear_dtc(0xFFFFFF)
         client.change_session(1)
@@ -272,19 +293,33 @@ def test_the_dtc_services_read_the_health_task_s_snapshot_and_clear(start_node, 
     stats = node.stats()
     table = stats["faults"]["dtcs"]
     assert [dtc.id for dtc in supported] == [entry["dtc"] for entry in table]
-    statuses = {dtc.id: dtc.status.get_byte_as_int() for dtc in supported}
+    assert [dtc.id for dtc in again] == [entry["dtc"] for entry in table]
+    before = {dtc.id: dtc.status.get_byte_as_int() for dtc in supported}
+    after = {dtc.id: dtc.status.get_byte_as_int() for dtc in again}
+    bus_off = next(entry["dtc"] for entry in table if entry["name"] == "CAN_BUS_OFF")
     for entry in table:
-        expected = BUS_OFF_AFTER_2_S if entry["name"] == "CAN_BUS_OFF" else AFTER_2_S
-        assert statuses[entry["dtc"]] == expected, entry
-    assert [dtc.id for dtc in matching] == [dtc.id for dtc in supported if statuses[dtc.id] != 0]
-    assert count == len(matching) == 1
+        if entry["dtc"] != bus_off:
+            assert before[entry["dtc"]] == after[entry["dtc"]] == AFTER_2_S, entry
+    # Before its 5 s in both reads, after them in both, or passed in between; never back.
+    passed = (before[bus_off], after[bus_off])
+    assert passed in ((BUS_OFF_BEFORE_5_S, BUS_OFF_BEFORE_5_S), (BUS_OFF_BEFORE_5_S, 0x00),
+                      (0x00, 0x00)), passed
+    print(f"CAN_BUS_OFF before and after the reads by mask: {passed}")
+    listed = [dtc.id for dtc in matching]
+    if before == after:
+        assert listed == [dtc for dtc, status in before.items() if status != 0]
+        assert count == len(listed)
+    else:
+        # It passed between the two reads: the list may have found it either way, and the
+        # count, read after the list, finds it only if the list did.
+        assert (listed, count) in (([bus_off], 1), ([bus_off], 0), ([], 0)), (listed, count)
     assert stats["faults"]["clears"] == 1
     assert "DTCs cleared: ClearDiagnosticInformation (clear 1)" in node.log()
     uds = stats["diag"]["uds"]
-    assert uds["requests"]["ReadDTCInformation"] == 3
+    assert uds["requests"]["ReadDTCInformation"] == 4
     assert uds["requests"]["ClearDiagnosticInformation"] == 1
     assert stats["diag"]["backend"]["clears"] == stats["diag"]["backend"]["clears_done"] == 1
-    assert stats["diag"]["backend"]["snapshots"] == 3
+    assert stats["diag"]["backend"]["snapshots"] == 4
     assert sum(uds["nrc"].values()) == 0
 
 
@@ -318,60 +353,66 @@ def test_a_block_takes_the_ticks_of_the_diagnostic_task_s_budget(start_node, ima
 #: (docs/can-simulation.md, lib/can/can_ctrl.h), so above the bus's capacity it would drop the
 #: tester's frames with the flood's (wire_overruns), where a real bus would let them win the
 #: arbitration. With the tester's own frames (about 1.7 per ms of the 3.7 the bus carries) the bus
-#: is close to full, and the receive task takes the flood's frames as well.
-LOW_FLOOD_ID = 0x7F0
+#: is close to full, and the receive task takes the flood's frames as well. Close to full, the
+#: model's queue of the other nodes' frames (64, the wire queue) has little room to spare: the
+#: host transport stamps every frame of one read pass of the node with the same time, so a host
+#: that delays the node's reads of the bus bunches the flood and a block of the tester into one
+#: pass. With a stall planted in the node's CAN thread every 2 s of a download
+#: (docs/diagnostics.md), stalls of 25 ms left every frame and stalls of 30 ms dropped some. The
+#: flood itself never bursts (update_bench.Flood gives up what a delay of its thread cost it),
+#: but the node's reads are the host's: the test is marked `timing`.
+LOW_FLOOD_FRAME = can.Message(arbitration_id=0x7F0, data=bytes([0x55] * 8), is_extended_id=False)
 LOW_FLOOD_BITRATE = 500_000
 LOW_FLOOD_LOAD = 0.4
 
 
 @pytest.mark.slow
+@pytest.mark.timing
 def test_no_frame_is_lost_in_the_node_under_a_flood_of_lower_priority_frames(start_node, images,
                                                                              workdir, ports):
     """The whole download (to the committed trial, without the reset) while another node floods
     the bus with 8-byte frames of lower priority than UDS_Request and UDS_Response (LOW_FLOOD_LOAD
-    says how much and why not more), and the node sends its full telemetry: every frame of the tester reaches lib/isotp
-    (no frame lost in the controller's receive FIFO, in the diagnostic task's queue, nor in lib/isotp:
-    no reception ended by a wrong sequence number or a timeout), every one of the node's frames is
-    confirmed, and the flood's frames were received and dropped by the receive task. Functional:
-    the counts decide, whatever the flood's timing was."""
-    import can
-
+    says how much and why not more), and the node sends its full telemetry: every frame of the
+    tester reaches lib/isotp (no frame lost in the controller's receive FIFO, in the diagnostic
+    task's queue, nor in lib/isotp: no reception ended by a wrong sequence number or a timeout),
+    every one of the node's frames is confirmed, and the flood's frames were received and dropped
+    by the receive task. Timing: the bus model has to keep every frame of the tester, which it
+    does only while the host reads the node's bus in time (LOW_FLOOD_LOAD); a frame it dropped is
+    counted (can.controller.wire_overruns), and the run is then a missed timing tolerance. With
+    none dropped, the counts decide."""
+    from fcn_tools.timing import check_timing
     from update_bench import Flood
 
     flash = workdir / "flash.bin"
     factory(flash, images["node-1.0.0"])
     node = start_node("--flash-file", str(flash))
-
-    class LowFlood(Flood):
-        def _run(self) -> None:
-            frame = can.Message(arbitration_id=LOW_FLOOD_ID, data=bytes([0x55] * 8),
-                                is_extended_id=False)
-            import time
-            start = time.monotonic()
-            while not self._stop.is_set():
-                due = int((time.monotonic() - start) * self.rate)
-                while self.sent < due:
-                    self._bus.send(frame)
-                    self.sent += 1
-                time.sleep(0.001)
-
-    flood = LowFlood(f"udp:{ports.bus}")
-    flood.rate = flood.rate * (LOW_FLOOD_BITRATE / 125_000) * (LOW_FLOOD_LOAD / 1.2)
+    flood = Flood(f"udp:{ports.bus}", frame=LOW_FLOOD_FRAME, load=LOW_FLOOD_LOAD,
+                  bitrate=LOW_FLOOD_BITRATE)
     try:
         status, report, _ = run_flasher(f"udp:{ports.bus}", images["node-1.1.0"],
                                         workdir / "report.json", "--address", "0x102000",
                                         "--no-reset")
     finally:
         flood.stop()
-    assert status == 0 and report["result"] == "committed", report
     assert node.stop() == EXIT_OK
     stats = node.stats()
-    print(f"flood: {flood.sent} frames sent; transfer {report['transfer']}")
+    controller = stats["can"]["controller"]
+    pacing = stats["can"]["pacing"]
+    print(f"flood: {flood.sent} frames sent, {flood.given_up} given up; transfer "
+          f"{report.get('transfer')}; wire overruns {controller['wire_overruns']}, late resyncs "
+          f"{controller['late_resyncs']}, the CAN thread's latest wake-up "
+          f"{pacing['wakeup_lag_max_ns'] / 1e6:.1f} ms late")
+    check_timing(controller["wire_overruns"] == 0,
+                 f"the bus model dropped {controller['wire_overruns']} frames (wire overruns; "
+                 f"{controller['late_resyncs']} late resyncs, a wake-up of the node's CAN thread "
+                 f"{pacing['wakeup_lag_max_ns'] / 1e6:.1f} ms late): the host delayed the node's "
+                 f"reads of the bus; the flasher: {report.get('result')}, failed step "
+                 f"{report.get('failed_step')}")
+    assert status == 0 and report["result"] == "committed", report
     diag = stats["diag"]
     driver = stats["can"]["driver"]
     assert flood.sent > 0 and driver["rx_unhandled"] > 0
     assert driver["rx_fifo_overruns"] == 0
-    assert stats["can"]["controller"]["wire_overruns"] == 0     # see LOW_FLOOD_LOAD
     assert diag["task"]["rx_lost"] == 0 and diag["task"]["tx_done_lost"] == 0
     assert diag["task"]["rx_high_water"] <= 16      # one block of BS 16 at most
     isotp = diag["isotp"]

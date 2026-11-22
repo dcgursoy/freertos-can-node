@@ -9,7 +9,7 @@
  * in the firmware. This channel is the same thing for the simulated hardware: a UDP socket on
  * the loopback interface, owned by the host platform layer, through which a test applies
  * faults to the models (CAN bus, sensors, flash, power) and reads their state. The
- * application has no test hooks and never sees these commands.
+ * application has no hook for these faults and never sees these commands.
  *
  * Protocol: one request per datagram, one reply datagram to the sender, both ASCII.
  *

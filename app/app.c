@@ -77,11 +77,12 @@
  * judged in fault_init() as the reset faults are). The health task judges every period
  * whether a trial runs in good health (update_health_period(): the watchdog manager OK, the CAN
  * controller error active, no bus-off, and a frame acknowledged since the period before); once
- * it has done so for UPDATE_CONFIRM_AFTER_S seconds without a break it asks the flash task to
- * confirm it, once. The tester's confirm routine (UDS RoutineControl 0xF000) is the other way:
- * whichever comes first writes the CONFIRM record, in the flash task, and the other one then
- * writes nothing (flash_job.h, THE CONFIRM); the health task learns of a confirm by the routine
- * from the flash task (update_routine_confirmed()).
+ * it has done so for UPDATE_CONFIRM_AFTER_S seconds without a break (a host test can lengthen
+ * the window: app_config_t) it asks the flash task to confirm it, once. The tester's confirm
+ * routine (UDS RoutineControl 0xF000) is the other way: whichever comes first writes the
+ * CONFIRM record, in the flash task, and the other one then writes nothing (flash_job.h, THE
+ * CONFIRM); the health task learns of a confirm by the routine from the flash task
+ * (update_routine_confirmed()).
  *
  * THE FLASH TASK, the lowest-priority task, makes every write of the node to the flash: a flash
  * operation blocks its caller for the time the part takes (a page program 0.4 ms, a sector
@@ -102,7 +103,8 @@
  *     queue of APP_DIAG_TX_DONE_QUEUE_LENGTH (can_io_on_tx_done()); each notifies the task;
  *   - the task takes the reports first, then the frames, at most APP_DIAG_EVENTS_PER_TICK in a
  *     tick, and polls the connection after them and at its next deadline (the timers of lib/isotp
- *     and of lib/uds), waiting at most APP_DIAG_IDLE_WAIT_MS;
+ *     and of lib/uds, and an accepted ECUReset's deadline), waiting at most
+ *     APP_DIAG_IDLE_WAIT_MS;
  *   - its frames go out as event frames of the transmit queue (can_io_send_event_stamped());
  *   - the flash work of a service is a job for the flash task, posted into a mailbox of one job
  *     (lib/uds runs one operation at a time) and polled while lib/uds answers responsePending;
@@ -113,7 +115,9 @@
  *     requests that the health task carries out as it carries out those of TESTER_Command
  *     (run_faults()), after which it notifies the task: the positive response follows the clear;
  *   - an accepted ECUReset is made by the task once the transmission of its response has ended,
- *     at most 2 s after the request (diag.h, ECURESET): plat_reset(PLAT_RESET_REQUESTED).
+ *     or 2 s after the task took the request if that comes first, a deadline of the connection
+ *     that cuts an earlier response the tester's flow control still holds (diag.h, ECURESET):
+ *     plat_reset(PLAT_RESET_REQUESTED).
  *
  * SUPERVISION. The sensor, processing, receive, transmit and diagnostic tasks each report an
  * alive indication once per pass of their loop, and the flash task once per pass and after every
@@ -1233,10 +1237,14 @@ static void describe_metadata(void)
 static boot_status_t confirm_trial(void)
 {
     const uint64_t start_ns = plat_time_ns();
+    /* The window in whole seconds: the product's, or the one a host test gave (app_config_t). */
+    const uint32_t window_s = (s_config.confirm_periods != 0U)
+                                  ? (s_config.confirm_periods / (1000U / APP_HEALTH_PERIOD_MS))
+                                  : UPDATE_CONFIRM_AFTER_S;
     bool written = false;
 
     LOG_INF(TAG, "trial in slot %s ran %u s in good health: writing its confirm",
-            slot_name(s_handoff.slot), (unsigned int)UPDATE_CONFIRM_AFTER_S);
+            slot_name(s_handoff.slot), (unsigned int)window_s);
 
     const boot_status_t status = flash_jobs_self_confirm(&s_jobs, &written);
     const uint64_t took_ns = plat_time_ns() - start_ns;
@@ -2046,8 +2054,8 @@ void app_start(const app_config_t *config)
      * that the first BMS_PackStatus already says whether one is active. A reset fault is
      * active from the start, not a change: no line for it (the reset cause has one, below). */
     ok = fault_init(&s_faults, cause, update_rolled_back(s_have_handoff ? &s_handoff : NULL));
-    ok = ok &&
-         update_init(&s_update, s_have_handoff ? &s_handoff : NULL, 1000U / APP_HEALTH_PERIOD_MS);
+    ok = ok && update_init(&s_update, s_have_handoff ? &s_handoff : NULL,
+                           1000U / APP_HEALTH_PERIOD_MS, s_config.confirm_periods);
     fault_summary(&s_faults, &s_fault_summary, &start_changes);
     ok = ok && (e2e_p11_protect_init(&s_fault_counter) == E2E_E_OK);
 

@@ -55,13 +55,25 @@
  * later than N_As. A report for no recorded frame is dropped as well (confirms_unknown).
  *
  * ECURESET. lib/uds accepts it and hands back its response with uds_output_t.reset. The reset is
- * due (diag_reset_due()) once the transmission of that response has ended, with N_OK or not, and
- * at once if there is no response (SPRMIB) or it found no free buffer. The wait has a bound:
- * lib/isotp ends every transmission within N_As of its last frame's hand-out (TIMERS in isotp.h),
- * and a response waits in the second buffer for at most the one transmission ahead of it, so the
- * reset is due at most 2 x N_As (2 s) after the request, also on a bus where nothing gets through.
- * The caller makes it (plat_reset(PLAT_RESET_REQUESTED)) and handles nothing more; nothing is
- * sent once it is due.
+ * due (diag_reset_due()) at the first of these:
+ *   - at once, if there is no response (SPRMIB) or it found no free buffer;
+ *   - when the transmission of its response has ended, with N_OK or not;
+ *   - DIAG_RESET_DEADLINE_US (2 x N_As, 2 s) after the call that accepted it, in the first call
+ *     at or after that time (the deadline is one of diag_next_deadline()'s), whatever is still
+ *     being sent then.
+ * ISO 14229-1 asks for the positive response before the reset and sets no time for a hardReset.
+ * The deadline is the node's: without it the reset would wait for the whole transmission ahead
+ * of its response, whose length the tester's flow control sets (up to DIAG_TX_WFT_MAX WAITs per
+ * block, BS, STmin), and a reset the tester asked for is not to be held off by the tester's own
+ * flow control. For a tester that waits for each response the deadline never comes first: ahead
+ * of the positive response (51 01) there is at most the last frame of the previous response,
+ * handed out before the request (the tester has received it), so that transmission ends within
+ * N_As of the request (TIMERS in isotp.h), and the 51 01, a single frame, ends within N_As of its
+ * hand-out. A tester that did not wait for an earlier response (RESPONSES) may get the reset with
+ * that response cut and without its 51 01, if the earlier one is still being sent at the
+ * deadline, or with its 51 01 handed out and cut, if the earlier one ended shortly before the
+ * deadline. No response is started once the reset is due; the caller makes it
+ * (plat_reset(PLAT_RESET_REQUESTED)) and handles nothing more.
  *
  * STATISTICS (diag_stats_t, and lib/isotp's and lib/uds's own: diag_isotp_stats(),
  * diag_uds_stats()). Counters of 32 bits that wrap. These hold between two calls:
@@ -94,6 +106,11 @@
 
 /** Response buffers (see RESPONSES). */
 #define DIAG_RESPONSES 2U
+
+/** An accepted ECUReset is due at the latest this long after the call that accepted it
+ *  (ECURESET): 2 x N_As (DIAG_TIMEOUT_US), N_As for the last frame of a previous response, which
+ *  may still be unconfirmed, then N_As for the ECUReset's response. */
+#define DIAG_RESET_DEADLINE_US 2000000U
 
 /** Frames handed out that are recorded for their confirmation: lib/isotp's pipeline, and as
  *  many again for frames it gave up whose record has not been dropped yet. */
@@ -130,7 +147,7 @@ typedef struct {
 typedef struct {
     uint8_t data[UDS_RESPONSE_MAX];
     uint32_t len;
-    bool reset; /* an ECUReset's response: the reset follows its confirmation */
+    bool reset; /* an ECUReset's response: the reset is due when its transmission ends */
 } diag_response_t;
 
 typedef struct {
@@ -147,6 +164,7 @@ typedef struct {
     uint8_t scratch[UDS_RESPONSE_MAX];         /* lib/uds's output when no buffer is free */
     diag_handout_t handouts[DIAG_HANDOUTS];    /* a FIFO of `handout_count` from `handout_head` */
     uint64_t call_us;                          /* the time of the call in progress */
+    uint64_t reset_deadline_us; /* an accepted ECUReset is due then at the latest; or UINT64_MAX */
     uint32_t response_head;
     uint32_t response_count;
     uint32_t handout_head;
@@ -193,12 +211,13 @@ void diag_on_tx_done(diag_t *d, uint64_t stamp_ns, uint64_t now_us);
  */
 void diag_poll(diag_t *d, uint64_t now_us);
 
-/** The earliest moment diag_poll() has time-driven work: the earlier of lib/isotp's and lib/uds's
- *  deadlines; UINT64_MAX if neither has one (or for an unprepared `d`). The owner. */
+/** The earliest moment diag_poll() has time-driven work: the earliest of lib/isotp's and
+ *  lib/uds's deadlines and that of an accepted ECUReset not yet due (ECURESET); UINT64_MAX if
+ *  none has one (or for an unprepared `d`). The owner. */
 uint64_t diag_next_deadline(const diag_t *d);
 
-/** Whether an accepted ECUReset is now to be made (ECURESET). False for an unprepared `d`. The
- *  owner, after each call. */
+/** Whether an accepted ECUReset is now to be made (ECURESET); at its deadline it becomes due in
+ *  the first call at or after it. False for an unprepared `d`. The owner, after each call. */
 bool diag_reset_due(const diag_t *d);
 
 /** The core's counters; NULL for an unprepared `d`. The owner. */

@@ -5,7 +5,7 @@ tasks and the hardware watchdog, and the reset cause the next start reports from
 retained-RAM cell (docs/faults.md).
 
 Faults are applied as on a bench (simulation control: sensor.*, can.*; the retained cell
-through --retained-file); the node has no test hook. Every frame is decoded with cantools from
+through --retained-file); the node has no hook for them. Every frame is decoded with cantools from
 the DBC and every protected one checked end to end with fcn_tools.e2e, an implementation of
 Profile 11 independent of the node's lib/e2e (fcn_tools.decode). The tests that concern the
 bus run on both transports: the bus fault, the watchdog reset and the frames after it, the

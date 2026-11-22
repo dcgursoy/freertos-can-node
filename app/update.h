@@ -154,12 +154,16 @@ typedef struct {
 
 /**
  * Set up `m` for this start: `handoff` is the bootloader's hand-off, or NULL for a start without
- * one. `periods_per_second` health periods make a second (at least 1). A TRIAL hand-off starts
- * the window (UPDATE_CONFIRM_WAITING); anything else needs no confirm. Returns false, setting up
- * nothing, for a NULL `m`. Before the scheduler starts.
+ * one. `periods_per_second` health periods make a second (at least 1). `window_periods` healthy
+ * periods in a row make the window; 0 gives the product's, UPDATE_CONFIRM_AFTER_S seconds of
+ * periods. Only the host build passes another, from its command line (--confirm-periods,
+ * app_config_t): a test hook the product does not have, for a test that leaves the confirm to
+ * the tester's routine and must not race the window. A TRIAL hand-off starts the window
+ * (UPDATE_CONFIRM_WAITING); anything else needs no confirm. Returns false, setting up nothing,
+ * for a NULL `m`. Before the scheduler starts.
  */
 bool update_init(update_monitor_t *m, const plat_boot_handoff_t *handoff,
-                 uint32_t periods_per_second);
+                 uint32_t periods_per_second, uint32_t window_periods);
 
 /**
  * One health period of the confirm: judge `health` (see THE CONFIRM OF A TRIAL). Returns true
@@ -181,8 +185,9 @@ void update_confirm_done(update_monitor_t *m, boot_status_t status);
  */
 void update_routine_confirmed(update_monitor_t *m);
 
-/** The whole seconds of good health counted towards the confirm (0 without a trial; all of
- *  them, UPDATE_CONFIRM_AFTER_S, once the confirm was asked for). Any context, a copy of `m`. */
+/** The whole seconds of good health counted towards the confirm (0 without a trial; all of the
+ *  window's, UPDATE_CONFIRM_AFTER_S with the product's window, once the confirm was asked for).
+ *  Any context, a copy of `m`. */
 uint32_t update_healthy_seconds(const update_monitor_t *m, uint32_t periods_per_second);
 
 /** Whether the hand-off reports a rollback (the bootloader's ROLLBACK, REJECT or FALLBACK):
