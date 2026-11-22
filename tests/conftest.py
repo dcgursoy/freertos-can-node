@@ -219,6 +219,38 @@ def start_node(workdir, node_binary, ports, started_nodes):
 
 
 @pytest.fixture
+def start_board(workdir, node_binary, ports, started_nodes):
+    """Factory: start_board(*args, flash_file, retained_file, name="node", can=None,
+    boot_args=()) returns a running fcn_tools.node.Board: the node started through fcn_boot on
+    `flash_file` and `retained_file`, and started again through fcn_boot after every requested
+    reset (exit status 10) the test announces with Board.expect_resets(), as a reset into the
+    bootloader starts a board again. Every run it starts is one of started_nodes, with the same end
+    checks; the runs take the simulation control port of the test, as restart_node's do. When the
+    test ends, the Board's current run is stopped in order and its thread joined."""
+    boards: list[node_module.Board] = []
+
+    def _start(*args: str, flash_file: Path, retained_file: Path, name: str = "node",
+               can: str | None = None, boot_args: tuple[str, ...] = ()) -> node_module.Board:
+        first = NodeProcess(workdir=workdir, args=args, binary=node_binary, name=name,
+                            can=can or f"udp:{ports.bus}",
+                            sim_port=None if started_nodes else ports.sim,
+                            retained_file=retained_file, flash_file=flash_file,
+                            boot_args=boot_args)
+        board = node_module.Board(first, on_start=started_nodes.append).start()
+        boards.append(board)
+        return board
+
+    yield _start
+
+    for board in boards:
+        if board.current.running:
+            try:
+                board.stop(timeout=STOP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                pass    # started_nodes reports it: killed, no statistics
+
+
+@pytest.fixture
 def restart_node(started_nodes):
     """Factory: restart_node(node, name=None, args=None, boot_args=None) starts the next run of
     a node that has ended, with its options, bus, simulation control port, retained-RAM cell and

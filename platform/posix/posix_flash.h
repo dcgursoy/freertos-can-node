@@ -40,6 +40,16 @@
  * FreeRTOS program on this platform has plat_reset(PLAT_RESET_POWER_LOSS) set by
  * posix_platform_init(), which ends with the same status.
  *
+ * A HANG. `--flash-hang N` (posix_flash_arm_hang()) makes the N-th program or erase of the run
+ * hang: the model makes the operation, and then its busy flag never clears, as a part that has
+ * failed, or a driver that waits for a status it never gets, would leave its caller. The call
+ * writes the line "flash: operation N hangs: its busy flag never clears (--flash-hang)" to
+ * stderr and then waits for ever, with the wait function (the node: one tick at a time, so that
+ * the other tasks run and the node's supervision can find the task that is stuck, app.c) or in
+ * sleeps of a millisecond. It is a fault of the simulated hardware for the tests of that
+ * supervision, put in from the start so that it does not race the node. Without a flash it is
+ * refused by the caller (node_main.c).
+ *
  * SIMULATION CONTROL (posix_sim.h), served by whichever thread calls posix_sim_service() (in
  * the node, the CAN hardware thread):
  *
@@ -149,6 +159,11 @@ bool posix_flash_open(const char *path, const nor_timing_t *timing, char *error,
 /** Arm `cut` (counted from the next operation; from the run's first if called right after
  *  posix_flash_open()). Does nothing without a flash. Any thread. */
 void posix_flash_arm_cut(const posix_flash_cut_t *cut);
+
+/** Make the `operation`-th program or erase of the run, counted from the next one (1 ..
+ *  POSIX_FLASH_CUT_MAX), hang (see A HANG); 0 arms nothing. Does nothing without a flash. Main
+ *  thread, right after posix_flash_open() and before any operation. */
+void posix_flash_arm_hang(uint32_t operation);
 
 /** Set how operations wait; NULL, the default, sleeps until the end of the operation. Kept
  *  across open and close. Main thread, before the first operation. */

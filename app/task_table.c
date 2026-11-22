@@ -33,10 +33,22 @@
  *   can_tx    Released by every notification (a transmit-done interrupt, a publish, a pong put
  *             into the queue), so like the receive task modelled by its demand per tick,
  *             counted below at TX_WCET_US.
+ *   diag      Released by every UDS_Request frame, every report of a UDS_Response frame, a flash
+ *             job done, a clear made and its own deadline; it takes at most
+ *             APP_DIAG_EVENTS_PER_TICK frames and reports in a tick (app.c), so it is modelled by
+ *             its demand per window of 10 ms: one job per 10 ms that does what any 10 ms can ask
+ *             of it, counted below at DIAG_WCET_US, with a deadline of 10 ms, the time P2server
+ *             (50 ms) leaves after the first responsePending (40 ms, lib/uds).
  *   health    Periodic.
- *   flash     Released by the health task's request (a task notification), at most once per
- *             health period: sporadic, with the health period as its shortest time between two
- *             releases and as its deadline. The lowest priority (app_tasks.h).
+ *   flash     Released by a job of the diagnostic task, by the health task's request of the
+ *             confirm (task notifications) and by the timeout of its wait. A job is a run of
+ *             lib/boot's calls back to back (flash_job.h), each of which waits for the part, so
+ *             in the model of the analysis it is one task per call ("A job that waits
+ *             mid-execution" in docs/architecture.md): modelled by its longest call, sporadic,
+ *             with the health period as its shortest time between two releases and as its
+ *             deadline, the time within which the alive indication after the call has to come
+ *             for the supervision (app.c, SUPERVISION). Its jobs take whatever processor time the
+ *             other tasks leave: the lowest priority (app_tasks.h), so that they delay nobody.
  *
  * Why a budget per tick bounds what the two CAN tasks take from the tasks below them: every
  * wake-up of either is one pass of its loop (can_io.c), and RX_WCET_US and TX_WCET_US count the
@@ -55,6 +67,11 @@
  * processing and the health task share the pack mutex (priority inheritance). The words that
  * pass between tasks in critical sections (the telemetry switch, the clear requests, the
  * summary of the DTCs) take less than the transmit queue's sections.
+ *
+ * Phase 5 put the diagnostic task between can_tx and health and added a pass to can_tx (below),
+ * the diagnostic task's critical sections (around the transmit queue, its queues' mutual parts,
+ * the flash job's mailbox, the snapshot of the DTCs: CRITICAL_US) to the blocking of every task
+ * above it, and the snapshot and the clears of the DTC services to the health task's budget.
  *
  * Phase 3 added to two budgets: the processing task judges every sample for the fault
  * monitor and posts the verdict (10 us), and the health task runs the supervision cycle,
@@ -147,18 +164,32 @@ _Static_assert(BUS_FRAMES_PER_TICK == 22U, "at most 22 frames end on the bus in 
  *   - two for the health task, which is below can_tx: can_tx runs a pass at each of its
  *     publishes, and a period publishes BMS_Fault and at most one of BMS_TaskStats and
  *     BMS_NodeInfo (app_tasks.h);
- *   - one timeout: tx_wait_ticks() never waits less than a tick.
+ *   - one timeout: tx_wait_ticks() never waits less than a tick;
+ *   - one for the diagnostic task (phase 5), which is below can_tx as well. Its frames
+ *     (UDS_Response, 0x7E8) wake can_tx only when the transmit queue holds no other event frame
+ *     once the frame is in (can_io_send_event_stamped()); otherwise the report of the event
+ *     frame ahead of it, which is a pass counted above, loads it. So between two of its wake-ups
+ *     a frame of the diagnostic task ended on the bus (in a bus without faults, the model's), and
+ *     the wake-ups in a window are at most one more than the diagnostic frames that were queued
+ *     and ended in it. Such a frame has 8 bytes, at least 111 bits with the intermission (111 us
+ *     at 1 Mbit/s), and with its own report counts two passes; a shortest frame, 47 us, counts
+ *     one. Two passes per 111 us of bus are fewer than one per 47 us, so the most passes in a
+ *     window are still those of BUS_FRAMES_PER_TICK shortest frames, and the diagnostic task adds
+ *     the one. The same holds for the events, and for the report of a diagnostic frame handed to
+ *     the diagnostic task's queue (4 us on top of its transmit-done): a diagnostic frame costs
+ *     2 passes, 2 events and the report, 36 us for 111 us of bus (0.32 us per us), a shortest
+ *     frame a pass and 2 events, 19 us for 47 us (0.40 us per us).
  * Events in any 1000 us: a transmit-done for each of the node's frames that ends on the bus, at
  * most BUS_FRAMES_PER_TICK, and a load for each of them and for each of the
  * CAN_IO_TX_MAILBOXES mailboxes that may be loaded with a frame that ends later.
  */
 #define TX_PASS_US         13U
 #define TX_EVENT_US        3U
-#define TX_PASSES_PER_TICK (BUS_FRAMES_PER_TICK + 1U + 2U + 1U)
+#define TX_PASSES_PER_TICK (BUS_FRAMES_PER_TICK + 1U + 2U + 1U + 1U)
 #define TX_EVENTS_PER_TICK ((2U * BUS_FRAMES_PER_TICK) + CAN_IO_TX_MAILBOXES)
 #define TX_WCET_US         ((TX_PASSES_PER_TICK * TX_PASS_US) + (TX_EVENTS_PER_TICK * TX_EVENT_US))
 
-_Static_assert(TX_PASSES_PER_TICK == 26U, "can_tx: 22 + 1 + 2 + 1 passes in any 1000 us");
+_Static_assert(TX_PASSES_PER_TICK == 27U, "can_tx: 22 + 1 + 2 + 1 + 1 passes in any 1000 us");
 _Static_assert(TX_EVENTS_PER_TICK == 47U, "can_tx: 2 x 22 + 3 events in any 1000 us");
 
 /* health, phase 2: the task list 20 us (with the scheduler suspended), the stack figure 100 us,
@@ -192,18 +223,64 @@ _Static_assert(TX_EVENTS_PER_TICK == 47U, "can_tx: 2 x 22 + 3 events in any 1000
  * task's. A period still sends at most two frames: BMS_BootInfo goes in periods without
  * BMS_TaskStats and BMS_NodeInfo (app_tasks.h), within the two frames of phase 2. */
 #define HEALTH_UPDATE_US 5U
-#define HEALTH_WCET_US   (300U + HEALTH_FAULT_WORK_US + HEALTH_UPDATE_US)
+/* Phase 5 adds the DTC services' part (app.c, THE DIAGNOSTIC TASK): the snapshot of the DTCs,
+ * the count of clears carried out and the confirm's state published in critical sections (5 us),
+ * the notification of the diagnostic task after a clear (2 us), and, once per run, a confirm of
+ * the tester's routine taken into the monitor with its log line (105 us). */
+#define HEALTH_DIAG_US 112U
+#define HEALTH_WCET_US (300U + HEALTH_FAULT_WORK_US + HEALTH_UPDATE_US + HEALTH_DIAG_US)
 
 _Static_assert(HEALTH_LOG_LINES == 38U, "health: 2 x 17 fault lines, the clears, the expiry, "
                                         "and the 2 lines of the processing task's wait");
-_Static_assert(HEALTH_WCET_US == 5354U, "health: 300 us + the fault work of phase 3 + phase 4");
+_Static_assert(HEALTH_WCET_US == 5466U,
+               "health: 300 us + the fault work of phase 3 + phase 4 + phase 5");
 
 /*
- * flash, the lowest-priority task. Its job is the confirm of a trial (boot_confirm()): two scans
- * of the metadata log (before the record is written and to read it back), each a read of one
- * entry and the check of its commit field for each of the 64 entries of the host's two
+ * diag, per window of DIAG_WINDOW_US (10 ms, ten ticks). In any window it takes at most
+ * DIAG_EVENTS frames and reports, APP_DIAG_EVENTS_PER_TICK in each tick (app.c, take_events()):
+ *   - 6 us per event: out of its queue, through lib/isotp (a frame received or a confirmation),
+ *     and the frames lib/isotp hands out then (a flow control, or a consecutive frame or two)
+ *     into the transmit queue (can_io_send_event_stamped(), its critical section);
+ *   - 20 us per message an event completes, at most one per event: lib/uds's checks, the copy of
+ *     the request (up to 1026 bytes), the response built (up to 131 bytes, from the snapshot of
+ *     the DTCs copied in a critical section), a flash job posted or the reset decided;
+ *   - 20 us per response the polls produce: the final response of a flash job, at most one job
+ *     per request and so DIAG_JOBS in a window (the requests the events complete, and one posted
+ *     before the window), and one responsePending (they come 2 s apart);
+ *   - 5 us per pass of its loop: the wake-up, the alive indication, the poll of lib/isotp and
+ *     lib/uds that finds nothing, the next deadline. Passes: one per event; one per job done;
+ *     one for a clear made (the health task's, once per 100 ms at most); one per deadline and one
+ *     per wait for the next tick when the budget is used up, each at most one per tick.
+ * Its deadline is DIAG_WINDOW_US: a responsePending is due 40 ms after its request and must go
+ * out before P2server, 50 ms (lib/uds); the task polls at the deadline's tick.
+ */
+#define DIAG_WINDOW_US  10000U
+#define DIAG_TICKS      (DIAG_WINDOW_US / TICK_US)
+#define DIAG_EVENTS     (DIAG_TICKS * APP_DIAG_EVENTS_PER_TICK)
+#define DIAG_JOBS       (DIAG_EVENTS + 1U)
+#define DIAG_EVENT_US   6U
+#define DIAG_MESSAGE_US 20U
+#define DIAG_PASS_US    5U
+#define DIAG_PASSES     (DIAG_EVENTS + DIAG_JOBS + 1U + (2U * DIAG_TICKS))
+#define DIAG_WCET_US                                                                               \
+    ((DIAG_EVENTS * (DIAG_EVENT_US + DIAG_MESSAGE_US)) + ((DIAG_JOBS + 1U) * DIAG_MESSAGE_US) +    \
+     (DIAG_PASSES * DIAG_PASS_US))
+
+_Static_assert(DIAG_TICKS == 10U, "the window is ten ticks");
+_Static_assert(DIAG_WCET_US == 1270U, "diag: 20 events, 22 responses of the polls, 62 passes");
+
+/*
+ * flash, the lowest-priority task, per call of lib/boot (above). The longest is a record write
+ * (boot_confirm(), and the BEGIN and COMMIT records of boot_writer_begin() and of the last
+ * boot_writer_finish_step(), the only calls of the slot writer that read the log, lib/boot): two
+ * scans of the metadata log (before the record is written and to read it back), each a read of
+ * one entry and the check of its commit field for each of the 64 entries of the host's two
  * metadata sectors, 30 us an entry; the record encoded and its two programs handed to the
- * driver, 100 us; the two log lines of the job, 100 us each. The waits for the part (two page
+ * driver, 100 us; the two log lines of the job, 100 us each; the result handed back and the
+ * notification of the task that waits for it, 5 us (phase 5). The other calls are shorter: a
+ * validation step reads 64 bytes and makes two SHA-256 compressions, a write copies a block of
+ * 1024 bytes and hands four page programs to the driver, an erase step hands one erase to it.
+ * The alive indication after a call is a lock-free addition. The waits for the part (two page
  * programs of 0.4 ms, and a sector erase of 45 ms when the record is the first of its sector)
  * block the task (the driver's wait is a vTaskDelay of a tick at a time, plat_flash.h) and take
  * no processor time: they are not in the budget, and in that the job waits in the middle it is
@@ -214,9 +291,10 @@ _Static_assert(HEALTH_WCET_US == 5354U, "health: 300 us + the fault work of phas
  */
 #define FLASH_SCAN_ENTRIES 64U
 #define FLASH_ENTRY_US     30U
-#define FLASH_WCET_US      ((2U * FLASH_SCAN_ENTRIES * FLASH_ENTRY_US) + 100U + (2U * 100U))
+#define FLASH_WCET_US      ((2U * FLASH_SCAN_ENTRIES * FLASH_ENTRY_US) + 100U + (2U * 100U) + 5U)
 
-_Static_assert(FLASH_WCET_US == 4140U, "flash: two scans of 64 entries, a record, two lines");
+_Static_assert(FLASH_WCET_US == 4145U,
+               "flash: two scans of 64 entries, a record, two lines, the result handed back");
 #define HEALTH_SUSPENDED_US  20U
 #define HEALTH_PACK_MUTEX_US 10U /* a copy of the pack state */
 
@@ -284,6 +362,16 @@ static const app_task_budget_t s_table[] = {{.name = "can_irq",
                                              .period_us = TICK_US,
                                              .deadline_us = TICK_US,
                                              .wcet_us = TX_WCET_US,
+                                             .jitter_us = 0U,
+                                             .nonpreemptive_us = CRITICAL_US,
+                                             .mutex = NULL,
+                                             .mutex_us = 0U},
+                                            {.name = "diag",
+                                             .priority = APP_DIAG_PRIORITY,
+                                             .periodic = false,
+                                             .period_us = DIAG_WINDOW_US,
+                                             .deadline_us = DIAG_WINDOW_US,
+                                             .wcet_us = DIAG_WCET_US,
                                              .jitter_us = 0U,
                                              .nonpreemptive_us = CRITICAL_US,
                                              .mutex = NULL,

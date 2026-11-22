@@ -79,10 +79,12 @@ def test_runs_for_the_requested_time_and_reports_statistics(start_node):
     assert stats["log_lines_dropped"] == 0
 
     tasks = {task["name"]: task for task in stats["tasks"]}
-    assert set(tasks) == {"can_rx", "sensor", "process", "can_tx", "health", "flash", "IDLE"}
+    assert set(tasks) == {"can_rx", "sensor", "process", "can_tx", "diag", "health", "flash",
+                          "IDLE"}
     # Priorities as documented in app/app_tasks.h, highest first.
     by_priority = sorted(tasks, key=lambda name: tasks[name]["priority"], reverse=True)
-    assert by_priority == ["can_rx", "sensor", "process", "can_tx", "health", "flash", "IDLE"]
+    assert by_priority == ["can_rx", "sensor", "process", "can_tx", "diag", "health", "flash",
+                           "IDLE"]
     assert len({task["priority"] for task in tasks.values()}) == len(tasks)
     assert sum(task["run_time_us"] for task in tasks.values()) <= stats["run_time_total_us"]
     # A node that sends a few frames every 10 ms is idle nearly all the time.

@@ -15,8 +15,13 @@
 #include "boot/boot.h"
 #include "can_io.h"
 #include "command.h"
+#include "diag.h"
+#include "diag_backend.h"
 #include "fault.h"
+#include "flash_job.h"
+#include "isotp/isotp.h"
 #include "plat_retained.h"
+#include "uds/uds.h"
 #include "update.h"
 #include "wdgm/wdgm.h"
 
@@ -122,7 +127,32 @@ typedef struct {
     uint32_t confirms;              /**< confirms made (boot_confirm() calls) */
     boot_status_t confirm_status;   /**< what the last one returned */
     uint64_t confirm_ns;            /**< how long it took, waits for the flash included */
+    /* Phase 5: the jobs of the diagnostic task (flash_job.h), by kind (flash_job_kind_t). */
+    uint32_t jobs[FLASH_JOB_KINDS];            /**< jobs run */
+    boot_status_t job_status[FLASH_JOB_KINDS]; /**< the result of the last one of the kind */
+    uint32_t job_steps[FLASH_JOB_KINDS];       /**< its lib/boot calls */
+    uint64_t job_last_ns[FLASH_JOB_KINDS]; /**< how long it took, waits for the flash included */
+    uint64_t job_max_ns[FLASH_JOB_KINDS];  /**< the longest of the kind */
+    bool confirmed_by_routine;             /**< the trial was confirmed by the routine */
+    uint32_t self_skipped; /**< self-confirms that found the trial confirmed by the routine */
+    uint32_t idle_passes;  /**< waits that ended without a job or a request */
 } node_flash_task_stats_t;
+
+/** The diagnostic connection (app.c, THE DIAGNOSTIC TASK): the core's, lib/isotp's, lib/uds's and
+ *  the backend's counters, and those of the task and its queues. */
+typedef struct {
+    diag_stats_t core;
+    isotp_stats_t isotp;
+    uds_stats_t uds;
+    diag_backend_stats_t backend;
+    uint8_t session;        /**< the UDS session at the end */
+    uint32_t rx_lost;       /**< UDS_Request frames the queue refused (full): lost in the node */
+    uint32_t rx_high_water; /**< most frames the queue held, as the receive task found it */
+    uint32_t tx_done_lost;  /**< reports of UDS_Response frames the queue refused */
+    uint32_t events;        /**< frames and reports the task took */
+    uint32_t passes;        /**< passes of its loop */
+    uint32_t budget_waits;  /**< ticks it waited with events left (APP_DIAG_EVENTS_PER_TICK) */
+} node_diag_stats_t;
 
 /** The update: the hand-off, the confirm monitor of the health task, the flash task. */
 typedef struct {
@@ -153,6 +183,7 @@ typedef struct {
     fault_summary_t fault_summary; /**< what the last BMS_Fault reported */
     node_supervision_stats_t supervision;
     node_update_stats_t update; /**< the hand-off, the confirm, the flash task */
+    node_diag_stats_t diag;     /**< the diagnostic connection (phase 5) */
 } node_stats_t;
 
 /** Fill the task table of `out` from uxTaskGetSystemState() (overruns 0). Call from a task;

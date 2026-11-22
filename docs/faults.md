@@ -199,17 +199,30 @@ the most recent testFailed record.
 **Change count.** `dtc_status_change_count()` counts status-byte changes (not changes of the
 debounce counter alone); the statistics give it as `faults.status_changes`.
 
-### Read access, shaped for UDS (phase 5)
+### Read access over UDS (phase 5)
 
-| UDS request | Function |
-|---|---|
-| ReadDTCInformation 0x01, reportNumberOfDTCByStatusMask | `dtc_count_by_status_mask()`, `DTC_STATUS_AVAILABILITY_MASK` |
-| ReadDTCInformation 0x02, reportDTCByStatusMask | `dtc_next_by_status_mask()` with a cursor the caller keeps, in table order |
-| ReadDTCInformation 0x0B to 0x0E, first and most recent test-failed and confirmed DTC | `dtc_recorded()` |
-| ReadDTCInformation 0x14, reportDTCFaultDetectionCounter | `dtc_get()`, field `fault_detection_counter` |
-| ClearDiagnosticInformation 0x14, group 0xFFFFFF | `dtc_clear_all()` |
+A tester reads and clears the DTCs over the bus with the node's UDS server
+([diagnostics.md](diagnostics.md)), in the default and the extended session:
 
-A DTC matches a status mask if (statusOfDTC & mask) ≠ 0.
+| UDS request | Answer | lib/dtc |
+|---|---|---|
+| ReadDTCInformation `19 01 <mask>`, reportNumberOfDTCByStatusMask | `59 01 FF 01 <count, 2 bytes>`: the DTCStatusAvailabilityMask 0xFF, the DTCFormatIdentifier 0x01 (ISO_14229-1_DTCFormat) | `dtc_count_by_status_mask()`, `DTC_STATUS_AVAILABILITY_MASK` |
+| ReadDTCInformation `19 02 <mask>`, reportDTCByStatusMask | `59 02 FF` and, for every DTC that matches, its 3-byte number and its status, in table order | `dtc_next_by_status_mask()` with a cursor |
+| ReadDTCInformation `19 0A`, reportSupportedDTC | `59 0A FF` and every DTC of the table with its status, 0x00 included (71 bytes for the 17 DTCs) | `dtc_get()` |
+| ClearDiagnosticInformation `14 FF FF FF` | `54`, once the health task has made the clear | `dtc_clear_all()`, in the health task |
+
+A DTC matches a status mask if (statusOfDTC & mask) ≠ 0, so a mask of 0 matches none. The
+answers are built from a snapshot of lib/dtc's state that the health task, the DTCs' only owner,
+publishes at the end of every period, in a critical section, with the count of clears it has
+carried out; a read therefore describes the end of the health task's last period, the same
+picture as that period's BMS_Fault (the system tests compare the two DTC by DTC), and is at most
+one period and the health task's response time old. ClearDiagnosticInformation is a clear request
+of its own, added to those of TESTER_Command, which the health task carries out as below
+(Clearing) and then reports to the diagnostic task: the positive answer never comes before the
+clear. Not served (lib/dtc has the functions, lib/uds does not offer them): ReadDTCInformation
+0x0B to 0x0E (the first and most recent test-failed and confirmed DTC, `dtc_recorded()`), 0x14
+reportDTCFaultDetectionCounter (`dtc_get()`, `fault_detection_counter`), snapshot and extended
+data, groups other than all, a MemorySelection.
 
 ## Who owns the DTCs
 
@@ -241,7 +254,11 @@ made in the health task.
   7. logs every change of a DTC's testFailed in the period, and publishes the summary
      (`fault_summary_t`) in a critical section;
   8. sends BMS_Fault.
-- **The receive task** counts the clear requests of TESTER_Command (`command_rx_t.clear_requests`).
+- **The receive task** counts the clear requests of TESTER_Command (`command_rx_t.clear_requests`),
+  and the diagnostic task those of ClearDiagnosticInformation (phase 5); the health task reads
+  their sum, so a clear by UDS is carried out like one by TESTER_Command. After its period the
+  health task publishes a snapshot of the DTCs for the diagnostic task's ReadDTCInformation
+  (above) and notifies that task after a clear.
 - **The processing task** reads the summary in a critical section for every sample:
   BMS_PackStatus says PackFaultActive and PackState FAULT while a fault is active in the
   summary of the health task's last period.
@@ -465,22 +482,25 @@ can_tx tasks each report an alive indication once per pass of their loop (the CA
 | Entity | Expected per 100 ms | Correct count | Why |
 |---|---|---|---|
 | sensor | 10 | 1 to 20 | a pass every 10 ms; at most twice that, so that a loop whose wait stops waiting is found too |
-| process | 10 | 1 to 20 | a pass per sample, and per 30 ms timeout while the samples do not come |
+| process | 10 | 1 to 21 | a pass per sample, and per 30 ms timeout while the samples do not come |
 | can_rx, can_tx | 2 | 1 to 65535 | a pass per wake-up, at least every 50 ms, up to one per frame on the bus: a lower bound only, in effect |
+| diag (phase 5) | 2 | 1 to 65535 | the same, for a pass per event or deadline, at least every 50 ms |
+| flash (phase 5) | 2 per 600 ms | 1 to 65535, examined every 6 cycles (reference cycle 6), failed tolerance 1 | a pass per job or request and at least every 100 ms between them, and an indication after every call of lib/boot in a job; one call can wait for the part 409 ms at its maximum times, so a window of 600 ms (no less than 555 ms with the health task's response time) is the shortest that a working flash task always reaches ([app/app.c](../app/app.c), SUPERVISION) |
 
 The lower bound of every entity is 1: the supervision is there to find a task that has stopped.
 Timing within a period is the business of the overrun counters (BMS_TaskStats). A task that
-goes on after a stall stays below the upper bound of 20. The sensor task does not make up the
+goes on after a stall stays below the upper bounds. The sensor task does not make up the
 periods it missed after an overrun: it skips them, keeps the grid of its 10 ms period, and
 counts them (`sensor.skipped_periods`; BMS_TaskStats counts them as overruns), so between two
 examinations it makes a pass for every period of the grid that begins in between and, after a
 stall, at most two more (the end of the pass that stalled, and at once the pass of the period
-the tick is in): 12 when the examinations are 100 ms apart, 14 when the health task's response
-time, under 20 ms in the analysis of [architecture.md](architecture.md#schedulability), puts
-them 120 ms apart. The heartbeat's PeriodCounter and the sample numbers count its passes, so
-they go on without a gap. The processing task, after a stall of its own, finds at most the 4
-samples the queue held and then one per pass of the sensor task, at most 18 in a cycle; it
-times out only while no sample comes. The failed tolerance is 2, so that one pass of an
+the tick is in): 12 when the examinations are 100 ms apart, 17 when the health task's response
+time, under 45 ms in the analysis of [architecture.md](architecture.md#schedulability) since
+phase 5's diagnostic task (under 20 ms before it), puts them 145 ms apart. The heartbeat's
+PeriodCounter and the sample numbers count its passes, so they go on without a gap. The
+processing task, after a stall of its own, finds at most the 4 samples the queue held and then
+one per pass of the sensor task, at most 21 in a cycle (its upper bound was 20 before phase 5);
+it times out only while no sample comes. The failed tolerance is 2, so that one pass of an
 event-driven task that slips past the end of a cycle is not taken for a hang, and a task that
 stands still for up to two cycles and then goes on is not reset for it: the cycle in which it
 goes on is correct again, and the good cycles after it make the entity OK. Measured from the
@@ -628,7 +648,7 @@ simulation control command `sensor.hang on|spin|off` makes every read of the fro
   same magic, version and CRC tell a cell from the garbage of a power-on. The bootloader shares
   the cell with the application (the hand-off, phase 4), so both linker scripts need it at the
   same address (phase 7).
-- **The DTCs** would be read and cleared over UDS (phase 5) as they are; keeping them across a
+- **The DTCs** are read and cleared over UDS (phase 5) as they are; keeping them across a
   reset would need a function that restores a saved state, which this project does not add.
 
 ## Measured on the development laptop
@@ -708,6 +728,7 @@ The size of the DTC state, with `sizeof` on the host and `arm-none-eabi-gcc -mcp
 | [tests/system/test_retained.py](../tests/system/test_retained.py) | the node with `--retained-file`: every verdict, every reason reported by name and value, a killed node, two nodes on one cell, an unusable path, and a watchdog reset of `wdg_selftest expire` that the node then reports |
 | [tests/system/test_boot.py](../tests/system/test_boot.py), [test_update.py](../tests/system/test_update.py), [test_update_cuts.py](../tests/system/test_update_cuts.py) (phase 4) | the reset cause through the bootloader: a watchdog reset of the node started through fcn_boot is reported by the next start (BMS_NodeInfo, RESET_WATCHDOG) next to the hand-off; UPDATE_ROLLBACK active and confirmed in the first BMS_Fault after a ROLLBACK (a trial that crashes, one that hangs), a REJECT (a trial with a flipped bit) and a FALLBACK (a confirmed image with a flipped bit), and not in the start after that; after a cut in the rollback record, reported by the start that writes it again, and lost when the cut completed it ([update.md](update.md)) |
 | [tests/system/test_faults.py](../tests/system/test_faults.py) | every fault of the table applied from outside: the right DTC in BMS_Fault, and only it, while it lasts, PackFaultActive and FAULT meanwhile, testFailed cleared and confirmedDTC kept after it, and the status byte, counter and fault detection counter in the statistics, both while the fault is active and after it, with two exceptions: SAMPLE_TIMEOUT, during which no sample and so no BMS_PackStatus comes, in BMS_PackStatus and in the statistics only once a stall the node survived has ended, and SUPERVISION_EXPIRED, which ends in a reset, which writes no statistics and leaves no after; a fault that comes and goes within one health period, active in its frame and logged; the clear while a fault is there and after it, a failure detected after the request surviving it and nothing from before the request in its frame; a shorted bus until bus off and the 5 s until its DTC heals; every reset cause a cell can record; `sensor.hang on` ending in a reset with status 11 and nothing else, then the start on the same cell (WATCHDOG, RESET_WATCHDOG until a clear) and after a power loss (POWER_ON); the supervision configuration of the design; one BMS_Fault per health period and every change of the DTCs in the frame of the period that made it, the frames counted exactly against the statistics and every one checked with the independent Profile 11 implementation; and, as timing tolerances, the time from a fault to its frame, from a hang to the reset, and from a change's log line to the frame that shows it, a stall of the sensor task that leaves two examinations without an alive indication survived (SAMPLE_TIMEOUT healed), and one that leaves three ending in a reset |
+| [tests/system/test_diag_services.py](../tests/system/test_diag_services.py), [test_download.py](../tests/system/test_download.py), [test_download_faults.py](../tests/system/test_download_faults.py) (phase 5) | ReadDTCInformation over UDS: the DTCs of the fault table in its order, the lists and counts by mask against reportSupportedDTC; a cell over its voltage limit, after it heals and after ClearDiagnosticInformation, each time 0x19's status bytes against BMS_Fault's FaultActive and FaultConfirmed DTC by DTC, and after the clear a BMS_Fault with FaultClearCount 1 and nothing confirmed; the snapshot of a run without a fault against the statistics; UPDATE_ROLLBACK after a rollback of a downloaded image read through 0x19, in BMS_Fault, and gone after the clear ([diagnostics.md](diagnostics.md)) |
 | every system test | the test harness fails any test whose node was reset without the test waiting for that reset with `wait_for_reset()`, and any test with a run that ended in order whose statistics show a kick missing: the hardware watchdog not started, kicks and withheld kicks that do not add up to the supervision cycles, or kicks the health task decided on that the watchdog did not count (`NodeProcess.lost_kicks()`); at the end of a test it stops the nodes that still run in order (SIGTERM), so that their kicks are checked too ([tests/conftest.py](../tests/conftest.py), for the nodes started through its fixtures; the few tests that start the node themselves assert its exit status and, after an orderly end, its kicks). So no node was reset without the test waiting for it, and in every run that ended in order every kick the health task decided on reached the hardware watchdog; neither shows that the kicks came often enough in a run shorter than the watchdog's 500 ms timeout or in the last 500 ms before an orderly stop, which switches the watchdog off |
 
 Each module was challenged with planted defects when it was written: realistic mistakes in a
@@ -754,9 +775,10 @@ the same way. 22 defects, each planted alone in a scratch copy, and every one ca
   erases: a trial that cuts its own supply would then never run out of attempts. lib/boot counts
   them in the flash, one program unit per attempt written before the trial starts
   ([update.md](update.md)); the cell's reserved words carry the bootloader's hand-off instead.
-- **UDS (phase 5).** ReadDTCInformation (0x19) and ClearDiagnosticInformation (0x14) over
-  ISO-TP will expose the DTCs through the read functions above; until then BMS_Fault and the
-  statistics are the only views, and CmdClearFaultsSeq the only clear.
+- **UDS (phase 5).** ReadDTCInformation (0x19: 0x01, 0x02, 0x0A) and ClearDiagnosticInformation
+  (0x14, all groups) over ISO-TP expose the DTCs through the read functions above
+  ([read access over UDS](#read-access-over-uds-phase-5)); BMS_Fault and the statistics are the
+  other views, and CmdClearFaultsSeq the other clear. The other reports of 0x19 are not served.
 - **Not implemented in lib/dtc:** healing of the warning indicator, snapshot (freeze-frame) and
   extended data records, occurrence counters, enable and storage conditions, an event memory
   smaller than the number of events, time-based debouncing, jump up, more than one kind of

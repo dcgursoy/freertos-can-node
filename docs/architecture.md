@@ -7,7 +7,11 @@ fault monitor and the supervision of the tasks to the processing and the health 
 ([app/fault.h](../app/fault.h), SUPERVISION in [app/app.c](../app/app.c)). Phase 4 added the
 node's side of an update: the bootloader's hand-off read at start, the confirm of a trial image,
 and the flash task that makes every write of the node to the flash ([app/update.h](../app/update.h),
-THE UPDATE in [app/app.c](../app/app.c)).
+THE UPDATE in [app/app.c](../app/app.c)). Phase 5 added the diagnostic task, which serves a tester
+on the bus with ISO-TP and UDS ([app/diag.h](../app/diag.h), lib/isotp and lib/uds), the flash
+task's jobs of a download ([app/flash_job.h](../app/flash_job.h)), the supervision of the flash
+task, and the snapshot and the clear of the DTCs for the UDS services (THE DIAGNOSTIC TASK and
+THE FLASH TASK in [app/app.c](../app/app.c)).
 The messages themselves are described in [can-protocol.md](can-protocol.md), the simulated bus in
 [can-simulation.md](can-simulation.md) and the sensor model in [sensor-model.md](sensor-model.md).
 
@@ -28,6 +32,13 @@ The messages themselves are described in [can-protocol.md](can-protocol.md), the
   bootloader's hand-off (plat_retained.h) ──> app_start: ActiveSlot, BMS_BootInfo, UPDATE_ROLLBACK
   health ──(confirm request, once a trial ran 5 s in good health)──> flash ──> lib/boot ──> flash (plat_flash.h)
          <──(the confirm's result)──────────────────────────────────┘
+
+  bus ──> can_rx ──(UDS_Request 0x7E0, a queue of 18)──> diag: lib/isotp ──> lib/uds ──(backend)
+  can_tx ──(reports of UDS_Response 0x7E8 sent, a queue of 8)──> diag       │
+  diag ──(UDS_Response frames, event frames of the transmit queue)──> can_tx ──> bus
+  diag ──(a flash job: erase, write, exit, check, confirm)──> flash ──(done)──> diag
+  health ──(the DTCs' snapshot, the clears carried out, the confirm's state)──> diag
+  diag ──(ClearDiagnosticInformation: one more clear request)──> health
 ```
 
 The DTCs ([lib/dtc](../lib/dtc/dtc.h), the faults in [app/fault.c](../app/fault.c)) have one
@@ -39,19 +50,20 @@ their DTCs, the fault frame, the watchdogs and the reset cause.
 
 ## Tasks
 
-Six tasks of the application, all created statically before the scheduler starts
+Seven tasks of the application, all created statically before the scheduler starts
 ([app/app.c](../app/app.c), [app/can_io.c](../app/can_io.c)); priorities and periods are defined in
 one place, [app/app_tasks.h](../app/app_tasks.h) and [app/can_io.h](../app/can_io.h). A higher number
 is more urgent.
 
 | Task | Priority | Released by | Does |
 |---|---|---|---|
-| `can_rx` | 6 | the CAN interrupt (task notification); at the latest after 50 ms, and at the end of every 100 ms receive cycle | takes received frames out of the controller's FIFO (at most 32 per activation) and calls their handlers: a pong for every ping, the check of every TESTER_Command; once per receive cycle the TESTER_Command check without data |
-| `sensor` | 5 | every 10 ms (`xTaskDelayUntil`) | publishes BMS_Heartbeat, reads the current in every period, the cells in every second and the temperatures in every tenth, posts the sample |
-| `process` | 4 | a sample in the queue, or 30 ms without one | runs lib/bms on the sample under the pack mutex, builds, protects and publishes the protected messages; judges the sample (or the timeout) for the fault monitor and posts the verdict to `health` |
-| `can_tx` | 3 | a producer or the controller (task notification), or the queue's next deadline, at the latest after 50 ms | loads the controller's three mailboxes from the transmit queue, handles transmit-done events, the bus-off policy |
-| `health` | 2 | every 100 ms (`xTaskDelayUntil`) | the supervision cycle of the watchdog manager and the kick of the hardware watchdog; the DTCs (the verdicts, the CAN controller, the supervision, clears) and BMS_Fault in every period; whether a trial image runs in good health, and once it has for 5 s the request for its confirm; BMS_TaskStats every second period (one task per frame), BMS_NodeInfo and a log line every tenth, BMS_BootInfo in the periods 2, 12, 22, ...; ends a run of `--duration-s` |
-| `flash` | 1 | the health task's request (task notification) | every write of the node to the flash: the confirm of a trial (`boot_confirm()` of lib/boot), and at start, when the bootloader started the node, a read of the metadata for the log and the statistics; phase 5's slot writer will run here too. Without a flash it waits and does nothing. Each flash operation blocks it for the time the part takes (a page program 0.4 ms, a sector erase 45 ms, [plat_flash.h](../platform/include/plat_flash.h)) |
+| `can_rx` | 7 | the CAN interrupt (task notification); at the latest after 50 ms, and at the end of every 100 ms receive cycle | takes received frames out of the controller's FIFO (at most 32 per activation) and calls their handlers: a pong for every ping, the check of every TESTER_Command, every UDS_Request frame into the diagnostic task's queue; once per receive cycle the TESTER_Command check without data |
+| `sensor` | 6 | every 10 ms (`xTaskDelayUntil`) | publishes BMS_Heartbeat, reads the current in every period, the cells in every second and the temperatures in every tenth, posts the sample |
+| `process` | 5 | a sample in the queue, or 30 ms without one | runs lib/bms on the sample under the pack mutex, builds, protects and publishes the protected messages; judges the sample (or the timeout) for the fault monitor and posts the verdict to `health` |
+| `can_tx` | 4 | a producer or the controller (task notification), or the queue's next deadline, at the latest after 50 ms | loads the controller's three mailboxes from the transmit queue, handles transmit-done events and hands those of UDS_Response frames to the diagnostic task, the bus-off policy |
+| `diag` | 3 | a UDS_Request frame or a report of a UDS_Response frame sent, a flash job done, a clear made (task notification), the next deadline of the connection, at the latest after 50 ms | the diagnostic connection ([app/diag.h](../app/diag.h)): lib/isotp and lib/uds on 0x7E0 and 0x7E8, at most 2 frames and reports in a tick; the UDS backend ([app/diag_backend.h](../app/diag_backend.h)): the flash jobs of a download and of the confirm routine, the boot information, the DTC snapshot and the clear; the ECUReset |
+| `health` | 2 | every 100 ms (`xTaskDelayUntil`) | the supervision cycle of the watchdog manager and the kick of the hardware watchdog; the DTCs (the verdicts, the CAN controller, the supervision, clears, those of ClearDiagnosticInformation too) and BMS_Fault in every period, and the snapshot of the DTCs for the diagnostic task; whether a trial image runs in good health, and once it has for 5 s the request for its confirm; BMS_TaskStats every second period (one task per frame), BMS_NodeInfo and a log line every tenth, BMS_BootInfo in the periods 2, 12, 22, ...; ends a run of `--duration-s` |
+| `flash` | 1 | a job of the diagnostic task or the health task's request (task notification), and at the latest after 100 ms | every write of the node to the flash: the jobs of a download (the erase, each block, the exit, the check: lib/boot's slot writer) and of the confirm routine ([app/flash_job.h](../app/flash_job.h)), the confirm of a trial by itself (`boot_confirm()`), and at start, when the bootloader started the node, a read of the metadata for the log and the statistics. Without a flash every job ends with BOOT_E_STATE. Each flash operation blocks it for the time the part takes (a page program 0.4 ms, a sector erase 45 ms; 3 ms and 400 ms at most, [plat_flash.h](../platform/include/plat_flash.h)) |
 
 Every task's stack is 512 words (`APP_TASK_STACK_WORDS`, `TASK_STACK_WORDS` in can_io.c), the
 size meant for the target; on the host each task runs on a pthread stack of its own, which the
@@ -59,17 +71,58 @@ platform measures ([README](../README.md#what-phase-0-contains)).
 
 **Why the flash task is the lowest.** A flash operation is synchronous and slow: the driver of a
 serial NOR polls the part's busy flag, and the host's flash blocks the calling task one tick at a
-time until the modelled time has passed. A task with a deadline, or one the watchdog manager
-supervises, would spend that time waiting: a sector erase is 45 ms, almost half a health period,
-and phase 5's erase of a slot is 256 of them. Below every other task the waits delay nobody; the
-only cost to the others is its short critical sections (see the analysis below). It is not a
-supervised entity of the watchdog manager: it waits for requests without a period, and in phase 4
-it has one job per run at most. A hang of it shows as a confirm that never comes (BMS_BootInfo
-ConfirmState CONFIRMING), after which the trial is rolled back by its attempts.
+time until the modelled time has passed. A task with a deadline would spend that time waiting: a
+sector erase is 45 ms, almost half a health period (400 ms at the part's maximum), and an erase of
+a whole slot is 256 of them. Below every other task the waits delay nobody; the only cost to the
+others is its short critical sections (see the analysis below).
+
+**How the flash task is supervised (phase 5).** In phase 4 it had one job per run at most and was
+no supervised entity; a download gives it hundreds, and a job that never returns (a part whose
+busy flag never clears) must not leave the tester waiting for ever. It is now an entity of the
+watchdog manager: it waits for a job at most 100 ms and gives an alive indication after every wait
+and after every call of lib/boot in a job. Its window is 6 supervision cycles (600 ms, no less than
+555 ms with the health task's response time), longer than the longest call of a working flash task
+at the part's maximum times (a record: a sector erase and three page programs, 409 ms) with its own
+response time (under 70 ms) on top, so erase steps of 400 ms back to back keep it OK; with a failed
+tolerance of 1 a flash task that stops is EXPIRED 1.2 to 1.8 s after its last indication, and the
+hardware watchdog resets the node 500 ms after the last kick. Meanwhile the diagnostic task, which
+does not wait for the flash, answers responsePending every 2 s, so a download stuck in the flash
+task ends in a watchdog reset, after which the bootloader starts the confirmed image (the slot
+written stays WRITING or EMPTY, which it never starts) and the tester's request runs out of
+P2*client. [tests/system/test_download.py](../tests/system/test_download.py) makes the first
+program of a run hang (`--flash-hang 1`, [posix_flash.h](../platform/posix/posix_flash.h)) and
+checks exactly that.
+
+**Why the diagnostic task sits between `can_tx` and `health`.** Below `can_tx`, so that nothing of
+the connection adds to `can_tx`'s response time, the smallest margin of the set (below). Above
+`health`, whose budget is 5.5 ms: a responsePending that lib/uds produces 40 ms after a request has
+to go out before P2server, 50 ms, and with `health` above it the diagnostic task's response could
+be 45 ms. Phase 5 therefore moved the four tasks above it up by one priority, and
+configMAX_PRIORITIES from 8 to 9: the levels 0 (idle) to 7 for the tasks, and 8 above every one
+of them for the health task's orderly stop of the host build (`stop_node()` in
+[app/app.c](../app/app.c), which asserts at compile time that no task has it). The stop reads
+the counters and ends the scheduler at that priority so that no task runs in between; with
+can_rx at 7 and the stop at 7 as well, time slicing let the receive task take a batch of frames
+at the next tick after its counter was read, and the receive path's accounting
+(`controller.rx_frames` against the driver's counts) came out about 30 frames short in 6 of 60
+runs of the 1 Mbit/s flood test of [test_node_errors.py](../tests/system/test_node_errors.py),
+and in none of 60 with the level kept free.
+
+**How no consecutive frame is lost in the node.** The node's flow control asks for blocks of 16
+consecutive frames (BS 16, STmin 0, [app/diag.h](../app/diag.h)). A tester that keeps to ISO 15765-2
+sends no more than one block before it waits for the next flow control, which the diagnostic task
+sends only after it took the block's last frame out of its queue; and it sends its next request
+only after the node's response. So the queue between `can_rx` and `diag` holds at most 16 of its
+frames, whatever the diagnostic task's timing; it has 18 places (`APP_DIAG_RX_QUEUE_LENGTH`). The
+controller's receive FIFO in front of `can_rx` is drained by the highest-priority task, in batches
+that cover a full bus at 1 Mbit/s (phase 1's analysis, bug 007), also under a flood of other
+frames. A frame the queue refuses is counted (`diag.task.rx_lost`), and a lost consecutive frame
+ends its reception in lib/isotp (`rx_results.WRONG_SN`, `TIMEOUT_CR`). The node never keeps the
+receive buffer (lib/uds copies the request in the indication), so it never sends FC WAIT.
 
 **Rate-monotonic order, with one exception.** A task with a shorter period has the higher
 priority: `can_rx` (modelled per tick, T = 1 ms; frames can come every 47 µs) above `sensor` and
-`process` (10 ms) above `health` (100 ms). `sensor` and `process` share a period; `sensor` is
+`process` (10 ms) above `diag` (modelled per 10 ms) above `health` (100 ms). `sensor` and `process` share a period; `sensor` is
 above, because `process` waits for its samples. The exception is `can_tx`, which is released by
 every frame it loads and so more often than the tasks above it. It runs below the tasks that
 produce the frames on purpose: a producer is never preempted by its own output, and the frames a
@@ -85,15 +138,21 @@ response-time analysis below holds for any fixed priorities and is the verdict.
 | CAN interrupt | `can_rx`, `can_tx` | task notification, one bit per cause (`xTaskNotifyFromISR`, `eSetBits`) | each task waits for "something for you" from one interrupt, with a few causes that may coincide. Bits in the notification value carry them without a kernel object per cause, and a bit set while the task is busy is still there when it next waits |
 | any producer | `can_tx` | the transmit queue ([lib/can/can_txq.h](../lib/can/can_txq.h)) in short critical sections, then a notification bit | a cyclic message needs a slot that keeps only the newest value, not a FIFO: a busy bus must delay data, not queue stale values. The queue is plain C shared by several tasks, so it is guarded by `taskENTER_CRITICAL` for the few instructions an operation takes, cheaper than a mutex for that length |
 | `sensor` | `process` | FreeRTOS queue of 4 samples (`app_sample_t`: lib/bms's `bms_sample_t` and the groups the front end did not answer, copied), statically allocated | a copy decouples the two in time and in memory: the sensor task can take the next sample while the last one is processed. The sensor task never waits for room (timeout 0): a full queue costs a sample, which is counted (`sample_queue.full`) and which lib/bms sees as a gap in the sequence numbers, but it never holds up the time base. The processing task waits with a timeout of 30 ms, three sensor periods: a timeout means the sensor task has stopped delivering, and is counted (`process.timeouts`) and judged as the fault SAMPLE_TIMEOUT. The processing task makes no log call; the health task logs the start and the end of such a stall from its counts (`process.timeouts`, `process.recoveries`) |
-| `process` | `health` | the pack state (`bms_pack_t`) behind a mutex with priority inheritance | shared state that a reader must see whole, written by one task and read by another. The mutex is held only to run lib/bms on one sample or to copy the state, and frames are built from the copy outside the lock. While `health` (2) holds it, `process` (4) waiting for it lifts `health` to 4, so no task between them (`can_tx`) can prolong the wait |
+| `process` | `health` | the pack state (`bms_pack_t`) behind a mutex with priority inheritance | shared state that a reader must see whole, written by one task and read by another. The mutex is held only to run lib/bms on one sample or to copy the state, and frames are built from the copy outside the lock. While `health` (2) holds it, `process` (5) waiting for it lifts `health` to 5, so no task between them (`can_tx`, `diag`) can prolong the wait |
 | `can_rx` | `process` | the telemetry switch, one `bool` read and written in critical sections | one word, set from TESTER_Command and read once per sample: a critical section around one load or store is the cheapest correct way |
 | `process` | `health` | a FreeRTOS queue of 32 verdicts on the samples (`fault_verdict_t`, 8 bytes: two masks and the count of clear requests the processing task read as it posted the verdict, [app/fault.h](../app/fault.h)), statically allocated; the processing task never waits for room, a lost verdict is counted (`process.verdicts_lost`) | the DTCs have one owner, the health task; the processing task judges each sample where the data is and hands over the verdict in its order, so that the debouncing counts samples, and the count tells the health task which verdicts came after a clear request. The owner sits below `can_tx`: the DTC work in the processing task would have added to `can_tx`'s response time, which the analysis below does not allow (see [the task table](#the-result-for-the-nodes-task-table)) |
 | `health` | `process` | the summary of the DTCs (`fault_summary_t`), written after every health period and read once per sample in critical sections | PackFaultActive and PackState FAULT follow the faults active in the summary; a few words, like the telemetry switch |
 | `can_rx` | `process`, `health` | the count of clear requests of TESTER_Command, written and read in critical sections | the processing task tags each verdict with it, and the health task carries out a clear once per new count (`command_rx_t.clear_requests`), before the first verdict that carries it |
 | `sensor`, `process`, `can_rx`, `can_tx` | `health` | alive indications to the watchdog manager ([lib/wdgm](../lib/wdgm/wdgm.h)), one lock-free atomic addition each | a task that hangs stops counting; the health task examines the counts once per period and kicks the hardware watchdog only while the manager allows it |
 | bootloader | every task | the hand-off (`plat_boot_handoff()`), read once by `app_start()` before the scheduler starts and constant after | written before the image runs, read-only while it runs: no lock |
-| `health` | `flash` | a task notification (`xTaskNotifyGive`), once per run when the trial has run 5 s in good health | one request and no data: the slot to confirm is the hand-off's, which both tasks read |
-| `flash` | `health` | the result of the confirm (`boot_status_t` and a flag), written and read in critical sections | two words; the health task takes it in its next period and updates the confirm's state (BMS_BootInfo) |
+| `health` | `flash` | a task notification bit, once per run when the trial has run 5 s in good health | one request and no data: the slot to confirm is the hand-off's, which both tasks read |
+| `flash` | `health` | the result of the confirm (`boot_status_t` and a flag), and whether the tester's routine confirmed the trial, written and read in critical sections | a few words; the health task takes them in its next period and updates the confirm's state (BMS_BootInfo) |
+| `can_rx` | `diag` | a FreeRTOS queue of 18 UDS_Request frames (`can_frame_t`), statically allocated, and a notification bit; `can_rx` never waits for room, a frame it refuses is counted (`diag.task.rx_lost`) | the frames have to be taken in their order, by a task below the one that receives them; why 18 is enough is above |
+| `can_tx` | `diag` | a FreeRTOS queue of 8 reports of UDS_Response frames sent (the time each was queued with), and a notification bit (`can_io_on_tx_done()`) | lib/isotp needs every confirmation, in the order of the frames; the time identifies the frame, so that a report that comes after lib/isotp gave its frame up is never taken for the next frame ([app/diag.h](../app/diag.h), CONFIRMATIONS) |
+| `diag` | `can_tx` | the transmit queue's event FIFO (`can_io_send_event_stamped()`), with a notification only when no other event frame is held | a response must not be replaced or reordered; a frame queued behind another event frame is loaded when that frame is reported, so a burst costs `can_tx` one pass (the analysis below) |
+| `diag` | `flash` | a mailbox of one job (`flash_job_t`) and its result, in critical sections, and a notification bit each way | lib/uds runs one operation at a time, so one job is enough; the data of a TransferData block is lib/uds's copy, unchanged until the job is done |
+| `health` | `diag` | the DTCs' snapshot (a copy of lib/dtc's state, about 150 bytes on the target), the count of clear requests carried out and the confirm's state, written after every period in a critical section; a notification bit after a clear | the DTC services read one consistent picture of the end of the health task's last period, at most one period and the health task's response time (45 ms) old; the clear is made by the DTCs' only owner |
+| `diag` | `health` | ClearDiagnosticInformation as one more clear request, added to those of TESTER_Command, in a critical section | the health task carries out every new count as it did for TESTER_Command alone, in order with the evidence (run_faults()), and the positive response waits until the count carried out has reached the diagnostic task's |
 | every task | statistics | counters each written by one task only; the health task copies them at the end after raising itself to the highest priority | no task is in the middle of an update when they are read |
 
 Every kernel object of the application is allocated statically (`xTaskCreateStatic`,
@@ -158,12 +217,12 @@ Every kernel object of the application is allocated statically (`xTaskCreateStat
 The heartbeat comes from the sensor task because its two numbers describe that task: the
 number of the period it runs and the tick it was released in. The sensor task is the highest-priority
 periodic task and is released by the tick alone, so the numbers keep the timing of phase 1's
-status frame. The frame reaches the bus only when `can_tx` loads it, and `can_tx` (3) runs below
-`process` (4): the heartbeat goes out after the processing job of its period, and a heartbeat on
+status frame. The frame reaches the bus only when `can_tx` loads it, and `can_tx` (4) runs below
+`process` (5): the heartbeat goes out after the processing job of its period, and a heartbeat on
 the bus says that the sensor task and `can_tx` both run. A processing task that blocks shows on
 the bus by itself: its protected messages stop while the heartbeat goes on, and their receivers'
 end-to-end checks time out. A processing job that does not end keeps `can_tx` from running, as
-any task at priority 3 or above that keeps the CPU does: the heartbeat then stops with every
+any task at priority 4 or above that keeps the CPU does: the heartbeat then stops with every
 other frame of the node, which a receiver cannot tell from a time base that stopped. The
 watchdogs of phase 3 find both: the watchdog manager a task that stops reporting that it is
 alive, the hardware watchdog a health task that no longer kicks it (SUPERVISION in
@@ -226,6 +285,27 @@ node, rather than the tester, stood still.
   `present`, `slot`, `mode` (confirmed or trial), `attempt`, `image_version` and its
   `image_version_code`, `event` (NONE, ADOPT, ROLLBACK, REJECT, FALLBACK), `event_slot`,
   `select_write_error`, and `rolled_back` (the evidence of UPDATE_ROLLBACK);
+- `diag` (phase 5): the diagnostic connection: `session`; `task` (the diagnostic task:
+  `events`, `passes`, `budget_waits`, `events_per_tick`, `rx_queue_length`, `rx_lost`,
+  `rx_high_water`, `tx_done_queue_length`, `tx_done_lost`); `connection` ([app/diag.h](../app/diag.h):
+  `frames_in`, `frames_out`, `frames_refused`, `confirms`, `confirms_passed`, `confirms_late`,
+  `confirms_unknown`, `confirms_forgotten`, `requests`, `responses`, `responses_sent`,
+  `responses_failed`, `responses_dropped`, `resets`); `isotp` (its `parameters`, and lib/isotp's
+  counters: `tx_requests`, `tx_results` and `rx_results` by N_Result, `ff_indications`,
+  `frames_out` and `frames_in` by kind, `ignored` by reason, `rx_overflow`, `rx_sf_too_long`,
+  `rx_sf_busy`, `fc_dropped`, `stmin_reserved`, `send_refused`, `confirmed`, `confirm_unmatched`,
+  `unconfirmed`, `proven`, `outstanding`, `reentry_refused`, `n_br_late`, `n_cs_late`,
+  `n_br_max_us`, `n_cs_max_us`); `uds` (lib/uds's: `requests` by service, `requests_unsupported`,
+  `requests_empty`, `nrc` by name, `response_pending`, `positive`, `suppressed`, `session_changes`,
+  `s3_timeouts`, `resets`, `pending_max_us`, and `download`: `state`, `address`, `size`,
+  `received`, `blocks`, `repeated_blocks`, `counter`, `erases`, `started`, `exited`, `committed`,
+  `aborted`, `failed`, `erase_us`, `transfer_us`, `check_us`); `backend` ([app/diag_backend.h](../app/diag_backend.h):
+  `post_refused`, `snapshots`, `clears`, `clears_done`, `resets`, and per job kind `posted`,
+  `failed`, `last_steps`, `last_status`); in `can.driver`, `tx_done_reports` and
+  `tx_quiet_enqueues`; in `confirm.flash_task`, `confirmed_by_routine`, `self_skipped`,
+  `idle_passes`, and per job kind (`jobs`) `run`, `last_status`, `last_steps`, `last_ns` and
+  `max_ns`. A run that ends in a reset writes no statistics: a download run that the tester ends
+  with ECUReset has its observables in its log and in the tester's report;
 - `confirm` (phase 4): the confirm of a trial ([app/update.h](../app/update.h)): `state`
   (NOT_NEEDED, WAITING, CONFIRMING, CONFIRMED, FAILED), `confirm_after_s`, `periods_needed`,
   `periods` judged, `healthy_periods`, `window_restarts`, `requested_period`, the periods that
@@ -289,9 +369,9 @@ The rules (Audsley, Burns, Richardson, Tindell and Wellings 1993, and those of t
 as app/task_table.c applies them:
 
 - **Interrupts** are sporadic tasks above every task, with a priority of `configMAX_PRIORITIES`
-  (8) or more: `can_irq` (9) at the shortest frame on the bus at the highest bit rate the node
+  (9) or more: `can_irq` (10) at the shortest frame on the bus at the highest bit rate the node
   accepts (44 bits and the 3-bit intermission at 1 Mbit/s: 47 µs), so that every bit rate is
-  covered, and the kernel's tick, `tick_irq` (8), periodic with T = 1000 µs
+  covered, and the kernel's tick, `tick_irq` (9), periodic with T = 1000 µs
   (`configTICK_RATE_HZ` is 1000).
 - **`can_rx` and `can_tx`** are released by events that can come far more often than once per
   tick, so each is modelled by its demand per tick: one job per tick (T = 1000 µs) that does what
@@ -355,6 +435,38 @@ as app/task_table.c applies them:
   task](#filling-in-the-table-for-another-task)), which for the lowest-priority task lengthens
   only its own response. Its critical sections (a log line's push, the result handed back) are
   counted as 5 µs, those of the transmit queue.
+- **Phase 5** added the diagnostic task and changed four entries.
+  - `diag` (priority 3): released by every UDS_Request frame, every report of a UDS_Response
+    frame, a flash job done, a clear made and its own deadline, so like `can_rx` modelled by its
+    demand per window, here of 10 ms, with a deadline of 10 ms (P2server's 50 ms less the 40 ms
+    of the first responsePending). It takes at most 2 frames and reports in a tick
+    (`APP_DIAG_EVENTS_PER_TICK`), so a window has at most 20: 6 µs each through lib/isotp and
+    into the transmit queue, 20 µs for the message each can complete (lib/uds's checks, the copy
+    of up to 1026 bytes, a response of up to 131 bytes, a flash job posted), 20 µs for each of the
+    22 responses the polls can produce (one per job, one job per request, and one
+    responsePending), and 62 passes of 5 µs: 1270 µs. Without the cap a tester that floods 0x7E0
+    at 1 Mbit/s could ask for 91 frames in 10 ms and make the set unschedulable; the cap is what
+    bounds the task's demand, and with it the throughput of a download (79 ticks at least for a
+    TransferData of 1024 bytes: 147 frames in and 11 reports).
+  - `can_tx`: one pass more, 26 → 27 (479 → 492 µs). A frame of the diagnostic task wakes
+    `can_tx` only when no other event frame is held (`can_io_send_event_stamped()`); otherwise the
+    report of the frame ahead of it, a pass counted already, loads it. So between two such
+    wake-ups a diagnostic frame ended on the bus, and in any window there is at most one wake-up
+    more than diagnostic frames that ended in it. Such a frame has 8 bytes (111 µs at 1 Mbit/s)
+    and costs two passes with its report, 2 events and the report handed on, 36 µs per 111 µs of
+    bus; a shortest frame costs 19 µs per 47 µs, more per µs of bus, so the worst window is still
+    one of 22 shortest frames, and the diagnostic task adds the one pass.
+  - `health`: the snapshot of the DTCs, the clears carried out and the confirm's state published
+    in critical sections (5 µs), the notification of the diagnostic task after a clear (2 µs), and
+    once per run a confirm of the routine taken into the monitor with its log line (105 µs):
+    5354 → 5466 µs.
+  - `flash`: its job is now a run of lib/boot's calls (an erase of any number of sectors, a
+    block written, the validation of an image a step per 64 bytes), each of which waits for the
+    part; modelled by its longest call, a record write (the confirm's budget of phase 4, now with
+    the result handed back and the notification of the task that waits for it: 4145 µs). Its jobs
+    take whatever processor time the other tasks leave.
+  - The priorities of `can_rx`, `sensor`, `process` and `can_tx` went up by one (7, 6, 5, 4),
+    which changes no response time: the order is the same.
 - **The idle task** is not listed. There are no software timers (`configUSE_TIMERS` is 0), so
   there is no timer task either.
 
@@ -410,24 +522,25 @@ python -m fcn_tools.sched task_table.json
 ```
 
 ```
-Utilisation U = sum of C/T = 0.8145
+Utilisation U = sum of C/T = 0.9557
   necessary          U <= 1                                       holds
-  Liu and Layland    U <= n(2^(1/n) - 1) = 0.7241 for n = 8       not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx, health; priorities not in rate-monotonic order
-  hyperbolic         prod(C/T + 1) = 2.0355 <= 2                  not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx, health; priorities not in rate-monotonic order
+  Liu and Layland    U <= n(2^(1/n) - 1) = 0.7205 for n = 9       not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx, diag, health; priorities not in rate-monotonic order
+  hyperbolic         prod(C/T + 1) = 2.3167 <= 2                  not applicable: deadline shorter than period: sensor; release jitter: process; blocking by lower-priority tasks: can_irq, tick_irq, can_rx, sensor, process, can_tx, diag, health; priorities not in rate-monotonic order
 
 Priority order (a higher number is more urgent)
-  rate-monotonic      no: can_tx (T 1000, priority 3) is not above sensor (T 10000, priority 5) (and 1 more pair(s))
-  deadline-monotonic  no: can_tx (D 1000, priority 3) is not above sensor (D 2000, priority 5) (and 1 more pair(s))
+  rate-monotonic      no: can_tx (T 1000, priority 4) is not above sensor (T 10000, priority 6) (and 1 more pair(s))
+  deadline-monotonic  no: can_tx (D 1000, priority 4) is not above sensor (D 2000, priority 6) (and 1 more pair(s))
 
   task      prio  kind           T       D     C     J   B      R  slack  job  verdict
-  can_irq      9  sporadic      47      47     2     0  20     22     25  1/1  meets
-  tick_irq     8  periodic    1000    1000     3     0  20     25    975  1/1  meets
-  can_rx       6  sporadic    1000    1000   169     0  20    202    798  1/1  meets
-  sensor       5  periodic   10000    2000   100     0  20    306   1694  1/1  meets
-  process      4  periodic   10000   10000   160  2000  30   2484   7516  1/1  meets
-  can_tx       3  sporadic    1000    1000   479     0  25    978     22  1/1  meets
-  health       2  periodic  100000  100000  5354     0   5  19907  80093  1/1  meets
-  flash        1  sporadic  100000  100000  4140     0   0  34801  65199  1/1  meets
+  can_irq     10  sporadic      47      47     2     0  20     22     25  1/1  meets
+  tick_irq     9  periodic    1000    1000     3     0  20     25    975  1/1  meets
+  can_rx       7  sporadic    1000    1000   169     0  20    202    798  1/1  meets
+  sensor       6  periodic   10000    2000   100     0  20    306   1694  1/1  meets
+  process      5  periodic   10000   10000   160  2000  30   2484   7516  1/1  meets
+  can_tx       4  sporadic    1000    1000   492     0  30    998      2  1/1  meets
+  diag         3  sporadic   10000   10000  1270     0  25   5787   4213  1/1  meets
+  health       2  periodic  100000  100000  5466     0   5  44913  55087  1/1  meets
+  flash        1  sporadic  100000  100000  4145     0   0  69939  30061  1/1  meets
 
 Verdict: schedulable: every task meets its deadline
 ```
@@ -438,17 +551,25 @@ applicable, as expected for this table: the sensor task's deadline is shorter th
 the processing task has release jitter, the critical sections and the pack mutex mean blocking,
 and `can_tx` breaks rate-monotonic order. The response-time analysis is the verdict: with the
 design budgets, every task meets its deadline. The smallest margin relative to its deadline is
-`can_tx`'s, 22 of 1000 µs (37 in phase 2, 27 in phase 3: the 10 µs added to the processing
-task's budget in phase 3 are 10 µs more of `can_tx`'s response, and in phase 4 the flash task's
-critical sections add 5 µs to its blocking). That margin is thin, and most of `can_tx`'s 479 µs
-is what its passes cost whatever they carry: 338 µs, 13 µs for each of 26. The analysis adds up
+`can_tx`'s, 2 of 1000 µs (37 in phase 2, 27 in phase 3, 22 in phase 4: the 10 µs added to the
+processing task's budget in phase 3 are 10 µs more of `can_tx`'s response, in phase 4 the flash
+task's critical sections add 5 µs to its blocking, and in phase 5 the diagnostic task's pass adds
+13 µs to its budget and the pack mutex held by `health` decides its blocking, 30 µs). That margin
+is as thin as it can be: any more work above `diag` would make `can_tx` miss its deadline in the
+analysis, which is why the diagnostic task is below it, and why its frames wake `can_tx` only when
+nothing else will. Most of `can_tx`'s 492 µs is what its passes cost whatever they carry: 351 µs,
+13 µs for each of 27. The analysis adds up
 the non-preemptive stretches of the lower-priority tasks (`can_tx`: the health task's 20 µs and
 the flash task's 5 µs, B = 25), the smaller of its two sums; on one processor a job can be
 blocked by only one of them, the one running when it arrives, so 20 µs would be the bound here
 and the 5 µs are a pessimism of the analysis. The processing task's response, 2484 µs from the
 tick, is mostly the 2000 µs of release jitter that the sensor task's deadline allows it. The
-health task's response, 19907 µs, is a fifth of its period, and the flash task's, 34801 µs from
-the request, a third of its: CPU time only, before its waits for the part. The largest blocking
+health task's response, 44913 µs, is under half of its period (19907 µs before phase 5), and the
+flash task's, 69939 µs from its release, under three quarters of its: CPU time only, before its
+waits for the part. The diagnostic task's, 5787 µs, is the bound of P2server's budget it needs
+(10 ms). The health task's longer response moves the examinations of the watchdog manager by up to
+45 ms; the bounds of the entities (SUPERVISION in [app/app.c](../app/app.c), [faults.md](faults.md))
+were checked against it, and the processing task's upper bound went from 20 to 21. The largest blocking
 term, 20 µs, is the health task's scheduler suspension, which the analysis counts against the
 interrupts as well, a pessimistic choice for `vTaskSuspendAll()`, which does not mask
 interrupts.

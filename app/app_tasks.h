@@ -5,27 +5,39 @@
  * schedulability check reads (tools/fcn_tools/sched.py, schema fcn.task_table/1).
  *
  *   task     priority  released by                                 does
- *   can_rx   6         the CAN interrupt, and every 100 ms         dispatches received frames,
- *                      (receive cycle of TESTER_Command)           checks TESTER_Command
- *   sensor   5         every 10 ms (xTaskDelayUntil)               heartbeat; reads the front end,
+ *   can_rx   7         the CAN interrupt, and every 100 ms         dispatches received frames,
+ *                      (receive cycle of TESTER_Command)           checks TESTER_Command, queues
+ *                                                                  UDS_Request frames
+ *   sensor   6         every 10 ms (xTaskDelayUntil)               heartbeat; reads the front end,
  *                                                                  posts a sample
- *   process  4         a sample in the queue (or a timeout)        lib/bms, pack state, protected
+ *   process  5         a sample in the queue (or a timeout)        lib/bms, pack state, protected
  *                                                                  telemetry, verdicts on faults
- *   can_tx   3         a producer or the controller notifies it    loads the controller's mailboxes
+ *   can_tx   4         a producer or the controller notifies it    loads the controller's
+ *                                                                  mailboxes, reports UDS_Response
+ *                                                                  frames sent
+ *   diag     3         a UDS_Request frame or a report, a flash    lib/isotp and lib/uds: the
+ *                      job done, a clear made, its deadline        diagnostic connection
  *   health   2         every 100 ms (xTaskDelayUntil)              supervision and the hardware
  *                                                                  watchdog, the DTCs and
- *                                                                  BMS_Fault, task statistics,
+ *                                                                  BMS_Fault, their snapshot and
+ *                                                                  the clears, task statistics,
  *                                                                  node and boot info, the
  *                                                                  confirm of a trial, ends the
  *                                                                  run
- *   flash    1         the health task's request (notification)    every write to the flash:
- *                                                                  the confirm (lib/boot); in
- *                                                                  phase 5 the slot writer
+ *   flash    1         a job of the diagnostic task, the health    every write to the flash: the
+ *                      task's request (notification), and every    slot writer of a download and
+ *                      APP_FLASH_IDLE_WAIT_MS                      the confirm (lib/boot)
+ *
+ * Phase 5 put the diagnostic task between can_tx and health, and moved the four tasks above it
+ * up by one: below can_tx, so that no work of the diagnostic connection adds to can_tx's response
+ * time, whose margin is the smallest of the set (task_table.c); above health, whose job takes up
+ * to 5.4 ms of budget, so that a responsePending due 40 ms after a request goes out within the
+ * 10 ms that P2server (50 ms) leaves (task_table.c, diag).
  *
  * The flash task is the lowest-priority task on purpose: a flash operation blocks its caller
- * for the time the part takes (plat_flash.h: 0.4 ms a page program, 45 ms a sector erase), and
- * below every other task that wait delays no deadline and no alive indication (app.c, THE
- * UPDATE).
+ * for the time the part takes (plat_flash.h: 0.4 ms a page program, 45 ms a sector erase; 3 ms
+ * and 400 ms at most), and below every other task that wait delays no deadline and no alive
+ * indication (app.c, THE FLASH TASK).
  *
  * Rate-monotonic order holds for the tasks with a period of their own (sensor above health)
  * and for the receive task, modelled by its demand per tick (task_table.c): a period of 1 ms,
@@ -45,10 +57,41 @@
 #include "can_io.h"
 
 /* Priorities. The two CAN tasks are defined by can_io.h. */
-#define APP_SENSOR_PRIORITY  5U
-#define APP_PROCESS_PRIORITY 4U
+#define APP_SENSOR_PRIORITY  6U
+#define APP_PROCESS_PRIORITY 5U
+#define APP_DIAG_PRIORITY    3U
 #define APP_HEALTH_PRIORITY  2U
 #define APP_FLASH_PRIORITY   1U
+
+/*
+ * The diagnostic task (app.c, THE DIAGNOSTIC TASK).
+ *   - APP_DIAG_RX_QUEUE_LENGTH: UDS_Request frames between the receive task and it. A tester
+ *     that keeps to ISO 15765-2 has at most one block of DIAG_BLOCK_SIZE (16) consecutive frames
+ *     on its way before it waits for the node's next flow control, which the diagnostic task
+ *     sends only after it took the block's last frame out of this queue (diag.h); and between two
+ *     messages it waits for the node's response. So the queue holds at most 16 of its frames,
+ *     whatever the diagnostic task's timing; two more are room for frames of a tester that does
+ *     not keep to it, which are otherwise counted as lost (diag.rx_lost) and end its reception.
+ *   - APP_DIAG_TX_DONE_QUEUE_LENGTH: reports of UDS_Response frames sent, from can_tx: one for
+ *     each frame lib/isotp has handed out and not seen confirmed (ISOTP_PIPELINE_DEPTH, 4), and as
+ *     many again for frames it has given up (diag.h, DIAG_HANDOUTS).
+ *   - APP_DIAG_EVENTS_PER_TICK: frames and reports the task takes in one tick at most; the rest
+ *     wait in their queues for the next tick. It bounds the task's demand on the processor
+ *     whatever arrives (task_table.c, diag), and the throughput of a download with it: a
+ *     TransferData of 1024 bytes of data is 147 frames in (a first frame and 146 consecutive
+ *     frames), and the reports of the 10 flow controls and of the response it sends, 158 events,
+ *     so it takes at least 79 ticks.
+ *   - APP_DIAG_IDLE_WAIT_MS: the longest it waits for an event, so that it gives an alive
+ *     indication at least that often (SUPERVISION in app.c).
+ */
+#define APP_DIAG_RX_QUEUE_LENGTH      18U
+#define APP_DIAG_TX_DONE_QUEUE_LENGTH 8U
+#define APP_DIAG_EVENTS_PER_TICK      2U
+#define APP_DIAG_IDLE_WAIT_MS         50U
+
+/* The flash task waits at most this long for a job or a request, so that it gives an alive
+ * indication at least that often between jobs (SUPERVISION in app.c). */
+#define APP_FLASH_IDLE_WAIT_MS 100U
 
 /* Periods. The sensor task's period is the cycle of BMS_PackStatus and of the heartbeat; the
  * cells are read every APP_CELLS_EVERY-th period, the temperatures every APP_TEMPS_EVERY-th
@@ -85,7 +128,9 @@
 /*
  * The hardware watchdog's timeout. The health task kicks it once per period, after the
  * supervision cycle, so in a run without a fault the kicks come APP_HEALTH_PERIOD_MS apart,
- * plus the health task's response time (2 ms in the analysis of task_table.c). Five periods:
+ * give or take the time from the release of a health job to its kick, which the higher tasks'
+ * demand bounds (under the health task's response time, 45 ms in the analysis of task_table.c
+ * since phase 5, of which the kick is the first thing). Five periods:
  * a health job that runs up to four periods late, far beyond anything the analysis allows (a
  * host that stalls the node's threads), does not reset the node, and a node whose kicks stop is
  * reset at most 500 ms after the last one. app.c checks it against the IWDG's range.

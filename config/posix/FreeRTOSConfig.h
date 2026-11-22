@@ -32,7 +32,9 @@
 #define configUSE_PORT_OPTIMISED_TASK_SELECTION 0 /* the POSIX port has no CLZ-based selection */
 #define configUSE_TICKLESS_IDLE                 0
 #define configTICK_RATE_HZ                      1000U
-#define configMAX_PRIORITIES                    8
+/* 0 (idle) to 7 (can_rx) for the tasks, and 8 above every task, which the health task takes for
+ * the orderly stop of the host build (stop_node() in app/app.c asserts that it is free). */
+#define configMAX_PRIORITIES                    9
 #define configMINIMAL_STACK_SIZE                256 /* words */
 #define configMAX_TASK_NAME_LEN                 12
 #define configTICK_TYPE_WIDTH_IN_BITS           TICK_TYPE_WIDTH_64_BITS

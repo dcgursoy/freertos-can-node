@@ -12,6 +12,7 @@ is tested where operations run: tests/platform/test_posix_flash.c and flash_self
 the node's own writes (its confirm) in tests/system/test_update_cuts.py."""
 from __future__ import annotations
 
+import shutil
 import subprocess
 import time
 
@@ -45,20 +46,29 @@ SLOT_SIZE = 0x100000      # plat_flash.h: each slot holds one image
 IMAGE_HEADER_SIZE = 256   # lib/image: the header before the payload
 
 
-def test_the_release_build_of_the_node_fits_into_a_slot_as_a_payload():
-    # plat_flash.h: a slot holds an image of the release build (and of the smaller debug
-    # build), unstripped, after the image header. The AddressSanitizer build is larger than a
-    # slot and is not an image (docs/update.md); its size is printed for the record. Checked on
-    # the release build whichever node the run tests (FCN_NODE), since that is the one packed.
+def test_the_release_build_of_the_node_fits_into_a_slot_as_a_payload(tmp_path):
+    # plat_flash.h: a slot holds an image of the release build (and of the debug build),
+    # stripped, after the image header: the payload the update tests pack (tests/system/
+    # conftest.py). Since phase 5 the unstripped release build (RelWithDebInfo, its DWARF
+    # included) is larger than a slot; symbols never go into an image, as a target's binary
+    # has none. The AddressSanitizer build is larger than a slot even stripped and is not an
+    # image (docs/update.md). Every size is printed for the record. Checked on the release
+    # build whichever node the run tests (FCN_NODE), since that is the one packed.
     release = paths.build_root() / "release" / "bin" / "fcn_node"
     if not release.exists():
         pytest.fail(f"{release} not found: build it with scripts/build.sh release", pytrace=False)
+    strip = shutil.which("strip")
+    assert strip is not None, "strip (binutils) is needed: the images are packed stripped"
+    stripped = {}
     for preset in ("release", "debug", "asan"):
         built = paths.build_root() / preset / "bin" / "fcn_node"
         if built.exists():
-            size = built.stat().st_size
-            print(f"{preset}: {size} bytes, {SLOT_SIZE - IMAGE_HEADER_SIZE - size} to spare")
-    assert release.stat().st_size <= SLOT_SIZE - IMAGE_HEADER_SIZE
+            out = tmp_path / f"fcn_node.{preset}.stripped"
+            subprocess.run([strip, "-o", str(out), str(built)], check=True)
+            stripped[preset] = out.stat().st_size
+            print(f"{preset}: {built.stat().st_size} bytes, stripped {stripped[preset]}, "
+                  f"{SLOT_SIZE - IMAGE_HEADER_SIZE - stripped[preset]} to spare")
+    assert stripped["release"] <= SLOT_SIZE - IMAGE_HEADER_SIZE
 
 
 def test_without_the_option_the_node_has_no_flash(start_node):

@@ -5,12 +5,16 @@ with two image slots and the metadata that say which one runs, an image format t
 bootloader can check, boot control that changes the metadata with writes a loss of supply can
 interrupt at any point, a bootloader that starts the right image and hands over to it, and the
 node's side: it confirms a new image once it has run in good health, and reports a rollback.
-Phase 4 builds all of it on the host and tests it without a transport: an update is written
-into the flash by a tool that makes exactly the calls phase 5's UDS download will make.
+Phase 4 built all of it on the host and tested it without a transport: an update is written
+into the flash by a tool that makes exactly the calls of a UDS download. Phase 5 added the
+transport: a tester on the bus makes the same calls through the node's UDS server, with the
+node running ([the download over the bus](#the-download-over-the-bus), and
+[diagnostics.md](diagnostics.md)).
 
 ```
-  fcn_flash stage: the slot writer's calls, begin, erase steps, writes, finish steps
-  (phase 5: UDS RequestDownload, TransferData, RequestTransferExit)
+  fcn_flash stage, or a tester's UDS download (phase 5: eraseMemory, RequestDownload,
+  TransferData, RequestTransferExit, checkProgrammingDependencies): the slot writer's calls,
+  begin, erase steps, writes, finish steps
         │
         v                       the flash (lib/flash/flash.h), written through lib/boot
   ┌──────────────────────────────────────────────────────────────────┐
@@ -188,16 +192,21 @@ size a flash with a code per double word needs. The metadata lie in sectors of t
 the slots, so that an erase of a slot never touches them. Every area starts at a sector and is
 whole sectors, and an image's payload, at offset 256 of its slot, starts on a page.
 
-A slot holds an image of the release and of the debug build of the node, unstripped, but not of
-the AddressSanitizer build:
+A slot holds an image of the release and of the debug build of the node, stripped, but not of the
+AddressSanitizer build. Unstripped, the release build fitted in phase 4 and no longer does since
+phase 5 added lib/isotp, lib/uds and the diagnostic task: its debug information alone is about a
+megabyte, and an image carries no symbols (a target's binary has none), so the tests pack the
+stripped build:
 
-| Build | Unstripped | Stripped | Fits a slot after the 256-byte header (1,048,320 bytes) |
+| Build | Unstripped | Stripped | Stripped fits a slot after the 256-byte header (1,048,320 bytes) |
 |---|---|---|---|
-| release (RelWithDebInfo, `-O2 -g`) | 1,011,792 | 186,768 | yes, with 36,528 bytes to spare |
-| debug | 635,584 | 256,400 | yes |
-| asan | 2,715,440 | 1,661,984 | no, not even stripped |
+| release (RelWithDebInfo, `-O2 -g`), phase 4 | 1,011,792 | 186,768 | yes |
+| release, phase 5 | 1,314,120 | 240,016 | yes, with 808,304 bytes to spare |
+| debug, phase 5 | 813,728 | 326,032 | yes |
+| asan, phase 5 | 3,533,792 | 2,170,688 | no |
 
-(`stat -c %s $FCN_BUILD_ROOT/<preset>/bin/fcn_node` and `strip -o` on the phase 4 build.)
+(`stat -c %s $FCN_BUILD_ROOT/<preset>/bin/fcn_node` and `strip -o`: the phase 4 figures as that
+phase measured them, the phase 5 ones on the build of 2026-11-22.)
 `tests/system/test_flash_file.py` checks that the release build fits. The system tests pack
 stripped images of the release build: they are smaller (less to erase and write per update),
 and the asan run of `scripts/test-system.sh` starts the same images, since its own node is no
@@ -1061,8 +1070,8 @@ The flash task reads the metadata once and logs
   sensor task) and one BMS_Fault (the health task) whatever its telemetry switch says, with
   BMS_TaskStats in every second period and BMS_NodeInfo and BMS_BootInfo once a second; with the
   telemetry on, also BMS_PackStatus every 10 ms, BMS_CellVoltages1/2 every 20 ms and
-  BMS_Temperatures every 100 ms. Two reads of the count are at least 80 ms apart (the health
-  task's response time is under 20 ms), so no period of a node that works sees no acknowledged
+  BMS_Temperatures every 100 ms. Two reads of the count are at least 55 ms apart (the health
+  task's response time is under 45 ms since phase 5's diagnostic task), so no period of a node that works sees no acknowledged
   frame, and one is all the rule asks for: the weaker "one within the last N periods" is not
   needed (update.h, WHY EVERY PERIOD NEEDS AN ACKNOWLEDGED FRAME). What the windows of
   `test_no_condition_of_a_working_node_cuts_the_window_short` counted in one run
@@ -1081,8 +1090,14 @@ The flash task reads the metadata once and logs
   as a timing tolerance.
 - **What the window does not prove.** That the trial receives: an image that cannot (a wrong
   acceptance filter, say) confirms itself all the same, as long as its own frames are
-  acknowledged. A tester's routine proves the receive path, and phase 5, whose next update comes
-  over that path, adds one.
+  acknowledged. A tester's routine proves the receive path: phase 5's confirm routine
+  (RoutineControl 0xF000, [diagnostics.md](diagnostics.md)), whose request reaches the trial
+  through that path. The routine and the self-confirm both run in the flash task, and the first
+  one writes the CONFIRM record: after the self-confirm the routine is refused
+  (conditionsNotCorrect, there is no trial any more) and writes nothing; after the routine the
+  self-confirm writes nothing (`confirm.flash_task.self_skipped`) and the monitor is CONFIRMED by
+  the routine (`confirm.flash_task.confirmed_by_routine`, log line `the trial in slot B is
+  confirmed by the tester's confirm routine`).
 - **The request.** The health task asks the flash task once (a task notification).
 - **The flash task** (priority 1, the lowest) calls `boot_confirm()` for the hand-off's slot.
   It logs `trial in slot B ran 5 s in good health: writing its confirm` and
@@ -1106,7 +1121,9 @@ delay no task with a deadline or an alive indication to give.
   not_active_periods, bus_off_periods, unacked_periods), the frames acknowledged in the window so
   far (window_acked) and the fewest in one of its periods (fewest_acked), status, and
   `flash_task` with flash, boot_init, described, have_record, seq, active_slot, trial_slot,
-  attempts_used, records_valid, confirms, confirm_status and confirm_ns.
+  attempts_used, records_valid, confirms, confirm_status and confirm_ns, and since phase 5
+  confirmed_by_routine, self_skipped, idle_passes and, per job of the diagnostic task
+  (`jobs`: erase, write, exit, check, confirm), run, last_status, last_steps, last_ns and max_ns.
 - `flash`: the operation counts of the host's flash (above).
 - `tasks` and `task_table` include `flash`; `telemetry.messages` includes `BMS_BootInfo`.
 
@@ -1127,7 +1144,7 @@ fcn_flash info    --flash-file F
   - Slot A is programmed page by page, with no erase (the new file is erased already).
   - lib/boot's select then runs once, as the bootloader's first start would, and writes ADOPT:
     slot A holds the CONFIRMED image.
-- **stage** makes exactly the calls phase 5's UDS download will make, in the same order:
+- **stage** makes exactly the calls phase 5's UDS download makes, in the same order:
   1. `boot_slot_by_address()` for `--address`, by default the start of the slot that is not
      CONFIRMED;
   2. `boot_writer_begin()`;
@@ -1231,6 +1248,7 @@ race the node is put in from its start (`--flash-cut`, `--can-fault`).
 | [test_update.py](../tests/system/test_update.py) | an image staged into slot B starts as a trial, confirms itself after 50 healthy health periods (BMS_BootInfo WAITING with its seconds, then CONFIRMED), and is the confirmed image after a restart; a trial that crashes (13) or hangs until the watchdog's time (11) is started exactly three times and rolled back to A, which reports UPDATE_ROLLBACK in its first BMS_Fault and only in that run; no update can begin while a trial is pending (after a run of the trial that ended by itself before its confirm, lib/boot refuses every address and nothing of the flash changes; while its next run runs, until the test stops it, the tool cannot open the flash the node holds); a trial with one bit flipped in its header or its payload is rejected and never started (REJECT, the DTC); a confirmed image with one bit flipped falls back to the one before it (FALLBACK, the DTC), and the next update goes to the damaged slot; a confirmed image with one bit flipped and nothing before it is not started (40); a trial whose frames nobody acknowledges (started with `--can-fault noack`, simulation control's `can.fault noack` from its start) stays error passive at 128, never bus off, and does not confirm itself in more periods than a window (the node's counts; the flash still holds the trial), and once it is acknowledged again (`can.fault none`) it confirms itself after a whole window that follows every period with the bus lost. Marked `timing`: the confirm is asked for 5 s after the node's start, by its own CLOCK_MONOTONIC log stamps, never earlier than 4.9 s and at most 0.2 s late, in period 50 with no window restart; no period cuts the window short with nothing on the bus but a listener, with the telemetry switched off by a tester, or at 125 kbit/s under a flood above the bus capacity; and the bus lost at run time (`can.fault noack`) once the window has begun cuts it short, and the trial confirms itself after a whole new window once it is acknowledged again (if the command came only after the confirm was asked for, the test process fell behind the node: a missed tolerance) |
 | [test_update_cuts.py](../tests/system/test_update_cuts.py) | power cuts on the system, below |
 | [test_flash_file.py](../tests/system/test_flash_file.py) | the flash in the running node: the option, the file, the statistics, the simulation commands |
+| [test_download.py](../tests/system/test_download.py), [test_download_faults.py](../tests/system/test_download_faults.py), [test_download_cuts.py](../tests/system/test_download_cuts.py) | phase 5: the update over the bus, end to end and broken on purpose, power cuts during a download ([diagnostics.md](diagnostics.md#how-it-is-tested)) |
 
 ### Power cuts on the system
 
@@ -1297,29 +1315,51 @@ first survived the system tests: select then tries a fourth attempt, cannot writ
 the trial back all the same, so that only the hand-off's `select_write_error` shows it; the
 system tests check that field since.
 
-## What phase 5 adds
+## The download over the bus
 
-Phase 5 puts the transport on top: ISO-TP (ISO 15765-2) and a UDS server (ISO 14229-1) in the
-node, so that a tester on the bus makes the update that `fcn_flash stage` makes today, and a
-bench test runs it end to end. The slot writer's calls are the services' work:
+Phase 5 put the transport on top: ISO-TP (ISO 15765-2) and a UDS server (ISO 14229-1) in the
+node's diagnostic task, so that a tester on the bus makes the update that `fcn_flash stage`
+makes, with the node running. [diagnostics.md](diagnostics.md) describes the transport, every
+service and the tester; this section is what the download does to the flash.
 
-| UDS | Calls | On refusal |
+The slot writer's calls are the services' work, each a job of the flash task
+([app/flash_job.h](../app/flash_job.h)), one job per service step:
+
+| UDS | Calls (the flash task) | lib/boot's refusals |
 |---|---|---|
-| RoutineControl (0x31) eraseMemory, or RequestDownload (0x34) | boot_slot_by_address(), boot_writer_begin(), then boot_writer_erase_step() until BOOT_OK, with responsePending (NRC 0x78) in between | BOOT_E_ARG (no slot there) or BOOT_E_SIZE: 0x31 requestOutOfRange; BOOT_E_STATE (the running slot, or a trial pending): 0x22 conditionsNotCorrect |
-| TransferData (0x36) | boot_writer_write() with the block's data at the offset the blocks so far add up to | BOOT_E_SEQUENCE: 0x24 requestSequenceError; BOOT_E_FLASH: 0x72 generalProgrammingFailure |
-| RequestTransferExit (0x37), or a check routine after it | boot_writer_finish_step() until BOOT_OK, with responsePending in between | BOOT_E_INVALID or BOOT_E_FLASH: 0x72 generalProgrammingFailure |
-| ECUReset (0x11) | none: the bootloader boots the committed trial as attempt 1 | |
+| RoutineControl 0xFF00 eraseMemory, `31 01 FF 00 44 <address> <size>` | `boot_slot_by_address()`, `boot_writer_begin()` (the BEGIN record), then `boot_writer_erase_step()` until BOOT_OK, one sector per call | no slot starts at the address, or a size of 0 or beyond the slot (BOOT_E_ARG, BOOT_E_SIZE): 0x31 requestOutOfRange; the running slot, a trial pending, the factory state (BOOT_E_STATE): 0x22 conditionsNotCorrect |
+| RequestDownload 0x34 | none: it checks that an eraseMemory completed for the same address and size (0x70 otherwise) | |
+| TransferData 0x36, blocks of 1024 bytes | `boot_writer_write()` with the block's data at the offset the blocks so far add up to; a repeated block is answered and not written | a refusal ends the download: BOOT_E_SEQUENCE 0x24 requestSequenceError, BOOT_E_FLASH or BOOT_E_POWER_LOST 0x72 generalProgrammingFailure (the whole mapping: [diagnostics.md](diagnostics.md)) |
+| RequestTransferExit 0x37 | the first `boot_writer_finish_step()`: the last partial page, the start of the validation | as for TransferData |
+| RoutineControl 0xFF01 checkProgrammingDependencies | `boot_writer_finish_step()` until BOOT_OK: the validation (lib/bootimg, one 64-byte step per call) and the COMMIT record: the slot is TRIAL | an image that does not validate (BOOT_E_INVALID): 0x72, the slot stays WRITING |
+| ECUReset 0x11 | none: the node resets after its positive response, and the bootloader boots the committed trial as attempt 1 | |
+| RoutineControl 0xF000, the confirm routine (extended session) | `boot_confirm()` of the running trial | no trial to confirm (BOOT_E_STATE): 0x22 |
 
-This mapping is a proposal; the services and their negative responses are phase 5's decision.
-The first finish step only flushes, so it can be made at RequestTransferExit and the validation
-steps in a check routine. The calls run in the flash task, which is the lowest-priority task, so
-a sector erase (45 ms typical, 400 ms at most) delays no deadline, while the server, in a task
-of its own, can answer responsePending meanwhile; its response-pending timing must allow the
-part's maximum times, not its typical ones. Phase 5 also has to decide how the flash task is
-supervised while a download runs (in phase 4 it has one job per run and is no supervised entity),
-and adds ReadDTCInformation (0x19) and ClearDiagnosticInformation (0x14) for the DTCs, among them
-UPDATE_ROLLBACK. A tester routine could also take over the confirm, and prove what the 5 s
-window cannot: that the new image receives.
+- **Timing.** The calls run in the flash task, the lowest-priority task, so a sector erase (45 ms
+  typical, 400 ms at most) delays no deadline, while the diagnostic task answers responsePending
+  40 ms after the request and then every 2000 ms. The tester's timeouts (fcn_tools.diag) are
+  computed from the part's maximum times, not the typical ones the host's model waits.
+- **Supervision.** The flash task is a supervised entity since phase 5: it gives an alive
+  indication after every wait and after every lib/boot call in a job, and a job that never returns
+  ends in a watchdog reset, never in a hang ([diagnostics.md](diagnostics.md)).
+- **A download is refused while a trial runs or is pending**, for both slots (BOOT_E_STATE): the
+  trial's fallback would be overwritten. After the trial's confirm, the slot of the image before
+  it is the one a download goes to.
+- **An abandoned download is safe.** A session change, S3server, an ECUReset, a refusal, a loss of
+  supply: lib/boot leaves the slot WRITING, which the bootloader never starts, and the next
+  eraseMemory erases every sector the new image needs again (no second BEGIN record).
+- **The DTCs** are served by ReadDTCInformation (0x19: 0x01, 0x02, 0x0A) and cleared by
+  ClearDiagnosticInformation (0x14) from the health task's snapshot ([faults.md](faults.md)),
+  UPDATE_ROLLBACK among them.
+
+The operations a download makes are those of a stage: for an image of S bytes, the BEGIN record
+(its record and its commit field), ceil(S / 4096) sector erases, ceil(S / 256) page programs (the
+last, partial one at RequestTransferExit) and the COMMIT record (record and commit field), with no
+flash operation of the node's own in between when the running image is the confirmed one.
+[test_download_cuts.py](../tests/system/test_download_cuts.py) cuts 11 of them on the system and
+checks decision 5's invariants after each, as [power cuts on the system](#power-cuts-on-the-system)
+does for the stage; [diagnostics.md](diagnostics.md#how-it-is-tested) has the other tests of the
+download.
 
 ## What a product would add
 
@@ -1356,13 +1396,15 @@ image leaves the device without an image to start. A product adds at least the f
   header), a confirm made by a tester's routine or after a drive cycle rather than after 5 s, and
   the endurance of the part actually used.
 
-## Limits of phase 4
+## Limits
 
 - **The flash is a model.** No weak bits, retention errors, read disturb, suspend, wear-out or
   ECC (the NOR model's list above), and typical times only.
 - **The bootloader is a host program.** It starts its image with `fexecve()` from a sealed copy;
   the jump on a target, and a bootloader that cannot be updated, are phase 7's.
-- **The update arrives by a tool**, not over the bus: phase 5.
+- **No access control on the download.** Any tester on the bus can erase the other slot and write
+  an image into it: there is no SecurityAccess (0x27) in front of the programming session
+  ([diagnostics.md](diagnostics.md#not-implemented-and-what-a-product-adds)).
 - **Integrity, not authenticity, and no anti-rollback** (above).
 - **The rollback's report can be lost.** UPDATE_ROLLBACK is reported by the start right after the
   rollback only, from the hand-off. If that start never reaches its first BMS_Fault (a cut of the
@@ -1370,6 +1412,7 @@ image leaves the device without an image to start. A product adds at least the f
   first health period), the next start has nothing to report; the metadata still show it (the
   newest record's event, `fcn_flash info`). DTCs are not kept in flash in this phase
   ([faults.md](faults.md)).
-- **The confirm proves that the trial is heard, not that it hears.** Its frames must be
+- **The self-confirm proves that the trial is heard, not that it hears.** Its frames must be
   acknowledged in every period of the window; what it receives plays no part (the confirm,
-  above). Phase 5's tester routine proves the receive path.
+  above). The tester's confirm routine proves the receive path, but only if a tester confirms
+  first: a trial that receives nothing still confirms itself after 5 s.

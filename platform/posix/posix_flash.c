@@ -43,6 +43,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "image/image.h"
 #include "platform.h"
 #include "posix_retained.h"
 #include "posix_sim.h"
@@ -84,6 +85,7 @@ static const plat_flash_layout_t LAYOUT = {
                  .unit_size = UNIT_SIZE},
     .meta = {.offset = META_OFFSET, .size = META_SIZE},
     .slot = {{.offset = SLOT_A, .size = SLOT_SIZE}, {.offset = SLOT_B, .size = SLOT_SIZE}},
+    .image_target = IMAGE_TARGET_HOST,
 };
 
 _Static_assert(PLAT_FLASH_SLOTS == 2U, "the table has slots A and B");
@@ -110,6 +112,10 @@ static int s_fd = -1;  /* open while the file is mapped; locked but after posix_
 static uint32_t s_armed_seed;
 static posix_flash_wait_fn s_wait;             /* NULL: sleep */
 static posix_flash_power_loss_fn s_power_loss; /* NULL: the end without a kernel */
+/* Programs and erases until the one that hangs, 1: the next; 0: none (posix_flash_arm_hang()).
+ * Set before the operations start, then only the operating thread counts it down. */
+static uint32_t s_hang_countdown;
+static uint64_t s_operations; /* programs and erases started, for the line of a hang */
 
 /* Shared with the thread that serves simulation control: atomics only. */
 static _Atomic bool s_open;
@@ -310,12 +316,49 @@ static void end_without_kernel(void)
     _exit((int)PLAT_RESET_POWER_LOSS);
 }
 
-/* After a program or erase: wait its time; if it was cut, the supply is gone. */
+/* The operation that was armed to hang (see A HANG in the header): its busy flag never clears. */
+static void hang_for_ever(void)
+{
+    char text[128];
+    const int len = snprintf(text, sizeof(text),
+                             "flash: operation %llu hangs: its busy flag never clears "
+                             "(--flash-hang)\n",
+                             (unsigned long long)s_operations);
+
+    if (len > 0) {
+        const size_t count = ((size_t)len < sizeof(text)) ? (size_t)len : (sizeof(text) - 1U);
+
+        (void)!write(STDERR_FILENO, text, count);
+    }
+
+    for (;;) {
+        if (s_wait != NULL) {
+            s_wait();
+        } else {
+            const struct timespec nap = {0, 1000000L};
+
+            (void)nanosleep(&nap, NULL);
+        }
+    }
+}
+
+/* After a program or erase: wait its time; if it was cut, the supply is gone; if it was armed
+ * to hang, it never returns. */
 static void finish(uint32_t cuts_before)
 {
     nor_stats_t stats;
 
     nor_get_stats(&s_nor, &stats);
+    s_operations++;
+
+    if (s_hang_countdown != 0U) {
+        s_hang_countdown--;
+
+        if (s_hang_countdown == 0U) {
+            hang_for_ever();
+        }
+    }
+
     wait_for(nor_last_duration_ns(&s_nor));
 
     if (stats.cuts != cuts_before) {
@@ -593,6 +636,8 @@ static void reset_counters(void)
 
     atomic_store(&s_max_sector_erases, 0U);
     s_armed_seed = 0U;
+    s_hang_countdown = 0U;
+    s_operations = 0U;
 }
 
 /* Open (creating it erased if missing) and lock the file; *fd_out the descriptor. */
@@ -703,6 +748,13 @@ void posix_flash_arm_cut(const posix_flash_cut_t *cut)
         (cut->operation <= POSIX_FLASH_CUT_MAX)) {
         atomic_store(&s_request,
                      REQUEST_PRESENT | ((uint64_t)cut->operation << 32U) | (uint64_t)cut->seed);
+    }
+}
+
+void posix_flash_arm_hang(uint32_t operation)
+{
+    if (atomic_load(&s_open) && (operation <= POSIX_FLASH_CUT_MAX)) {
+        s_hang_countdown = operation;
     }
 }
 

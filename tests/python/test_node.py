@@ -445,3 +445,76 @@ def test_a_missing_binary_is_reported_before_anything_starts(tmp_path):
     with pytest.raises(FileNotFoundError, match="does not exist"):
         node.start()
     assert not node.running and node.unnoticed_end() is None
+
+
+# ---------------------------------------------------------------- the Board (phase 5's bench)
+
+#: A bootloader stand-in for the Board: the first run ends with a requested reset (10), as the
+#: node does after a tester's ECUReset; every later one runs until it is stopped. The count of
+#: runs is in the file "runs" next to the flash file.
+RESETS_ONCE = ('flash=""\n'
+               'for a in "$@"; do if [ "$prev" = --flash-file ]; then flash="$a"; fi; prev="$a"; '
+               'done\n'
+               'count_file="$(dirname "$flash")/runs"\n'
+               'n=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))\n'
+               'echo $n > "$count_file"\n'
+               'if [ "$n" -eq 1 ]; then exit 10; fi\n'
+               "trap 'exit 0' TERM\necho ready\nwhile :; do sleep 0.02; done\n")
+
+
+def make_board(tmp_path, script: str, boards: list) -> node_module.Board:
+    boot = tmp_path / "boot.sh"
+    boot.write_text("#!/bin/sh\n" + script)
+    boot.chmod(0o755)
+    flash, cell = tmp_path / "flash.bin", tmp_path / "cell.bin"
+    started: list[NodeProcess] = []
+    first = NodeProcess(workdir=tmp_path / "work", binary=boot, boot_binary=boot,
+                        flash_file=flash, retained_file=cell)
+    board = node_module.Board(first, on_start=started.append)
+    board.started_runs = started
+    boards.append(board)
+    return board
+
+
+@pytest.fixture
+def boards():
+    made: list[node_module.Board] = []
+    yield made
+    for board in made:
+        for run in board.runs:
+            run.kill()
+
+
+def test_a_board_starts_the_node_again_after_an_announced_requested_reset(tmp_path, boards):
+    board = make_board(tmp_path, RESETS_ONCE, boards)
+    board.expect_resets(1)
+    board.start()
+    second = board.wait_for_run(2, timeout=10.0)
+    wait_until_ready(second)
+    first = board.runs[0]
+    assert first._proc.returncode == node_module.RESET_REQUESTED
+    # The reset was announced: neither an unexpected reset nor an end nobody looked at.
+    assert first.unexpected_reset() is None and first.unnoticed_end() is None
+    assert second.flash_file == first.flash_file and second.retained_file == first.retained_file
+    assert second.name == "node-2" and second.command()[0] == str(tmp_path / "boot.sh")
+    assert board.started_runs == [first, second]       # the harness sees every run
+    assert board.stop() == node_module.EXIT_OK
+    assert board.unexpected_end is None and len(board.runs) == 2
+
+
+def test_a_requested_reset_nobody_announced_stops_the_board_and_is_reported(tmp_path, boards):
+    board = make_board(tmp_path, RESETS_ONCE, boards)
+    board.start()
+    with pytest.raises(TimeoutError):
+        board.wait_for_run(2, timeout=10.0)
+    first = board.runs[0]
+    assert len(board.runs) == 1 and board.unexpected_end == node_module.RESET_REQUESTED
+    assert "never called wait_for_reset" in first.unexpected_reset()
+    assert "ended by itself with status 10" in first.unnoticed_end()
+
+
+def test_a_board_needs_a_flash_and_a_retained_cell(tmp_path):
+    with pytest.raises(ValueError):
+        node_module.Board(NodeProcess(workdir=tmp_path, flash_file=tmp_path / "f"))
+    with pytest.raises(ValueError):
+        node_module.Board(NodeProcess(workdir=tmp_path, retained_file=tmp_path / "c"))

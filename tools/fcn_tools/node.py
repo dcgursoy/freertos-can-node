@@ -20,6 +20,14 @@ starts through the bootloader again, as a board does after every reset.
 A run that ends with PLAT_RESET_POWER_LOSS (12) lost its supply, which on the host only a cut of
 the flash's supply does (--flash-cut, flash.cut). Such an end is expected only from a run in which
 the test armed a cut (`cut_armed`): otherwise it is reported, also when the test waited for it.
+
+A requested reset (PLAT_RESET_REQUESTED, 10) is what the node does after a tester's UDS ECUReset
+(phase 5, app/diag.h). A Board follows a node across such resets while a tester talks to it on
+the bus: when a run ends with 10 and the test has announced the reset (Board.expect_resets()),
+the Board starts the next run at once through fcn_boot, with the same flash and retained cell,
+as a reset into the bootloader starts a board again, and counts the ended run's reset as awaited.
+A requested reset the test did not announce, and every other end, stop the Board, and the end
+checks of the harness see them as they see any run's end.
 """
 from __future__ import annotations
 
@@ -27,9 +35,10 @@ import json
 import os
 import signal
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from . import paths
 from .simctl import SimControl
@@ -395,8 +404,100 @@ class NodeProcess:
         removed."""
         return json.loads(self.stats_path.read_text())
 
+    def note_reset_awaited(self) -> None:
+        """Count the reset this run ended with as one the caller waited for (what
+        wait_for_reset() does), for a caller that saw the end in another way: a Board."""
+        self._reset_awaited = True
+        self._end_noticed = True
+
     def __enter__(self) -> "NodeProcess":
         return self.start()
 
     def __exit__(self, *exc_info) -> None:
         self._kill()
+
+
+class Board:
+    """A node with a flash and a retained cell, followed across the requested resets the test
+    announces (see the module's text). `first` is the first run, not yet started; `on_start` is
+    called with every run the Board starts (the first included), before it is started, so that a
+    test harness can track it. The runs are in `runs`, the one that runs now (or ran last) is
+    `current`.
+
+    A thread waits for each run's end. It is also the parent of every run it starts after the
+    first, and a node asks the kernel to end with the thread that started it (FCN_DIE_WITH_PARENT,
+    the prctl in node_main.c): the thread therefore lives until the last run has ended, and stop()
+    stops that run in order and then waits for the thread."""
+
+    def __init__(self, first: NodeProcess,
+                 on_start: Callable[[NodeProcess], None] | None = None) -> None:
+        if first.flash_file is None or first.retained_file is None:
+            raise ValueError("a Board needs a flash file and a retained cell: its runs start "
+                             "through fcn_boot, and the cell carries the hand-off and the reset")
+        self.runs: list[NodeProcess] = [first]
+        self._on_start = on_start
+        self._lock = threading.Lock()
+        self._expected = 0
+        self._ended = threading.Event()
+        self._started = threading.Condition(self._lock)
+        self._thread: threading.Thread | None = None
+        self.unexpected_end: int | None = None
+
+    @property
+    def current(self) -> NodeProcess:
+        with self._lock:
+            return self.runs[-1]
+
+    def expect_resets(self, count: int = 1) -> None:
+        """Announce `count` more requested resets: the test (its tester) sends ECUReset."""
+        with self._lock:
+            self._expected += count
+
+    def start(self) -> "Board":
+        if self._on_start is not None:
+            self._on_start(self.runs[0])
+        self.runs[0].start()
+        self._thread = threading.Thread(target=self._follow, name="Board", daemon=True)
+        self._thread.start()
+        return self
+
+    def wait_for_run(self, count: int, timeout: float) -> NodeProcess:
+        """Wait until the Board has started its `count`-th run (1: the first); that run.
+        TimeoutError if it has not within `timeout` seconds, or if the Board stopped before."""
+        with self._started:
+            if not self._started.wait_for(lambda: len(self.runs) >= count or self._ended.is_set(),
+                                          timeout=timeout) or len(self.runs) < count:
+                raise TimeoutError(f"the board has started {len(self.runs)} runs, not {count}")
+            return self.runs[count - 1]
+
+    def _follow(self) -> None:
+        while True:
+            run = self.current
+            status = run._proc.wait() if run._proc is not None else None  # noqa: SLF001
+            with self._lock:
+                expected = status == RESET_REQUESTED and self._expected > 0
+                if expected:
+                    self._expected -= 1
+            if not expected:
+                self.unexpected_end = status if status not in (EXIT_OK, None) else None
+                break
+            run.note_reset_awaited()
+            nxt = run.restarted(name=f"{self.runs[0].name}-{len(self.runs) + 1}")
+            if self._on_start is not None:
+                self._on_start(nxt)
+            nxt.start()
+            with self._started:
+                self.runs.append(nxt)
+                self._started.notify_all()
+        with self._started:
+            self._ended.set()
+            self._started.notify_all()
+
+    def stop(self, timeout: float = 5.0) -> int:
+        """Stop the current run in order (SIGTERM, NodeProcess.stop()) and wait for the thread;
+        the run's exit status. A run that ended already keeps its status."""
+        run = self.current
+        status = run.stop(timeout=timeout)
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+        return status

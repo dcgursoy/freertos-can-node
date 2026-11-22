@@ -7,7 +7,7 @@ measurements on CAN and takes fail-safe A/B firmware updates over the same bus. 
 as a Linux process on the FreeRTOS POSIX port, and its CAN controller, flash and sensors are
 simulated around it, so that all of it builds, runs and is tested on a laptop and in CI.
 
-> **Work in progress: phases 0 to 4 of 8 are done.** This page is a placeholder until the
+> **Work in progress: phases 0 to 5 of 8 are done.** This page is a placeholder until the
 > last phase. The sections below describe only what exists today and quote no results; the
 > final README will take every number from `results/*.json`.
 
@@ -20,8 +20,8 @@ simulated around it, so that all of it builds, runs and is tested on a laptop an
 | 2 | Application: tasks and IPC, DBC, end-to-end protection, telemetry | done |
 | 3 | Fault handling: trouble codes, the fault frame, watchdogs, reset cause | done |
 | 4 | Simulated NOR flash, bootloader, A/B update logic | done |
-| 5 | ISO-TP, UDS download, end-to-end update | next |
-| 6 | Measurements and plots | |
+| 5 | ISO-TP, UDS download, end-to-end update | done |
+| 6 | Measurements and plots | next |
 | 7 | Cortex-M3 build in QEMU with a real bootloader jump | |
 | 8 | Final README and documentation | |
 
@@ -140,9 +140,11 @@ No timing of the application has been measured yet; that is phase 6.
   first-order fixed-point filter per channel with exact rounding and a proof that it cannot
   overflow, and the pack summary and state (STARTUP, NORMAL, FAULT), all in integer arithmetic.
 - **The application** ([app/app.c](app/app.c), tasks in [app/app_tasks.h](app/app_tasks.h)). Five
-  tasks: `can_rx` (priority 6) for received frames and the command's supervision, `sensor` (5)
-  every 10 ms, `process` (4) released by the sensor's samples, `can_tx` (3) below the tasks whose
-  frames it sends, and `health` (2) every 100 ms. The sensor task posts samples to a queue; the
+  tasks: `can_rx` (priority 6; 7 since phase 5) for received frames and the command's
+  supervision, `sensor` (5; now 6) every 10 ms, `process` (4; now 5) released by the sensor's
+  samples, `can_tx` (3; now 4) below the tasks whose frames it sends, and `health` (2) every
+  100 ms; phase 4 added the flash task (1), phase 5 the diagnostic task (3). The sensor task
+  posts samples to a queue; the
   processing task runs lib/bms under a mutex with priority inheritance and publishes the
   protected telemetry; interrupts reach the CAN tasks by task notification. Every kernel object
   of the application is allocated statically. The conversions to the DBC's raw values are in
@@ -287,6 +289,60 @@ measured for a target.
   attempt or writes a rollback, and while the node confirms, each followed by a start that must
   be what the state machine says.
 
+## What phase 5 adds
+
+The update now comes over the bus: a tester on CAN erases the slot that does not run, downloads
+the new image into it with the node running, has it checked and committed, resets the node, and
+confirms the trial the bootloader starts. The node is an A/B design, so the running image
+receives the download and the bootloader stays small and carries no UDS stack
+([docs/diagnostics.md](docs/diagnostics.md) says why, and describes all of it; no timing has been
+measured for a target).
+
+- **ISO-TP** ([lib/isotp](lib/isotp/isotp.h)), ISO 15765-2:2016 for one connection on classical
+  CAN, in pure C with the time passed in: single, first, consecutive and flow control frames,
+  block size and separation time from every flow control, WAIT with a bound at both ends,
+  overflow, the four timers to the microsecond, the standard's table of unexpected frames, and
+  transmit confirmations that carry no identity, matched in order, with the peer's answer
+  accepted as proof of a frame not yet confirmed. Every frame is padded to 8 bytes with 0xCC; a
+  shorter frame is understood if it holds what its first byte says.
+- **A UDS server** ([lib/uds](lib/uds/uds.h)), ISO 14229-1:2020, transport-independent: the
+  default, programming and extended sessions with P2server, P2*server, responsePending and
+  S3server; the general response behaviour in the standard's order, the
+  suppressPosRspMsgIndicationBit, one request at a time; DiagnosticSessionControl, ECUReset,
+  TesterPresent, ReadDataByIdentifier (the session, the image's version, a boot information
+  record), RoutineControl (eraseMemory, checkProgrammingDependencies, and a confirm routine for
+  the running trial), RequestDownload, TransferData, RequestTransferExit, ReadDTCInformation and
+  ClearDiagnosticInformation, in a table of services. Long work goes through a backend that
+  answers *pending*; the download's state machine maps every refusal of lib/boot's slot writer
+  to its negative response.
+- **The node's side** ([app/diag.c](app/diag.c), [app/diag_backend.c](app/diag_backend.c),
+  [app/flash_job.c](app/flash_job.c)). A diagnostic task between the transmit task and the health
+  task joins the two to the CAN tasks; its receive parameters are chosen so that the protocol
+  itself bounds what its queue holds, and the response-time analysis, task table and
+  [docs/architecture.md](docs/architecture.md) include it. Every flash operation is still the
+  flash task's, now as one job per service step, and the flash task is supervised: a download
+  stuck in it ends in a watchdog reset, never in a hang. The tester's confirm routine and the
+  trial's self-confirm after 5 s of good health both exist, and the first one wins. The DTC
+  services read a snapshot the health task publishes every period, and the clear is the health
+  task's. The statistics count every ISO-TP result and frame, every UDS request, negative
+  response and responsePending, and the download's bytes, blocks and durations.
+- **A tester** ([tools/fcn_tools/diag.py](tools/fcn_tools/diag.py),
+  [tools/fcn_tools/flasher.py](tools/fcn_tools/flasher.py)) on the pinned udsoncan and
+  can-isotp, independent implementations of both standards, on SocketCAN or the UDP bus, with
+  timeouts from the flash part's maximum times; `python -m fcn_tools.flasher` makes the
+  programming sequence and writes a JSON report with the time of every step. A bench that starts
+  the node again through the bootloader after a requested reset, as a board starts again.
+- **Tests.** Unit tests of every new module, each challenged with planted defects; system tests
+  that write ISO-TP frames by hand (a wrong sequence number, stray frames, a first frame too
+  large, a tester that stops in the middle of a message, WAIT and overflow from the tester),
+  send every request of every service with exactly its expected answer and compare the node's
+  counters with what the tester saw, download end to end with the flasher on both transports, and
+  break downloads on purpose: an image that does not validate, an image that crashes and is
+  rolled back (the rollback read back through ReadDTCInformation), a download while a trial
+  runs, a tester that falls silent or resets the node in the middle of one, and power cuts in
+  every kind of flash operation of a download, each followed by a start through the bootloader
+  that must be what the state machine says and a download that must succeed.
+
 ## Build and test
 
 Ubuntu 24.04 (natively, or under WSL2):
@@ -342,8 +398,10 @@ SocketCAN interface `vcan0`, and runs the timing benchmark for the record.
 lib/             portable C11 modules: no OS calls, no malloc; covered by the unit tests
 app/             the FreeRTOS application: tasks and their IPC (app.c), the conversions to the
                  DBC (signals.c), the frames (telemetry.c), the command receiver (command.c),
-                 the faults and their DTCs (fault.c), the node's side of an update (update.c);
-                 gen/ is generated from the DBC by tools/gen_can_db.py
+                 the faults and their DTCs (fault.c), the node's side of an update (update.c),
+                 the diagnostic connection and its backend (diag.c, diag_backend.c), the flash
+                 jobs of a download (flash_job.c); gen/ is generated from the DBC by
+                 tools/gen_can_db.py
 dbc/             the CAN messages (fcn.dbc), the source of app/gen/ and of the Python decoders
 platform/        include/ is what the application expects from a platform;
                  posix/ implements it on Linux under the FreeRTOS POSIX port, and holds the
@@ -354,12 +412,13 @@ tests/           unit/ (Unity), platform/ (tests of the host layer), python/ (py
                  system/ (pytest, the node as a process), tools/ (C helpers the tests call)
 tools/           Python package: node and bus control, UDP bus for python-can, decoding and
                  E2E checks, the schedulability check, the image format and the flash file,
-                 result files; the codec generator
+                 the UDS tester and the flasher, result files; the codec generator
 bench/           measurement scripts; they write results/
 results/         measured data (JSON with provenance) and plots; host timing only
 scripts/         one script per build, test and analysis step
 docs/            the application, the CAN protocol, the simulated CAN bus, the sensor model,
-                 fault handling, the update, bug log, MISRA deviations, notes on WSL
+                 fault handling, the update, diagnostics (ISO-TP and UDS), bug log, MISRA
+                 deviations, notes on WSL
 third_party/     FreeRTOS-Kernel and Unity, pinned submodules
 ```
 

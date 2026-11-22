@@ -109,7 +109,7 @@ to `temp4`; `cell1` is bit 0 of the invalid mask, and the cell signal `Cell1Volt
   (`vTaskDelay(1)`), so the tasks below it go on running, the health task included, and only
   something that watches the sensor task itself can see that it stopped: the watchdog manager,
   or the processing task's timeout on the samples that no longer come. With `spin` it waits
-  the way a driver polling a busy flag does: the sensor task (priority 5) never gives up the
+  the way a driver polling a busy flag does: the sensor task (priority 6 since phase 5) never gives up the
   CPU as far as the scheduler can tell, so every task below it starves, the processing,
   transmit and health tasks with it, and with the health task everything it does, such as
   kicking the hardware watchdog. (On the host the thread sleeps 1 ms between its looks at the

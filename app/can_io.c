@@ -75,6 +75,11 @@ static can_io_stats_t s_stats;
 static can_io_alive_handler_t s_rx_alive;
 static can_io_alive_handler_t s_tx_alive;
 
+/* The transmit-done handler (can_io_on_tx_done): set before the scheduler starts, read only by
+ * the transmit task afterwards. */
+static can_io_tx_done_handler_t s_tx_done_handler;
+static uint32_t s_tx_done_id;
+
 /* Interrupt context: turn the controller's causes into notifications. */
 static void can_io_isr(void *context, uint32_t causes, BaseType_t *woken)
 {
@@ -216,12 +221,21 @@ static void handle_controller_events(void)
 
     while (plat_can_event(&event)) {
         uint32_t requests = 0U;
+        can_txq_done_t done = {.cyclic = true, .slot = 0U, .id = 0U, .stamp_ns = 0U};
+        bool report = false;
 
         taskENTER_CRITICAL();
 
         switch (event.kind) {
         case PLAT_CAN_EVENT_TX_DONE:
-            (void)can_txq_on_tx_done(&s_queue, event.handle, NULL);
+            /* An event frame of the registered identifier goes to its handler, after the
+             * critical section; the queue's record says which frame the handle was. */
+            report = can_txq_on_tx_done(&s_queue, event.handle, &done) && !done.cyclic &&
+                     (s_tx_done_handler != NULL) && (done.id == s_tx_done_id);
+
+            if (report) {
+                s_stats.tx_done_reports++;
+            }
             break;
         case PLAT_CAN_EVENT_TX_ABORTED:
             (void)can_txq_on_tx_aborted(&s_queue, event.handle);
@@ -238,6 +252,10 @@ static void handle_controller_events(void)
         }
 
         taskEXIT_CRITICAL();
+
+        if (report) {
+            s_tx_done_handler(done.stamp_ns);
+        }
 
         if (event.kind == PLAT_CAN_EVENT_STATE) {
             LOG_WRN(TAG, "controller state %u -> %u (TEC %u, REC %u)",
@@ -404,6 +422,43 @@ bool can_io_send_event(const can_frame_t *frame)
     }
 
     return accepted;
+}
+
+bool can_io_send_event_stamped(const can_frame_t *frame, uint64_t *stamp_ns)
+{
+    bool accepted;
+    bool wake;
+    uint64_t now_ns;
+
+    taskENTER_CRITICAL();
+    now_ns = plat_time_ns();
+    accepted = can_txq_enqueue(&s_queue, frame, now_ns);
+    /* Counted after the enqueue, in its critical section: the enqueue has discarded the event
+     * frames that had expired, so any other frame still held is one that will be reported or
+     * loaded (see the header), and none can leave before this one is in. */
+    wake = accepted && (can_txq_events_held(&s_queue) == 1U);
+
+    if (accepted && !wake) {
+        s_stats.tx_quiet_enqueues++;
+    }
+
+    taskEXIT_CRITICAL();
+
+    if (accepted) {
+        *stamp_ns = now_ns;
+
+        if (wake) {
+            (void)xTaskNotify(s_tx_task, NOTIFY_TX_REQUEST, eSetBits);
+        }
+    }
+
+    return accepted;
+}
+
+void can_io_on_tx_done(uint32_t id, can_io_tx_done_handler_t handler)
+{
+    s_tx_done_id = id;
+    s_tx_done_handler = handler;
 }
 
 void can_io_get_stats(can_io_stats_t *io, can_txq_stats_t *queue)

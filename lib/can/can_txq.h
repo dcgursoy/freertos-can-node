@@ -301,6 +301,17 @@ uint64_t can_txq_next_deadline(const can_txq_t *queue);
 
 const can_txq_stats_t *can_txq_stats(const can_txq_t *queue);
 
+/**
+ * The event frames the queue holds now: those waiting in the FIFO and the one in a mailbox, if
+ * one is. While it is not 0 the transmit path has an event frame to report or to load, so a
+ * caller that serves it (the transmit task) looks at the FIFO again when that frame's report
+ * comes, or when the cyclic frames that keep the mailboxes busy are reported: a producer that
+ * reads it in the same critical section as its can_txq_enqueue() and finds it above 0 knows
+ * that its frame will be loaded without a wake-up of its own (app/can_io.c,
+ * can_io_send_event_stamped()). Any context, serialised with the other calls.
+ */
+uint32_t can_txq_events_held(const can_txq_t *queue);
+
 /** The counters of cyclic slot `slot` (see ACCOUNTING); NULL if `slot` is not below
  *  CAN_TXQ_CYCLIC_SLOTS. */
 const can_txq_slot_stats_t *can_txq_slot_stats(const can_txq_t *queue, uint8_t slot);

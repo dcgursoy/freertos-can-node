@@ -78,18 +78,46 @@
  * whether a trial runs in good health (update_health_period(): the watchdog manager OK, the CAN
  * controller error active, no bus-off, and a frame acknowledged since the period before); once
  * it has done so for UPDATE_CONFIRM_AFTER_S seconds without a break it asks the flash task to
- * confirm it, once.
- * The FLASH TASK, the lowest-priority task, makes every write of the node to the flash: a flash
- * operation blocks its caller for the time the part takes (a record: two page programs of
- * 0.4 ms, and a sector erase of 45 ms when it is the first of a sector), which no task with a
- * deadline or an alive indication to give may spend waiting. It owns lib/boot's state (boot_t):
- * at start it reads the metadata once (boot_describe(), for the log and the statistics), and on
- * each request it calls boot_confirm() for the slot the hand-off names and hands the result
- * back to the health task. Phase 5's slot writer runs in it too. Without a flash
- * (plat_flash_device() NULL) it waits and does nothing.
+ * confirm it, once. The tester's confirm routine (UDS RoutineControl 0xF000) is the other way:
+ * whichever comes first writes the CONFIRM record, in the flash task, and the other one then
+ * writes nothing (flash_job.h, THE CONFIRM); the health task learns of a confirm by the routine
+ * from the flash task (update_routine_confirmed()).
  *
- * SUPERVISION. The sensor, processing, receive and transmit tasks each report an alive
- * indication once per pass of their loop (s_supervised). The health task runs one supervision
+ * THE FLASH TASK, the lowest-priority task, makes every write of the node to the flash: a flash
+ * operation blocks its caller for the time the part takes (a page program 0.4 ms, a sector
+ * erase 45 ms; 3 ms and 400 ms at most), which no task with a deadline or an alive indication
+ * to give may spend waiting. It owns lib/boot's state (boot_t) and the slot writer: at start it
+ * reads the metadata once (boot_describe(), for the log and the statistics); then it runs the
+ * jobs of the diagnostic task, one at a time (flash_job.h: an erase, a block written, the exit,
+ * the check, the confirm routine), and the confirm the health task asks for, and hands each
+ * result back. It waits for them at most APP_FLASH_IDLE_WAIT_MS, so that it gives an alive
+ * indication at least that often, and gives one after every call of lib/boot in a job (see
+ * SUPERVISION). Without a flash (plat_flash_device() NULL) every job ends with BOOT_E_STATE.
+ *
+ * THE DIAGNOSTIC TASK owns the diagnostic connection (diag.h: lib/isotp in front of lib/uds) and
+ * the UDS backend (diag_backend.h):
+ *   - the receive task puts every UDS_Request frame (0x7E0) into a queue of
+ *     APP_DIAG_RX_QUEUE_LENGTH frames (never waiting: a frame the queue refuses is lost and
+ *     counted), and the transmit task every report of a UDS_Response frame (0x7E8) sent into a
+ *     queue of APP_DIAG_TX_DONE_QUEUE_LENGTH (can_io_on_tx_done()); each notifies the task;
+ *   - the task takes the reports first, then the frames, at most APP_DIAG_EVENTS_PER_TICK in a
+ *     tick, and polls the connection after them and at its next deadline (the timers of lib/isotp
+ *     and of lib/uds), waiting at most APP_DIAG_IDLE_WAIT_MS;
+ *   - its frames go out as event frames of the transmit queue (can_io_send_event_stamped());
+ *   - the flash work of a service is a job for the flash task, posted into a mailbox of one job
+ *     (lib/uds runs one operation at a time) and polled while lib/uds answers responsePending;
+ *     the flash task notifies the task when the job is done;
+ *   - the DTC services read the snapshot of the DTCs the health task publishes after every period
+ *     (a copy of lib/dtc's state in a critical section, at most one health period and the health
+ *     task's response time old), and ClearDiagnosticInformation adds one to a count of clear
+ *     requests that the health task carries out as it carries out those of TESTER_Command
+ *     (run_faults()), after which it notifies the task: the positive response follows the clear;
+ *   - an accepted ECUReset is made by the task once the transmission of its response has ended,
+ *     at most 2 s after the request (diag.h, ECURESET): plat_reset(PLAT_RESET_REQUESTED).
+ *
+ * SUPERVISION. The sensor, processing, receive, transmit and diagnostic tasks each report an
+ * alive indication once per pass of their loop, and the flash task once per pass and after every
+ * call of lib/boot in a job (s_supervised). The health task runs one supervision
  * cycle of the watchdog manager per period and kicks the hardware watchdog after it while the
  * manager allows a kick (global status OK, FAILED or EXPIRED). An entity beyond its tolerance
  * makes the global status STOPPED at once (expired_tolerance 0): the health task records it (a
@@ -112,10 +140,14 @@
 
 #include "app_tasks.h"
 #include "boot/boot.h"
+#include "bootimg/bootimg.h"
 #include "can_db.h"
 #include "can_io.h"
 #include "command.h"
+#include "diag.h"
+#include "diag_backend.h"
 #include "fault.h"
+#include "flash_job.h"
 #include "log/log.h"
 #include "plat_can.h"
 #include "plat_flash.h"
@@ -202,9 +234,9 @@ _Static_assert(APP_FAULT_VERDICT_QUEUE_LENGTH >=
 _Static_assert(APP_SAMPLE_TIMEOUT_MS > APP_SENSOR_PERIOD_MS, "a timeout is longer than a period");
 
 /* The tasks BMS_TaskStats goes round, in this order (TaskIndex). */
-#define TASK_STATS_TASKS 7U
+#define TASK_STATS_TASKS 8U
 static const char *const s_stats_tasks[TASK_STATS_TASKS] = {"can_rx", "sensor", "process", "can_tx",
-                                                            "health", "flash",  "IDLE"};
+                                                            "health", "flash",  "IDLE",    "diag"};
 _Static_assert(TASK_STATS_TASKS <= (CAN_DB_BMS_TASK_STATS_TASK_INDEX_RAW_MAX + 1U),
                "TaskIndex holds every index");
 _Static_assert((uint32_t)configMAX_PRIORITIES <= (CAN_DB_BMS_TASK_STATS_TASK_PRIORITY_RAW_MAX + 1U),
@@ -261,20 +293,39 @@ static const message_info_t s_messages[SLOTS] = {
  * period is the business of the overrun counters (BMS_TaskStats). The upper bounds:
  *   - sensor, process: one indication per pass, a pass per 10 ms (the process task's also on
  *     each timeout of its wait, every 30 ms, while the samples do not come): 10 expected, at
- *     most 20, twice the rate of its period, so that a task whose wait no longer waits (a loop
- *     that runs through xTaskDelayUntil or the queue at once) is found as well. A task that
+ *     most about twice the rate of its period, so that a task whose wait no longer waits (a
+ *     loop that runs through xTaskDelayUntil or the queue at once) is found as well. A task that
  *     goes on after a stall stays below it. The sensor task does not make up the periods it
  *     missed: it skips them and keeps the grid of its period (sensor_task()). Between two
  *     examinations it makes a pass for each period of the grid that begins in between, and
  *     after a stall at most two more (the end of the pass that stalled, and at once the pass
- *     of the period the tick is in): 12 when the examinations are 100 ms apart, 14 when the
- *     health task's response time (under 20 ms, task_table.c) puts them 120 ms apart. The
- *     processing task, after a stall of its own, finds at most the APP_SAMPLE_QUEUE_LENGTH (4)
- *     samples the queue held and then one per pass of the sensor task: at most 4 + 14 = 18;
- *     its timeouts come only while no sample does;
+ *     of the period the tick is in): 12 when the examinations are 100 ms apart, 17 when the
+ *     health task's response time (under 45 ms since phase 5's diagnostic task, task_table.c)
+ *     puts them 145 ms apart: at most 20. The processing task, after a stall of its own, finds
+ *     at most the APP_SAMPLE_QUEUE_LENGTH (4) samples the queue held and then one per pass of
+ *     the sensor task: at most 4 + 17 = 21 (20 before phase 5, when the examinations were at
+ *     most 120 ms apart); its timeouts come only while no sample does;
  *   - can_rx, can_tx: a pass per wake-up, at least every 50 ms (can_io.h), at most one per
  *     frame on the bus (2200 per 100 ms at 1 Mbit/s, task_table.c): 2 expected and the largest
- *     upper bound a uint16_t margin gives, 65535; a lower bound only, in effect.
+ *     upper bound a uint16_t margin gives, 65535; a lower bound only, in effect;
+ *   - diag: the same, for a pass per event or deadline, at least every APP_DIAG_IDLE_WAIT_MS
+ *     (50 ms);
+ *   - flash: a pass per job or request, at least every APP_FLASH_IDLE_WAIT_MS (100 ms) between
+ *     them, and an indication after every call of lib/boot in a job (flash_job.h), up to
+ *     thousands in a cycle (the validation of an image is a step per 64 bytes): the same bounds
+ *     as can_rx. But one call can block the task for longer than a supervision cycle: a record
+ *     written into a metadata sector that has to be erased first takes a sector erase and three
+ *     page programs, 409 ms at the part's maximum times (plat_flash.h), and the erase steps of
+ *     a download take 400 ms each at the maximum, back to back. So the flash entity is examined
+ *     every 6 cycles (reference_cycle 6): a window of 600 ms, which the health task's response
+ *     time (under 45 ms, task_table.c) shortens to no less than 555 ms, always holds an
+ *     indication of a flash task that works, also with every call at the part's maximum time and
+ *     the task's own response time to it (under 70 ms) on top. failed_tolerance 1: a flash task that
+ *     stops (a job that never returns, --flash-hang in the tests) makes the first window that
+ *     begins after its last indication incorrect and the second EXPIRED, 1.2 to 1.8 s after
+ *     that indication, and the hardware watchdog resets the node APP_WDG_TIMEOUT_MS after the
+ *     last kick. A download stuck in the flash task therefore ends in a reset, never in a hang:
+ *     the tester has had responsePending every 2 s until then, and gets no answer after it.
  * failed_tolerance 2: two failed cycles, net of good ones in between, are tolerated, so that one
  * pass of an event-driven task that slips past the end of a cycle is not taken for a hang, and
  * a task that stands still for up to two cycles and then goes on is not reset for it: the
@@ -296,6 +347,8 @@ typedef enum {
     SUPERVISED_SENSOR,
     SUPERVISED_PROCESS,
     SUPERVISED_CAN_TX,
+    SUPERVISED_DIAG,
+    SUPERVISED_FLASH,
     SUPERVISED_ENTITIES
 } supervised_t;
 
@@ -315,7 +368,7 @@ static const wdgm_entity_config_t s_supervised[SUPERVISED_ENTITIES] = {
     [SUPERVISED_PROCESS] = {.name = "process",
                             .expected_alive = 10U,
                             .min_margin = 9U,
-                            .max_margin = 10U,
+                            .max_margin = 11U,
                             .reference_cycle = 1U,
                             .failed_tolerance = 2U},
     [SUPERVISED_CAN_TX] = {.name = "can_tx",
@@ -323,7 +376,19 @@ static const wdgm_entity_config_t s_supervised[SUPERVISED_ENTITIES] = {
                            .min_margin = 1U,
                            .max_margin = 65533U,
                            .reference_cycle = 1U,
-                           .failed_tolerance = 2U}};
+                           .failed_tolerance = 2U},
+    [SUPERVISED_DIAG] = {.name = "diag",
+                         .expected_alive = 2U,
+                         .min_margin = 1U,
+                         .max_margin = 65533U,
+                         .reference_cycle = 1U,
+                         .failed_tolerance = 2U},
+    [SUPERVISED_FLASH] = {.name = "flash",
+                          .expected_alive = 2U,
+                          .min_margin = 1U,
+                          .max_margin = 65533U,
+                          .reference_cycle = 6U,
+                          .failed_tolerance = 1U}};
 
 /* expired_tolerance 0: no supervision cycle with kicks after an entity expired. The time the
  * node has to record the failure before the reset is the hardware watchdog's timeout. */
@@ -421,9 +486,80 @@ static update_monitor_t s_update;
  * goes to the health task in s_confirm_result, s_confirm_reported, read and written in
  * critical sections. */
 static boot_t s_boot;
+static bootimg_t s_validator;
+static flash_jobs_t s_jobs;
 static node_flash_task_stats_t s_flash_stats;
 static boot_status_t s_confirm_result;
 static bool s_confirm_reported;
+
+/* What the flash task tells the others besides the confirm's result, read and written in
+ * critical sections: the trial was confirmed (by either way), and by the routine (for the health
+ * task, which then takes it into its monitor once: s_routine_reported). */
+static bool s_trial_confirmed;
+static bool s_routine_confirmed;
+static bool s_routine_reported;
+
+/* The notification bits of the flash task. */
+#define FLASH_NOTIFY_CONFIRM 0x01U /* the health task asks for the confirm of the trial */
+#define FLASH_NOTIFY_JOB     0x02U /* the diagnostic task posted a job */
+
+/* The mailbox of the flash task's jobs (THE DIAGNOSTIC TASK): one job, its state and its result,
+ * read and written in critical sections. The diagnostic task posts (IDLE -> POSTED) and takes the
+ * result (DONE -> IDLE); the flash task runs it (POSTED -> RUNNING -> DONE). */
+typedef enum { JOB_IDLE = 0, JOB_POSTED, JOB_RUNNING, JOB_DONE } job_state_t;
+
+static job_state_t s_job_state;
+static flash_job_t s_job;
+static flash_job_result_t s_job_result;
+
+/* The diagnostic task: the connection and the backend, owned by it. */
+static StaticTask_t s_diag_tcb;
+static StackType_t s_diag_stack[APP_TASK_STACK_WORDS];
+static TaskHandle_t s_diag_task;
+static diag_t s_diag;
+static diag_backend_t s_diag_backend;
+static dtc_state_t s_diag_dtc; /* its copy of the published snapshot */
+static uint32_t s_diag_events;
+static uint32_t s_diag_passes;
+static uint32_t s_diag_budget_waits;
+
+/* The notification bits of the diagnostic task. */
+#define DIAG_NOTIFY_EVENT  0x01U /* a frame or a report in a queue */
+#define DIAG_NOTIFY_JOB    0x02U /* the flash task finished the job */
+#define DIAG_NOTIFY_HEALTH 0x04U /* the health task carried out a clear */
+
+static StaticQueue_t s_diag_rx_queue_state;
+static can_frame_t s_diag_rx_queue_storage[APP_DIAG_RX_QUEUE_LENGTH];
+static QueueHandle_t s_diag_rx_queue;
+static StaticQueue_t s_diag_tx_done_queue_state;
+static uint64_t s_diag_tx_done_queue_storage[APP_DIAG_TX_DONE_QUEUE_LENGTH];
+static QueueHandle_t s_diag_tx_done_queue;
+
+/* Written by the receive task: UDS_Request frames lost, and the queue's high-water mark. */
+static uint32_t s_diag_rx_lost;
+static uint32_t s_diag_rx_high_water;
+/* Written by the transmit task: reports lost. */
+static uint32_t s_diag_tx_done_lost;
+
+/* Published by the health task after every period, read by the diagnostic task, in critical
+ * sections: the DTCs (a copy of lib/dtc's state), the count of clear requests it has carried out
+ * (fault_monitor_t.clear_requests), and the confirm's state. */
+static dtc_state_t s_dtc_published;
+static uint32_t s_clears_carried_out;
+static update_confirm_state_t s_confirm_state_published;
+
+/* ClearDiagnosticInformation requests of the diagnostic task: added to those of TESTER_Command
+ * (s_clear_requests), the sum is the count the health task carries out. Critical sections. */
+static uint32_t s_uds_clear_requests;
+
+/* The health task's: the count of TESTER_Command's clear requests at its last clear, for the log
+ * line that names the source of a clear. */
+static uint32_t s_command_clears_seen;
+
+_Static_assert(APP_DIAG_RX_QUEUE_LENGTH == (DIAG_BLOCK_SIZE + 2U),
+               "the queue holds a block of the node's BS and two frames more");
+_Static_assert(APP_DIAG_TX_DONE_QUEUE_LENGTH >= DIAG_HANDOUTS,
+               "a report for every frame the connection has recorded");
 
 /* ------------------------------------------------------------------------------- helpers */
 
@@ -437,22 +573,25 @@ static void publish(uint8_t slot, bool built, const can_frame_t *frame, uint64_t
     }
 }
 
-/* The telemetry switch and the count of clear requests, as the receive task last left them. */
+/* The telemetry switch, as the receive task last left it, and the count of clear requests: those
+ * of TESTER_Command (the receive task's) and those of ClearDiagnosticInformation (the diagnostic
+ * task's), added up. Both only grow, so the sum does, and the health task carries out a clear for
+ * every new sum as it did for the count of TESTER_Command alone (fault_clear_if_requested()). */
 static void command_outputs(bool *telemetry_on, uint32_t *clear_requests)
 {
     taskENTER_CRITICAL();
     *telemetry_on = s_telemetry_on;
-    *clear_requests = s_clear_requests;
+    *clear_requests = s_clear_requests + s_uds_clear_requests;
     taskEXIT_CRITICAL();
 }
 
-/* The count of clear requests alone, as the receive task last left it. */
+/* The count of clear requests alone (see command_outputs()). */
 static uint32_t clear_requests_counted(void)
 {
     uint32_t requests;
 
     taskENTER_CRITICAL();
-    requests = s_clear_requests;
+    requests = s_clear_requests + s_uds_clear_requests;
     taskEXIT_CRITICAL();
 
     return requests;
@@ -947,16 +1086,39 @@ static void run_faults(update_health_t *confirm)
     fault_health_cycle(&s_faults, &inputs);
 
     if (s_faults.clears != clears) {
-        LOG_INF(TAG, "DTCs cleared: CmdClearFaultsSeq changed (clear %lu)",
-                (unsigned long)s_faults.clears);
+        uint32_t command_clears;
+
+        taskENTER_CRITICAL();
+        command_clears = s_clear_requests;
+        taskEXIT_CRITICAL();
+
+        /* Which source asked: TESTER_Command if its count moved since the last clear (phase 3's
+         * line), otherwise ClearDiagnosticInformation. */
+        if (command_clears != s_command_clears_seen) {
+            LOG_INF(TAG, "DTCs cleared: CmdClearFaultsSeq changed (clear %lu)",
+                    (unsigned long)s_faults.clears);
+        } else {
+            LOG_INF(TAG, "DTCs cleared: ClearDiagnosticInformation (clear %lu)",
+                    (unsigned long)s_faults.clears);
+        }
+
+        s_command_clears_seen = command_clears;
     }
 
     fault_summary(&s_faults, &summary, &changes);
     log_fault_changes(&changes);
 
+    /* The summary, and for the diagnostic task the snapshot of the DTCs and the clears carried
+     * out, all of the end of this period (THE DIAGNOSTIC TASK). */
     taskENTER_CRITICAL();
     s_fault_summary = summary;
+    s_dtc_published = s_faults.dtc;
+    s_clears_carried_out = s_faults.clear_requests;
     taskEXIT_CRITICAL();
+
+    if (s_faults.clears != clears) {
+        (void)xTaskNotify(s_diag_task, DIAG_NOTIFY_HEALTH, eSetBits);
+    }
 
     const bool built = telemetry_fault(&s_fault_counter, &summary, &frame);
 
@@ -1009,20 +1171,35 @@ static void run_update(const update_health_t *health)
 {
     boot_status_t result;
     bool reported;
+    bool by_routine;
 
     taskENTER_CRITICAL();
     reported = s_confirm_reported;
     result = s_confirm_result;
     s_confirm_reported = false;
+    by_routine = s_routine_confirmed && !s_routine_reported;
+    s_routine_reported = s_routine_confirmed;
     taskEXIT_CRITICAL();
+
+    /* The routine's confirm first: a confirm of the window that the flash task answered after
+     * it found the trial confirmed then changes nothing (update.h). */
+    if (by_routine) {
+        update_routine_confirmed(&s_update);
+        LOG_INF(TAG, "the trial in slot %s is confirmed by the tester's confirm routine",
+                slot_name(s_handoff.slot));
+    }
 
     if (reported) {
         update_confirm_done(&s_update, result);
     }
 
     if (update_health_period(&s_update, health)) {
-        (void)xTaskNotifyGive(s_flash_task);
+        (void)xTaskNotify(s_flash_task, FLASH_NOTIFY_CONFIRM, eSetBits);
     }
+
+    taskENTER_CRITICAL();
+    s_confirm_state_published = s_update.state;
+    taskEXIT_CRITICAL();
 }
 
 /* Flash task context: the metadata as the task finds them at start, into its statistics and
@@ -1051,28 +1228,35 @@ static void describe_metadata(void)
     }
 }
 
-/* Flash task context: the confirm the health task asked for. */
+/* Flash task context: the confirm the health task asked for, unless the tester's routine has
+ * made it (flash_jobs_self_confirm()). */
 static boot_status_t confirm_trial(void)
 {
-    boot_status_t status = BOOT_E_ARG; /* no flash, or lib/boot refused its layout */
     const uint64_t start_ns = plat_time_ns();
+    bool written = false;
 
     LOG_INF(TAG, "trial in slot %s ran %u s in good health: writing its confirm",
             slot_name(s_handoff.slot), (unsigned int)UPDATE_CONFIRM_AFTER_S);
 
-    if (s_flash_stats.boot_ready) {
-        status = boot_confirm(&s_boot, s_handoff.slot);
-    }
+    const boot_status_t status = flash_jobs_self_confirm(&s_jobs, &written);
+    const uint64_t took_ns = plat_time_ns() - start_ns;
 
-    s_flash_stats.confirms++;
+    taskENTER_CRITICAL();
+    s_flash_stats.confirms += written ? 1U : 0U;
     s_flash_stats.confirm_status = status;
-    s_flash_stats.confirm_ns = plat_time_ns() - start_ns;
+    s_flash_stats.confirm_ns = written ? took_ns : s_flash_stats.confirm_ns;
+    s_flash_stats.self_skipped = s_jobs.self_skipped;
+    s_trial_confirmed = s_jobs.confirmed;
+    taskEXIT_CRITICAL();
 
-    if (status == BOOT_OK) {
+    if ((status == BOOT_OK) && !written) {
+        LOG_INF(TAG, "the trial is confirmed by the tester's confirm routine already: nothing "
+                     "written");
+    } else if (status == BOOT_OK) {
         LOG_INF(TAG, "confirmed: slot %s, image %u.%u.%u, is the active image (%lu us)",
                 slot_name(s_handoff.slot), version_major(s_handoff.image_version),
                 version_minor(s_handoff.image_version), version_patch(s_handoff.image_version),
-                (unsigned long)(s_flash_stats.confirm_ns / 1000U));
+                (unsigned long)(took_ns / 1000U));
     } else {
         LOG_ERR(TAG,
                 "the confirm of slot %s failed: %s; it stays a trial, rolled back after its "
@@ -1083,14 +1267,107 @@ static boot_status_t confirm_trial(void)
     return status;
 }
 
+/* Flash task context: an alive indication from inside a job (flash_job.h). */
+static void flash_alive(void *ctx)
+{
+    (void)ctx;
+    alive(SUPERVISED_FLASH);
+}
+
+/* Flash task context: the log line at the end of a job. Writes are many (a line each would be
+ * a line per TransferData block): only their failures are logged. */
+static void log_job(const flash_job_t *job, const flash_job_result_t *result, uint64_t took_ns)
+{
+    const bool ok = (result->status == BOOT_OK) ||
+                    ((job->kind == FLASH_JOB_EXIT) && (result->status == BOOT_BUSY));
+
+    if (!ok) {
+        LOG_WRN(TAG, "flash job %s: %s after %lu steps (%lu us)", flash_job_kind_name(job->kind),
+                boot_status_name(result->status), (unsigned long)result->steps,
+                (unsigned long)(took_ns / 1000U));
+    } else if (job->kind == FLASH_JOB_ERASE) {
+        LOG_INF(TAG, "download: slot at 0x%06lX erased for %lu bytes, %lu steps (%lu us)",
+                (unsigned long)job->address, (unsigned long)job->size, (unsigned long)result->steps,
+                (unsigned long)(took_ns / 1000U));
+    } else if (job->kind == FLASH_JOB_CHECK) {
+        LOG_INF(TAG,
+                "download: the image validated and is committed as the trial, %lu steps "
+                "(%lu us)",
+                (unsigned long)result->steps, (unsigned long)(took_ns / 1000U));
+    } else if (job->kind == FLASH_JOB_CONFIRM) {
+        LOG_INF(TAG,
+                "confirmed by the tester's confirm routine: slot %s, image %u.%u.%u, is the "
+                "active image (%lu us)",
+                slot_name(s_handoff.slot), version_major(s_handoff.image_version),
+                version_minor(s_handoff.image_version), version_patch(s_handoff.image_version),
+                (unsigned long)(took_ns / 1000U));
+    } else {
+        /* a write or the exit: no line */
+    }
+}
+
+/* Flash task context: the job the diagnostic task posted, if one is (THE DIAGNOSTIC TASK). */
+static void run_posted_job(void)
+{
+    flash_job_t job = {
+        .kind = FLASH_JOB_NONE, .address = 0U, .size = 0U, .offset = 0U, .data = NULL, .len = 0U};
+    flash_job_result_t result = {.status = BOOT_E_ARG, .steps = 0U};
+    bool posted;
+
+    taskENTER_CRITICAL();
+    posted = (s_job_state == JOB_POSTED);
+
+    if (posted) {
+        job = s_job;
+        s_job_state = JOB_RUNNING;
+    }
+
+    taskEXIT_CRITICAL();
+
+    if (posted) {
+        const uint64_t start_ns = plat_time_ns();
+
+        flash_job_run(&s_jobs, &job, flash_alive, NULL, &result);
+
+        const uint64_t took_ns = plat_time_ns() - start_ns;
+        const uint32_t kind = (uint32_t)job.kind;
+
+        log_job(&job, &result, took_ns);
+
+        taskENTER_CRITICAL();
+        s_job_result = result;
+        s_job_state = JOB_DONE;
+
+        if (kind < (uint32_t)FLASH_JOB_KINDS) {
+            s_flash_stats.jobs[kind]++;
+            s_flash_stats.job_status[kind] = result.status;
+            s_flash_stats.job_steps[kind] = result.steps;
+            s_flash_stats.job_last_ns[kind] = took_ns;
+
+            if (took_ns > s_flash_stats.job_max_ns[kind]) {
+                s_flash_stats.job_max_ns[kind] = took_ns;
+            }
+        }
+
+        s_flash_stats.confirmed_by_routine = s_jobs.by_routine;
+        s_trial_confirmed = s_jobs.confirmed;
+        s_routine_confirmed = s_jobs.by_routine;
+        taskEXIT_CRITICAL();
+
+        (void)xTaskNotify(s_diag_task, DIAG_NOTIFY_JOB, eSetBits);
+    }
+}
+
 /*
- * The flash task: every write of the node to the flash (see THE UPDATE). Blocked between
- * requests; each operation it makes blocks it for the part's time (plat_flash.h), which only the
- * idle task waits behind.
+ * The flash task: every write of the node to the flash (see THE FLASH TASK). Blocked between
+ * jobs and requests, at most APP_FLASH_IDLE_WAIT_MS; each operation it makes blocks it for the
+ * part's time (plat_flash.h), which only the idle task waits behind.
  */
 static void flash_task(void *arg)
 {
     const flash_dev_t *dev = plat_flash_device();
+    const plat_flash_layout_t *layout = plat_flash_layout();
+    boot_validator_t validator;
     boot_config_t config;
 
     (void)arg;
@@ -1099,10 +1376,15 @@ static void flash_task(void *arg)
     s_flash_stats.flash = (dev != NULL);
     s_flash_stats.boot_init_status = BOOT_E_ARG;
 
-    if (update_boot_config(plat_flash_layout(), dev, &config)) {
+    /* lib/image's validation for the slot writer (bootimg.h), for the images of this target. */
+    if (bootimg_init(&s_validator, layout->image_target, &validator) &&
+        update_boot_config(layout, dev, &validator, &config)) {
         s_flash_stats.boot_init_status = boot_init(&s_boot, &config);
         s_flash_stats.boot_ready = (s_flash_stats.boot_init_status == BOOT_OK);
     }
+
+    (void)flash_jobs_init(&s_jobs, s_flash_stats.boot_ready ? &s_boot : NULL,
+                          s_have_handoff ? &s_handoff : NULL);
 
     /* With a hand-off the metadata say what the bootloader decided: read them once. */
     if (s_flash_stats.boot_ready && s_have_handoff) {
@@ -1110,15 +1392,308 @@ static void flash_task(void *arg)
     }
 
     for (;;) {
-        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        uint32_t bits = 0U;
 
-        const boot_status_t status = confirm_trial();
+        if (xTaskNotifyWait(0U, UINT32_MAX, &bits, pdMS_TO_TICKS(APP_FLASH_IDLE_WAIT_MS)) !=
+            pdTRUE) {
+            s_flash_stats.idle_passes++;
+        }
 
-        taskENTER_CRITICAL();
-        s_confirm_result = status;
-        s_confirm_reported = true;
-        taskEXIT_CRITICAL();
+        alive(SUPERVISED_FLASH);
+
+        /* A job is looked for on every pass, not only on its bit: the bit and the job are set in
+         * two steps by the diagnostic task. */
+        run_posted_job();
+
+        if ((bits & FLASH_NOTIFY_CONFIRM) != 0U) {
+            const boot_status_t status = confirm_trial();
+
+            taskENTER_CRITICAL();
+            s_confirm_result = status;
+            s_confirm_reported = true;
+            taskEXIT_CRITICAL();
+        }
     }
+}
+
+/* -------------------------------------------------------------------- the diagnostic task */
+
+/* The time the connection works with: microseconds of plat_time_ns(). */
+static uint64_t now_us(void)
+{
+    return plat_time_ns() / 1000U;
+}
+
+/* Receive task context: a UDS_Request frame into the diagnostic task's queue, never waiting. */
+static void on_uds_request(const can_frame_t *frame, uint64_t eof_ns)
+{
+    (void)eof_ns;
+
+    if (xQueueSend(s_diag_rx_queue, frame, 0U) == pdTRUE) {
+        const uint32_t held = (uint32_t)uxQueueMessagesWaiting(s_diag_rx_queue);
+
+        if (held > s_diag_rx_high_water) {
+            s_diag_rx_high_water = held;
+        }
+
+        (void)xTaskNotify(s_diag_task, DIAG_NOTIFY_EVENT, eSetBits);
+    } else {
+        s_diag_rx_lost++;
+    }
+}
+
+/* Transmit task context: the report of a UDS_Response frame sent, never waiting. */
+static void on_uds_response_sent(uint64_t stamp_ns)
+{
+    if (xQueueSend(s_diag_tx_done_queue, &stamp_ns, 0U) == pdTRUE) {
+        (void)xTaskNotify(s_diag_task, DIAG_NOTIFY_EVENT, eSetBits);
+    } else {
+        s_diag_tx_done_lost++;
+    }
+}
+
+/* The connection's port (diag_port_t): its frames are event frames of the transmit queue. */
+static bool diag_send(void *ctx, const can_frame_t *frame, uint64_t *stamp_ns)
+{
+    (void)ctx;
+    return can_io_send_event_stamped(frame, stamp_ns);
+}
+
+/* The backend's side of the node (diag_node_t), all in the diagnostic task's context. */
+
+static bool node_post_job(void *ctx, const flash_job_t *job)
+{
+    bool taken;
+
+    (void)ctx;
+    taskENTER_CRITICAL();
+    taken = (s_job_state == JOB_IDLE);
+
+    if (taken) {
+        s_job = *job;
+        s_job_state = JOB_POSTED;
+    }
+
+    taskEXIT_CRITICAL();
+
+    if (taken) {
+        (void)xTaskNotify(s_flash_task, FLASH_NOTIFY_JOB, eSetBits);
+    }
+
+    return taken;
+}
+
+static bool node_job_done(void *ctx, flash_job_result_t *result)
+{
+    bool done;
+
+    (void)ctx;
+    taskENTER_CRITICAL();
+    done = (s_job_state == JOB_DONE);
+
+    if (done) {
+        *result = s_job_result;
+        s_job_state = JOB_IDLE;
+    }
+
+    taskEXIT_CRITICAL();
+
+    return done;
+}
+
+static void node_boot_info(void *ctx, uds_boot_info_t *info)
+{
+    update_confirm_state_t state;
+    bool confirmed;
+
+    (void)ctx;
+    taskENTER_CRITICAL();
+    state = s_confirm_state_published;
+    confirmed = s_trial_confirmed;
+    taskEXIT_CRITICAL();
+
+    (void)memset(info, 0, sizeof(*info));
+    info->handoff = s_have_handoff;
+    info->slot = s_handoff.slot;
+    info->mode = (uint8_t)s_handoff.mode;
+    info->attempt = s_handoff.attempt;
+    info->event = (uint8_t)s_handoff.event;
+    info->event_slot = s_handoff.event_slot;
+    info->image_version = s_handoff.image_version;
+    /* The flash task knows of a confirm before the health task's next period does. */
+    info->confirm_state = (uint8_t)(confirmed ? UPDATE_CONFIRM_CONFIRMED : state);
+}
+
+static const dtc_state_t *node_dtc_snapshot(void *ctx)
+{
+    (void)ctx;
+    taskENTER_CRITICAL();
+    s_diag_dtc = s_dtc_published;
+    taskEXIT_CRITICAL();
+
+    return &s_diag_dtc;
+}
+
+static uint32_t node_clear_post(void *ctx)
+{
+    uint32_t number;
+
+    (void)ctx;
+    taskENTER_CRITICAL();
+    s_uds_clear_requests++;
+    number = s_clear_requests + s_uds_clear_requests;
+    taskEXIT_CRITICAL();
+
+    return number;
+}
+
+static bool node_clear_done(void *ctx, uint32_t number)
+{
+    uint32_t carried_out;
+
+    (void)ctx;
+    taskENTER_CRITICAL();
+    carried_out = s_clears_carried_out;
+    taskEXIT_CRITICAL();
+
+    /* Counts that only grow, modulo 2^32: carried out up to `number` or beyond it. */
+    return (carried_out - number) < 0x80000000U;
+}
+
+/* Ticks the task may wait for an event: until the connection's next deadline, rounded up to a
+ * whole tick, but at least one and at most APP_DIAG_IDLE_WAIT_MS (a deadline that has passed is
+ * handled in the pass anyway). */
+static TickType_t diag_wait_ticks(void)
+{
+    const uint64_t deadline_us = diag_next_deadline(&s_diag);
+    const uint64_t now = now_us();
+    uint64_t wait_ms = APP_DIAG_IDLE_WAIT_MS;
+
+    if (deadline_us != UINT64_MAX) {
+        const uint64_t until_ms = (deadline_us > now) ? (((deadline_us - now) + 999U) / 1000U) : 1U;
+
+        if (until_ms < wait_ms) {
+            wait_ms = (until_ms == 0U) ? 1U : until_ms;
+        }
+    }
+
+    return pdMS_TO_TICKS((TickType_t)wait_ms);
+}
+
+/* An ECUReset that is due: after the log line, the reset (diag.h, ECURESET). */
+static void reset_if_due(void)
+{
+    if (diag_reset_due(&s_diag)) {
+        LOG_WRN(TAG, "ECUReset: resetting (requested by the tester)");
+        plat_reset(PLAT_RESET_REQUESTED);
+    }
+}
+
+/* The events of one pass: the reports first, then the frames, while the tick's budget of
+ * APP_DIAG_EVENTS_PER_TICK lasts. Returns true if events are left when the budget is used up. */
+static bool take_events(TickType_t *budget_tick, uint32_t *taken)
+{
+    bool left = false;
+    bool more = true;
+
+    while (more) {
+        const TickType_t tick = xTaskGetTickCount();
+        uint64_t stamp_ns = 0U;
+        can_frame_t frame;
+
+        if (tick != *budget_tick) {
+            *budget_tick = tick;
+            *taken = 0U;
+        }
+
+        if (*taken >= APP_DIAG_EVENTS_PER_TICK) {
+            left = (uxQueueMessagesWaiting(s_diag_tx_done_queue) != 0U) ||
+                   (uxQueueMessagesWaiting(s_diag_rx_queue) != 0U);
+            more = false;
+        } else if (xQueueReceive(s_diag_tx_done_queue, &stamp_ns, 0U) == pdTRUE) {
+            diag_on_tx_done(&s_diag, stamp_ns, now_us());
+            (*taken)++;
+            s_diag_events++;
+        } else if (xQueueReceive(s_diag_rx_queue, &frame, 0U) == pdTRUE) {
+            diag_on_frame(&s_diag, &frame, now_us());
+            (*taken)++;
+            s_diag_events++;
+        } else {
+            more = false;
+        }
+
+        reset_if_due();
+    }
+
+    return left;
+}
+
+/*
+ * The diagnostic task (THE DIAGNOSTIC TASK): waits for an event or the connection's deadline,
+ * takes the events, polls the connection. With events left over at the end of the tick's budget
+ * it waits for the next tick instead, without a notification, and goes on.
+ */
+static void diag_task(void *arg)
+{
+    TickType_t budget_tick;
+    uint32_t taken = 0U;
+    bool left = false;
+
+    (void)arg;
+    plat_task_enter("diag");
+    budget_tick = xTaskGetTickCount();
+
+    for (;;) {
+        uint32_t bits = 0U;
+
+        if (left) {
+            s_diag_budget_waits++;
+            vTaskDelay(1U);
+        } else {
+            (void)xTaskNotifyWait(0U, UINT32_MAX, &bits, diag_wait_ticks());
+        }
+
+        alive(SUPERVISED_DIAG);
+        s_diag_passes++;
+        left = take_events(&budget_tick, &taken);
+        diag_poll(&s_diag, now_us());
+        reset_if_due();
+    }
+}
+
+/* Before the scheduler: the connection, its backend, its queues and the task. */
+static bool diag_start(void)
+{
+    static const diag_node_t node = {.ctx = NULL,
+                                     .post_job = node_post_job,
+                                     .job_done = node_job_done,
+                                     .boot_info = node_boot_info,
+                                     .dtc_snapshot = node_dtc_snapshot,
+                                     .clear_post = node_clear_post,
+                                     .clear_done = node_clear_done};
+    static const diag_port_t port = {.ctx = NULL, .send = diag_send};
+    uds_backend_t backend;
+    bool ok;
+
+    s_dtc_published = s_faults.dtc;
+    s_confirm_state_published = s_update.state;
+    ok = diag_backend_init(&s_diag_backend, &node, &backend) && diag_init(&s_diag, &port, &backend);
+
+    s_diag_rx_queue =
+        xQueueCreateStatic(APP_DIAG_RX_QUEUE_LENGTH, sizeof(can_frame_t),
+                           (uint8_t *)s_diag_rx_queue_storage, &s_diag_rx_queue_state);
+    s_diag_tx_done_queue =
+        xQueueCreateStatic(APP_DIAG_TX_DONE_QUEUE_LENGTH, sizeof(uint64_t),
+                           (uint8_t *)s_diag_tx_done_queue_storage, &s_diag_tx_done_queue_state);
+    s_diag_task = xTaskCreateStatic(diag_task, "diag", APP_TASK_STACK_WORDS, NULL,
+                                    APP_DIAG_PRIORITY, s_diag_stack, &s_diag_tcb);
+
+    const bool registered = can_io_on_frame(CAN_DB_UDS_REQUEST_ID, false, on_uds_request);
+
+    can_io_on_tx_done(CAN_DB_UDS_RESPONSE_ID, on_uds_response_sent);
+
+    return ok && registered && (s_diag_rx_queue != NULL) && (s_diag_tx_done_queue != NULL) &&
+           (s_diag_task != NULL);
 }
 
 /* ------------------------------------------------------------------------------ health */
@@ -1291,16 +1866,29 @@ static void capture_app(node_stats_t *out)
     out->pack = s_pack;
     (void)xSemaphoreGive(s_pack_mutex);
 
-    /* The health task's own state: no lock. The flash task's statistics: it is below this task,
-     * which runs above every other now, so it is not in the middle of an update of them. */
+    /* The health task's own state: no lock. The flash task's statistics: it writes them in
+     * critical sections, or, for its own counters, it is below this task. The diagnostic task's:
+     * it is above this task, so it is blocked now between two of its calls, not in one. */
     out->faults = s_faults;
     capture_supervision(&out->supervision);
     out->update.have_handoff = s_have_handoff;
     out->update.handoff = s_handoff;
     out->update.monitor = s_update;
-    out->update.flash_task = s_flash_stats;
+
+    out->diag.core = *diag_stats(&s_diag);
+    out->diag.isotp = *diag_isotp_stats(&s_diag);
+    diag_uds_stats(&s_diag, &out->diag.uds);
+    out->diag.backend = s_diag_backend.stats;
+    out->diag.session = diag_session(&s_diag);
+    out->diag.events = s_diag_events;
+    out->diag.passes = s_diag_passes;
+    out->diag.budget_waits = s_diag_budget_waits;
 
     taskENTER_CRITICAL();
+    out->update.flash_task = s_flash_stats;
+    out->diag.rx_lost = s_diag_rx_lost;
+    out->diag.rx_high_water = s_diag_rx_high_water;
+    out->diag.tx_done_lost = s_diag_tx_done_lost;
     out->sensor = s_sensor;
     out->process = s_process;
     out->command = s_command;
@@ -1326,19 +1914,30 @@ static void capture_app(node_stats_t *out)
     taskEXIT_CRITICAL();
 }
 
+/* The priority stop_node() takes: the highest, which no task has (FreeRTOSConfig.h). */
+#define STOP_PRIORITY ((uint32_t)configMAX_PRIORITIES - 1U)
+_Static_assert((CAN_IO_RX_PRIORITY < STOP_PRIORITY) && (CAN_IO_TX_PRIORITY < STOP_PRIORITY) &&
+                   (APP_SENSOR_PRIORITY < STOP_PRIORITY) &&
+                   (APP_PROCESS_PRIORITY < STOP_PRIORITY) && (APP_DIAG_PRIORITY < STOP_PRIORITY) &&
+                   (APP_HEALTH_PRIORITY < STOP_PRIORITY) && (APP_FLASH_PRIORITY < STOP_PRIORITY),
+               "the stop priority is above every task's");
+
 /*
  * End the run: take the final statistics and end the scheduler. Only the host build ever gets
  * here; firmware on a microcontroller does not stop.
  *
  * The task table is read first, while this task still has its own priority. Then the task
- * raises itself above every other, so that nothing runs between reading the counters and the
- * end of the scheduler: what the report says a task did is then all it did, and the counters
- * of the layers below can be checked against it frame for frame.
+ * raises itself above every other (STOP_PRIORITY), so that nothing runs between reading the
+ * counters and the end of the scheduler: what the report says a task did is then all it did,
+ * and the counters of the layers below can be checked against it frame for frame. "Above" has
+ * to be strictly above: at the priority of another task, time slicing runs that task at the
+ * next tick (a receive task that takes frames after its counter was read leaves them out of
+ * every count).
  */
 static void stop_node(void)
 {
     node_stats_capture_tasks(&s_final_stats);
-    vTaskPrioritySet(NULL, (UBaseType_t)configMAX_PRIORITIES - 1U);
+    vTaskPrioritySet(NULL, (UBaseType_t)configMAX_PRIORITIES - 1U); /* STOP_PRIORITY */
     node_stats_capture_can(&s_final_stats);
     capture_app(&s_final_stats);
     LOG_INF(TAG, "stopping after %lu ticks", (unsigned long)xTaskGetTickCount());
@@ -1476,6 +2075,10 @@ void app_start(const app_config_t *config)
     (void)can_io_on_frame(CAN_DB_TESTER_COMMAND_ID, false, on_command);
     can_io_on_rx_cycle(COMMAND_CYCLE_MS, on_command_cycle);
     can_io_on_alive(can_rx_alive, can_tx_alive);
+
+    const bool diag_ok = diag_start();
+
+    configASSERT(diag_ok);
 
     (void)xTaskCreateStatic(sensor_task, "sensor", APP_TASK_STACK_WORDS, NULL, APP_SENSOR_PRIORITY,
                             s_sensor_stack, &s_sensor_tcb);

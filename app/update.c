@@ -104,6 +104,15 @@ void update_confirm_done(update_monitor_t *m, boot_status_t status)
     }
 }
 
+void update_routine_confirmed(update_monitor_t *m)
+{
+    if ((m->state == UPDATE_CONFIRM_WAITING) || (m->state == UPDATE_CONFIRM_CONFIRMING)) {
+        m->state = UPDATE_CONFIRM_CONFIRMED;
+        m->confirm_status = BOOT_OK;
+        m->by_routine = true;
+    }
+}
+
 uint32_t update_healthy_seconds(const update_monitor_t *m, uint32_t periods_per_second)
 {
     const uint32_t per_second = (periods_per_second == 0U) ? 1U : periods_per_second;
@@ -168,13 +177,18 @@ const char *update_event_name(plat_boot_event_t event)
 }
 
 bool update_boot_config(const plat_flash_layout_t *layout, const flash_dev_t *dev,
-                        boot_config_t *out)
+                        const boot_validator_t *validator, boot_config_t *out)
 {
     const bool ok = (layout != NULL) && (dev != NULL) && (out != NULL);
 
     if (ok) {
         (void)memset(out, 0, sizeof(*out));
         out->dev = dev;
+
+        if (validator != NULL) {
+            out->validator = *validator;
+        }
+
         out->meta_addr = layout->meta.offset;
         out->meta_sectors = layout->meta.size / layout->geometry.sector_size;
 

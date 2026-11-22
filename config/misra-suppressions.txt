@@ -28,6 +28,13 @@ misra-c2012-11.5:*/lib/flash/nor.c
 // callbacks convert it back to the bootimg_t that bootimg_init() stored there.
 misra-c2012-11.5:*/lib/bootimg/bootimg.c
 
+// Advisory rule 11.5 in the node's diagnostic connection and its UDS backend only: lib/isotp's
+// callbacks (isotp_callbacks_t) and lib/uds's backend (uds_backend_t) pass the implementation its
+// own context as a void pointer, and the callbacks convert it back to the diag_t or the
+// diag_backend_t that diag_init() and diag_backend_init() stored there.
+misra-c2012-11.5:*/app/diag.c
+misra-c2012-11.5:*/app/diag_backend.c
+
 // Required rule 17.1 and rule 21.6 in the logging front end only: a printf-style log call
 // needs <stdarg.h> and vsnprintf. No other file may use them.
 misra-c2012-17.1:*/lib/log/log.c

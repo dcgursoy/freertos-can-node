@@ -60,10 +60,11 @@
  * period (app.c, WHO SENDS WHAT); BMS_TaskStats, BMS_NodeInfo and BMS_BootInfo come on top, and
  * with telemetry on BMS_PackStatus every 10 ms, BMS_CellVoltages1/2 every 20 ms and
  * BMS_Temperatures every 100 ms. The health task's periods are released 100 ms apart and it
- * reads the count within its job, whose response time is under 20 ms (19.9 ms in the
- * response-time analysis of the task table, docs/architecture.md), so two reads are at least
- * 80 ms apart. In between, at least seven heartbeats and the BMS_Fault of the period before
- * have been published, and each is acknowledged a few milliseconds after its publication: the
+ * reads the count within its job, whose response time is under 45 ms (44.9 ms in the
+ * response-time analysis of the task table since phase 5's diagnostic task, 19.9 ms before it,
+ * docs/architecture.md), so two reads are at least 55 ms apart. In between, at least five
+ * heartbeats and the BMS_Fault of the period before have been published, and each is
+ * acknowledged a few milliseconds after its publication: the
  * transmit task's response time (under 1 ms) and the frames ahead of it, also under a flood of
  * other nodes' frames of lower priority, since the node's periodic frames win the arbitration
  * at the next frame boundary. No tester is needed: any other node on the bus acknowledges (on
@@ -73,10 +74,19 @@
  * system tests treat as a timing tolerance. (The fewest a system test counted in one period:
  * 11 with the telemetry off, 30 with it on; docs/update.md.)
  *
+ * THE CONFIRM ROUTINE (phase 5). A tester confirms the trial with UDS RoutineControl 0xF000
+ * (app/diag_backend.h), in the extended session; a positive response to it also shows that the
+ * trial receives, which the window above cannot. The routine and the window's confirm both run
+ * in the flash task, one after the other, and the first that comes writes the CONFIRM record
+ * (app/flash_job.h, THE CONFIRM): after the window's, the routine is refused with
+ * conditionsNotCorrect (lib/boot finds no trial); after the routine's, the window's confirm,
+ * should it come, writes nothing and changes nothing here, since update_routine_confirmed() has
+ * made the state CONFIRMED already.
+ *
  * CONTEXT. No operating system and no locks: an update_monitor_t belongs to the health task
- * (the node: app.c), which alone calls update_health_period() and update_confirm_done(); the
- * result it passes to the latter comes from the flash task through the health task's own
- * copy. update_init() runs before the scheduler starts.
+ * (the node: app.c), which alone calls update_health_period(), update_confirm_done() and
+ * update_routine_confirmed(); what it passes to them comes from the flash task through the
+ * health task's own copy. update_init() runs before the scheduler starts.
  */
 #ifndef FCN_UPDATE_H
 #define FCN_UPDATE_H
@@ -137,6 +147,9 @@ typedef struct {
     /** the fewest frames acknowledged in one healthy period of the window so far; 0 before its
      *  first */
     uint64_t fewest_acked;
+    /** the trial was confirmed by the tester's confirm routine (update_routine_confirmed()),
+     *  not by its own window */
+    bool by_routine;
 } update_monitor_t;
 
 /**
@@ -160,6 +173,14 @@ bool update_health_period(update_monitor_t *m, const update_health_t *health);
  *  other status. Ignored unless the state is CONFIRMING. The owner. */
 void update_confirm_done(update_monitor_t *m, boot_status_t status);
 
+/**
+ * The tester's confirm routine (UDS RoutineControl 0xF000, app/diag_backend.h) confirmed the
+ * trial: CONFIRMED with BOOT_OK, `by_routine` set, from WAITING or CONFIRMING; the window stops
+ * counting, and a confirm it asked for that comes back later changes nothing (THE CONFIRM OF A
+ * TRIAL: the first one wins). Ignored in every other state. The owner.
+ */
+void update_routine_confirmed(update_monitor_t *m);
+
 /** The whole seconds of good health counted towards the confirm (0 without a trial; all of
  *  them, UPDATE_CONFIRM_AFTER_S, once the confirm was asked for). Any context, a copy of `m`. */
 uint32_t update_healthy_seconds(const update_monitor_t *m, uint32_t periods_per_second);
@@ -176,11 +197,12 @@ const char *update_event_name(plat_boot_event_t event);
 
 /**
  * lib/boot's configuration for the node: `dev` (plat_flash_device()), the metadata area and the
- * slots of `layout` (plat_flash_layout()), and no validator: the node of phase 4 only confirms
- * (boot.h). Fills `out` completely. Returns false, filling nothing, for a NULL pointer. Any
- * context.
+ * slots of `layout` (plat_flash_layout()), and `validator` (copied), which the slot writer of a
+ * download needs (boot.h; the node of phase 5 passes lib/bootimg's), or none for a NULL
+ * `validator` (a node that only confirms). Fills `out` completely. Returns false, filling
+ * nothing, for a NULL `layout`, `dev` or `out`. Any context.
  */
 bool update_boot_config(const plat_flash_layout_t *layout, const flash_dev_t *dev,
-                        boot_config_t *out);
+                        const boot_validator_t *validator, boot_config_t *out);
 
 #endif /* FCN_UPDATE_H */

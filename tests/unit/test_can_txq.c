@@ -4409,10 +4409,61 @@ static void test_a_caller_that_sleeps_until_the_deadline_misses_nothing_with_8_m
     run_twins(0x5EED08U, 8U, 0U);
 }
 
+/* can_txq_events_held(): the event frames in the FIFO and the one in a mailbox, through every
+ * way in and out (enqueue, hand-out, sent, aborted, expired, dropped), with cyclic frames around
+ * that must not count. */
+static void test_events_held_counts_the_fifo_and_the_event_frame_in_a_mailbox(void)
+{
+    can_frame_t frame;
+    uint32_t first = 0U;
+    uint32_t second = 0U;
+    uint32_t cyclic = 0U;
+
+    start(3U, 1000U);
+    TEST_ASSERT_EQUAL_UINT32(0U, can_txq_events_held(&s_queue));
+    TEST_ASSERT_TRUE(publish(0U, 0x010U, 1U, ms(0)));
+    TEST_ASSERT_EQUAL_UINT32(0U, can_txq_events_held(&s_queue));
+    TEST_ASSERT_TRUE(enqueue(0x7E8U, 2U, ms(0)));
+    TEST_ASSERT_TRUE(enqueue(0x7E8U, 3U, ms(0)));
+    TEST_ASSERT_EQUAL_UINT32(2U, can_txq_events_held(&s_queue));
+
+    /* The cyclic frame and the first event frame go into mailboxes; the second event waits. */
+    TEST_ASSERT_TRUE(next(ms(1), &frame, &cyclic));
+    TEST_ASSERT_EQUAL_HEX32(0x010U, frame.id);
+    TEST_ASSERT_TRUE(next(ms(1), &frame, &first));
+    TEST_ASSERT_EQUAL_UINT32(2U, tag_of(&frame));
+    TEST_ASSERT_FALSE(next(ms(1), &frame, &second));
+    TEST_ASSERT_EQUAL_UINT32(2U, can_txq_events_held(&s_queue));
+    TEST_ASSERT_TRUE(done(cyclic));
+    TEST_ASSERT_EQUAL_UINT32(2U, can_txq_events_held(&s_queue));
+
+    /* Sent: one left. Aborted: back in the FIFO, still held. */
+    TEST_ASSERT_TRUE(done(first));
+    TEST_ASSERT_EQUAL_UINT32(1U, can_txq_events_held(&s_queue));
+    TEST_ASSERT_TRUE(next(ms(2), &frame, &second));
+    TEST_ASSERT_EQUAL_UINT32(1U, can_txq_events_held(&s_queue));
+    TEST_ASSERT_TRUE(aborted(second));
+    TEST_ASSERT_EQUAL_UINT32(1U, can_txq_events_held(&s_queue));
+
+    /* Expired at its timeout: nothing held any more. */
+    (void)poll(ms(1000));
+    TEST_ASSERT_EQUAL_UINT32(0U, can_txq_events_held(&s_queue));
+    EXPECT_COUNTS(3U, 2U, 0U, 0U, 1U, 0U);
+
+    /* A frame the full FIFO refuses is not held. */
+    for (uint32_t i = 0U; i < CAN_TXQ_EVENT_DEPTH; i++) {
+        TEST_ASSERT_TRUE(enqueue(0x7E8U, i, ms(1001)));
+    }
+
+    TEST_ASSERT_FALSE(enqueue(0x7E8U, 99U, ms(1001)));
+    TEST_ASSERT_EQUAL_UINT32(CAN_TXQ_EVENT_DEPTH, can_txq_events_held(&s_queue));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
 
+    RUN_TEST(test_events_held_counts_the_fifo_and_the_event_frame_in_a_mailbox);
     RUN_TEST(test_a_new_queue_is_empty_and_on_the_bus);
     RUN_TEST(test_init_clamps_the_number_of_mailboxes_to_1_through_8);
     RUN_TEST(test_init_raises_a_maximum_holdoff_that_is_below_the_initial_one);

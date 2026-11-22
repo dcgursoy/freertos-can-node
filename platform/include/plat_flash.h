@@ -22,8 +22,10 @@
  *     slot A    0x002000    0x100000    2 - 257     1 MiB
  *     slot B    0x102000    0x100000    258 - 513   1 MiB
  *
- * A slot of 1 MiB holds an image of the release and of the debug build of the node, unstripped,
+ * A slot of 1 MiB holds an image of the release and of the debug build of the node, stripped,
  * after the 256-byte image header (tests/system/test_flash_file.py checks the release build).
+ * Since phase 5 the unstripped release build, its debug information included, is larger; an
+ * image never carries symbols.
  * The AddressSanitizer build is larger than a slot and is never an image; docs/update.md has
  * the sizes. The device is a file the node maps (`--flash-file`); docs/update.md has the rest.
  *
@@ -55,6 +57,10 @@ typedef struct {
     flash_geometry_t geometry;                /**< of the whole device */
     plat_flash_area_t meta;                   /**< the boot control metadata */
     plat_flash_area_t slot[PLAT_FLASH_SLOTS]; /**< the image slots, A and B */
+    /** The target the images in the slots are built for, lib/image's IMAGE_TARGET_*: the node's
+     *  slot writer accepts a downloaded image only for it (lib/bootimg), as the bootloader starts
+     *  only such images. The host: IMAGE_TARGET_HOST. */
+    uint32_t image_target;
 } plat_flash_layout_t;
 
 /** The layout of this platform's flash; valid whether or not this run has a flash device.

@@ -146,7 +146,13 @@ sampling, acknowledgement by this node, or the detection of errors: it is told t
 happened. Arbitration is decided between whole frames, not bit by bit. A frame from the
 transport carries no sender, so frames from other participants keep the order the transport
 delivers them in, and only the oldest of them competes with the node: a high-priority frame
-of another node that waits behind a low-priority one waits for it. CAN FD is not supported.
+of another node that waits behind a low-priority one waits for it. So when other nodes together
+offer more than the bus can carry, the model's queue of their frames (64 frames, the wire queue
+of [can_ctrl.h](../lib/can/can_ctrl.h)) overflows and drops frames whatever their priority
+(`can.controller.wire_overruns`): a tester's UDS_Request frames (0x7E0) are lost with those of a
+flood of lower priority, where on a real bus they would win the arbitration. Phase 5's flood test
+therefore stays at 0.4 of the bus's capacity ([diagnostics.md](diagnostics.md)). CAN FD is not
+supported.
 
 ## Simulation control
 

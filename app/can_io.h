@@ -35,9 +35,11 @@
 #include "can/can_frame.h"
 #include "can/can_txq.h"
 
-/** Priorities of the two tasks (the application's priority table is in app_tasks.h). */
-#define CAN_IO_RX_PRIORITY 6U
-#define CAN_IO_TX_PRIORITY 3U
+/** Priorities of the two tasks (the application's priority table is in app_tasks.h). Phase 5
+ *  moved both up by one, so that the diagnostic task fits between the transmit task and the
+ *  health task (app_tasks.h). */
+#define CAN_IO_RX_PRIORITY 7U
+#define CAN_IO_TX_PRIORITY 4U
 
 /** Most frames the receive task handles before it lets other work run for one tick. One batch
  *  per tick has to keep up with a full bus at PLAT_CAN_MAX_BITRATE (can_io.c checks this at
@@ -73,6 +75,17 @@ typedef void (*can_io_cycle_handler_t)(void);
  */
 typedef void (*can_io_alive_handler_t)(void);
 
+/**
+ * Called in the transmit task for every event frame with the identifier it was registered for
+ * (can_io_on_tx_done) that the controller reports sent, in the order of the reports: the
+ * transmit queue keeps event frames in a FIFO and one of them in a mailbox at a time
+ * (can_txq.h), so that is the order they were queued in. `stamp_ns` is the time the frame was
+ * queued with, as can_io_send_event_stamped() returned it. Event frames the queue discards
+ * (expired, dropped) are never reported. Keep it short and non-blocking: it runs in the
+ * transmit task's pass.
+ */
+typedef void (*can_io_tx_done_handler_t)(uint64_t stamp_ns);
+
 typedef struct {
     uint32_t rx_frames;      /**< frames taken from the controller */
     uint32_t rx_unhandled;   /**< of those, frames no handler was registered for */
@@ -85,6 +98,11 @@ typedef struct {
     /** state events of the controller into error passive (the bus-off events are counted by
      *  the transmit queue, can_txq_stats_t.bus_off_count) */
     uint32_t error_passive_entries;
+    /** reports handed to the transmit-done handler (can_io_on_tx_done) */
+    uint32_t tx_done_reports;
+    /** event frames can_io_send_event_stamped() queued behind another event frame, without
+     *  waking the transmit task (see there) */
+    uint32_t tx_quiet_enqueues;
 } can_io_stats_t;
 
 /** Create the two tasks and connect the interrupt. Call once, before the scheduler starts. */
@@ -121,6 +139,31 @@ bool can_io_publish(uint8_t slot, const can_frame_t *frame, uint64_t stamp_ns);
 
 /** Queue an event frame (see can_txq_enqueue). Any task. Returns false if it was refused. */
 bool can_io_send_event(const can_frame_t *frame);
+
+/**
+ * Queue an event frame as can_io_send_event() does, and give the time it was queued with in
+ * `*stamp_ns` (the clock of plat_time_ns()): the transmit-done handler gets it back
+ * (can_io_on_tx_done), so that the caller can tell which of its frames a report is for. Returns
+ * false if the frame was refused (`*stamp_ns` is then left alone).
+ *
+ * The transmit task is woken only if the queue holds no other event frame once this one is in
+ * (can_txq_events_held() read in the critical section of the enqueue, after the frames that had
+ * expired were discarded). Otherwise an event frame is ahead of this one,
+ * in a mailbox or waiting for one, and the report of that frame or of the cyclic frames in the
+ * mailboxes wakes the transmit task, which then loads this one: so a producer that sends a burst
+ * of frames costs the transmit task one pass for the burst, not one per frame (task_table.c,
+ * can_tx). Counted in tx_quiet_enqueues. Any task.
+ */
+bool can_io_send_event_stamped(const can_frame_t *frame, uint64_t *stamp_ns);
+
+/**
+ * Have `handler` called for every event frame with this identifier that the controller reports
+ * sent (can_io_tx_done_handler_t). The transmit queue's report carries the identifier but not the
+ * format, so the node must send no event frame of the other format with the same number (it
+ * sends base-format frames only). One handler; a second call replaces it. Call before the
+ * scheduler starts.
+ */
+void can_io_on_tx_done(uint32_t id, can_io_tx_done_handler_t handler);
 
 /** Copies of the counters. Any task. */
 void can_io_get_stats(can_io_stats_t *io, can_txq_stats_t *queue);

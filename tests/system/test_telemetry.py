@@ -83,9 +83,9 @@ SAMPLE_CHAIN = (HEARTBEAT, PACK_STATUS, *CELLS, TEMPERATURES)
 EVERY = {"current": 1, "cells": CYCLE_MS[CELLS[0]] // SENSOR_PERIOD_MS,
          "temps": CYCLE_MS[TEMPERATURES] // SENSOR_PERIOD_MS}
 #: The tasks BMS_TaskStats goes round, by TaskIndex (app/app.c, s_stats_tasks).
-STATS_TASKS = ("can_rx", "sensor", "process", "can_tx", "health", "flash", "IDLE")
+STATS_TASKS = ("can_rx", "sensor", "process", "can_tx", "health", "flash", "IDLE", "diag")
 #: Tasks without a period of their own, which never count an overrun.
-UNPERIODIC = ("can_rx", "can_tx", "flash", "IDLE")
+UNPERIODIC = ("can_rx", "can_tx", "flash", "IDLE", "diag")
 
 COUNTER_MODULUS = e2e.COUNTER_MODULUS
 

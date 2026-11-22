@@ -403,7 +403,76 @@ static void test_the_window_follows_the_periods_per_second(void)
     TEST_ASSERT_EQUAL_UINT32(1U, run(&good, 1U));
 }
 
-/* lib/boot's configuration is the layout's areas, the device given and no validator. */
+/* The tester's confirm routine confirms the trial from WAITING and CONFIRMING; a confirm of the
+ * window that comes back later, and every other state, change nothing: the first one wins. */
+static void test_the_confirm_routine_confirms_a_waiting_or_confirming_trial(void)
+{
+    const update_health_t good = healthy();
+    const plat_boot_handoff_t trial = handoff(PLAT_BOOT_TRIAL, 1U, PLAT_BOOT_EVENT_NONE);
+    const plat_boot_handoff_t confirmed = handoff(PLAT_BOOT_CONFIRMED, 0U, PLAT_BOOT_EVENT_NONE);
+
+    /* WAITING: confirmed at once, and the window asks for nothing any more. */
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_EQUAL_UINT32(0U, run(&good, 3U));
+    update_routine_confirmed(&s_monitor);
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_CONFIRMED, s_monitor.state);
+    TEST_ASSERT_EQUAL(BOOT_OK, s_monitor.confirm_status);
+    TEST_ASSERT_TRUE(s_monitor.by_routine);
+    TEST_ASSERT_EQUAL_UINT32(0U, run(&good, 2U * WINDOW));
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_CONFIRMED, s_monitor.state);
+
+    /* CONFIRMING: the window asked, the routine came first; the window's late answer (the flash
+     * task found the trial confirmed: BOOT_OK, or a failure) changes nothing. */
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_EQUAL_UINT32(1U, run(&good, WINDOW));
+    update_routine_confirmed(&s_monitor);
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_CONFIRMED, s_monitor.state);
+    update_confirm_done(&s_monitor, BOOT_E_STATE);
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_CONFIRMED, s_monitor.state);
+    TEST_ASSERT_EQUAL(BOOT_OK, s_monitor.confirm_status);
+    TEST_ASSERT_TRUE(s_monitor.by_routine);
+
+    /* Confirmed by its window first: the routine changes nothing (and lib/boot refuses it). */
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_EQUAL_UINT32(1U, run(&good, WINDOW));
+    update_confirm_done(&s_monitor, BOOT_OK);
+    update_routine_confirmed(&s_monitor);
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_CONFIRMED, s_monitor.state);
+    TEST_ASSERT_FALSE(s_monitor.by_routine);
+
+    /* FAILED, and no trial at all: unchanged. */
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &trial, PER_SECOND));
+    TEST_ASSERT_EQUAL_UINT32(1U, run(&good, WINDOW));
+    update_confirm_done(&s_monitor, BOOT_E_FLASH);
+    update_routine_confirmed(&s_monitor);
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_FAILED, s_monitor.state);
+    TEST_ASSERT_FALSE(s_monitor.by_routine);
+    TEST_ASSERT_TRUE(update_init(&s_monitor, &confirmed, PER_SECOND));
+    update_routine_confirmed(&s_monitor);
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_NOT_NEEDED, s_monitor.state);
+    TEST_ASSERT_TRUE(update_init(&s_monitor, NULL, PER_SECOND));
+    update_routine_confirmed(&s_monitor);
+    TEST_ASSERT_EQUAL(UPDATE_CONFIRM_NOT_NEEDED, s_monitor.state);
+    TEST_ASSERT_FALSE(s_monitor.by_routine);
+}
+
+static void dummy_start(void *ctx, const flash_dev_t *dev, uint32_t addr, uint32_t len)
+{
+    (void)ctx;
+    (void)dev;
+    (void)addr;
+    (void)len;
+}
+
+static boot_check_t dummy_step(void *ctx, boot_image_info_t *info)
+{
+    (void)ctx;
+    (void)info;
+    return BOOT_CHECK_INVALID;
+}
+
+/* lib/boot's configuration is the layout's areas, the device given and the validator given, or
+ * none. */
 static void test_the_boot_configuration_is_the_platform_layout(void)
 {
     const plat_flash_layout_t layout = {
@@ -411,10 +480,18 @@ static void test_the_boot_configuration_is_the_platform_layout(void)
         .meta = {.offset = 0U, .size = 0x2000U},
         .slot = {{.offset = 0x2000U, .size = 0x100000U}, {.offset = 0x102000U, .size = 0x100000U}}};
     const flash_dev_t dev = {.geometry = layout.geometry};
+    static int s_marker;
+    const boot_validator_t validator = {.ctx = &s_marker, .start = dummy_start, .step = dummy_step};
     boot_config_t config;
 
     (void)memset(&config, 0x5A, sizeof(config));
-    TEST_ASSERT_TRUE(update_boot_config(&layout, &dev, &config));
+    TEST_ASSERT_TRUE(update_boot_config(&layout, &dev, &validator, &config));
+    TEST_ASSERT_EQUAL_PTR(&s_marker, config.validator.ctx);
+    TEST_ASSERT_TRUE(config.validator.start == dummy_start);
+    TEST_ASSERT_TRUE(config.validator.step == dummy_step);
+
+    (void)memset(&config, 0x5A, sizeof(config));
+    TEST_ASSERT_TRUE(update_boot_config(&layout, &dev, NULL, &config));
     TEST_ASSERT_EQUAL_PTR(&dev, config.dev);
     TEST_ASSERT_EQUAL_UINT32(0U, config.meta_addr);
     TEST_ASSERT_EQUAL_UINT32(2U, config.meta_sectors);
@@ -426,9 +503,9 @@ static void test_the_boot_configuration_is_the_platform_layout(void)
     TEST_ASSERT_NULL(config.validator.step);
     TEST_ASSERT_NULL(config.validator.ctx);
 
-    TEST_ASSERT_FALSE(update_boot_config(&layout, NULL, &config));
-    TEST_ASSERT_FALSE(update_boot_config(NULL, &dev, &config));
-    TEST_ASSERT_FALSE(update_boot_config(&layout, &dev, NULL));
+    TEST_ASSERT_FALSE(update_boot_config(&layout, NULL, &validator, &config));
+    TEST_ASSERT_FALSE(update_boot_config(NULL, &dev, &validator, &config));
+    TEST_ASSERT_FALSE(update_boot_config(&layout, &dev, &validator, NULL));
 }
 
 int main(void)
@@ -444,6 +521,7 @@ int main(void)
     RUN_TEST(test_a_trial_that_nobody_acknowledges_never_confirms_itself);
     RUN_TEST(test_restarts_count_the_windows_that_were_cut_short);
     RUN_TEST(test_the_result_of_the_confirm_decides_its_state);
+    RUN_TEST(test_the_confirm_routine_confirms_a_waiting_or_confirming_trial);
     RUN_TEST(test_which_events_are_a_rollback);
     RUN_TEST(test_the_names_are_those_of_the_dbc);
     RUN_TEST(test_the_window_follows_the_periods_per_second);

@@ -35,10 +35,15 @@ row below has findings behind it today.
 | 11.5 | advisory | `lib/ring/spsc_ring.c` | The ring stores elements of a caller-chosen type and, like `memcpy`, takes storage and elements as `void` pointers. They are converted only to `uint8_t *` for copying bytes. |
 | 11.5 | advisory | `lib/flash/nor.c` | The flash device interface (`lib/flash/flash.h`) hands every implementation its own state as a `void *ctx`, so that the update code is written against one interface whatever part stands behind it. The NOR model's three adapters (`dev_read`, `dev_program`, `dev_erase`) convert it back to the `nor_t` that `nor_device()` put there; there is no other conversion in the module. |
 | 11.5 | advisory | `lib/bootimg/bootimg.c` | lib/boot's validator interface (`boot_validator_t` in `lib/boot/boot.h`) hands the implementation its own state as a `void *ctx`, so that lib/boot does not depend on lib/image. The two callbacks (`validator_start`, `validator_step`) convert it back to the `bootimg_t` that `bootimg_init()` put there; there is no other conversion in the module. |
+| 11.5 | advisory | `app/diag.c` | lib/isotp's callbacks (`isotp_callbacks_t` in `lib/isotp/isotp.h`) hand the caller its own state as a `void *context`, so that the transport does not depend on its user. The three callbacks of the node's diagnostic connection (`on_send_frame`, `on_indication`, `on_confirm`) convert it back to the `diag_t` that `diag_init()` put there; there is no other conversion in the module. |
+| 11.5 | advisory | `app/diag_backend.c` | lib/uds's backend (`uds_backend_t` in `lib/uds/uds.h`) hands the implementation its own state as a `void *ctx`, so that the server does not depend on the node. The node's backend converts it back to the `diag_backend_t` that `diag_backend_init()` put there, in one function (`backend_of()`); there is no other conversion in the module. |
 | 17.1, 21.6 | required | `lib/log/log.c` | A printf-style log call needs `<stdarg.h>` and `vsnprintf`. The logging front end is the only file allowed to use them; it formats into a fixed buffer on the caller's stack and never allocates. |
 
 Functions in `lib/` and `app/` have a single point of exit (advisory rule 15.5 is followed, not
 deviated from).
 
 A local exception that applies to a single line is written next to that line as a
-`cppcheck-suppress` comment with its reason. There are none in `lib/` or `app/` today.
+`cppcheck-suppress` comment with its reason. There are none for a MISRA rule in `lib/` or
+`app/` today. `lib/uds/uds.c` has one for cppcheck's own style check `constParameterPointer`,
+which is not a MISRA rule: the TesterPresent handler only reads the server, but has the
+signature of every handler of the service table, so its server pointer cannot be const.

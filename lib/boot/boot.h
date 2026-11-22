@@ -159,14 +159,16 @@
  * slot writer one step per call over the bytes it has written.
  *
  * THE SLOT WRITER (boot_writer_t) writes a new image into the slot that is not CONFIRMED, in the
- * calls phase 5's UDS download makes: boot_writer_begin() (RequestDownload: the slot named by
- * its address, which must be o, and the image size; writes the BEGIN record before the first
- * erase), boot_writer_erase_step() until BOOT_OK (one sector per call, responsePending in
- * between), boot_writer_write() for every TransferData block (any length, consecutive offsets;
- * whole pages are programmed, a partial page waits in the writer), and boot_writer_finish_step()
- * until BOOT_OK (RequestTransferExit: the last partial page, then the validation one step per
- * call, then the COMMIT record). Only the sectors the image needs are erased, and each of them
- * always, even if it reads erased.
+ * calls phase 5's UDS download makes (app/flash_job.h): boot_writer_begin() (the eraseMemory
+ * routine, which names the slot by its start address, boot_slot_by_address(), and the image
+ * size; the slot must be the one that is not CONFIRMED, o in THE STATE MACHINE; writes the BEGIN
+ * record before the first erase), boot_writer_erase_step() until BOOT_OK (one sector per call,
+ * responsePending in between), boot_writer_write() for every TransferData block (any length,
+ * consecutive offsets; whole pages are programmed, a partial page waits in the writer), and
+ * boot_writer_finish_step() until BOOT_OK (its first call at RequestTransferExit: the last
+ * partial page and the start of the validation; the others in the checkProgrammingDependencies
+ * routine: the validation one step per call, then the COMMIT record). Only the sectors the image
+ * needs are erased, and each of them always, even if it reads erased.
  *
  * WHAT A CALLER HAS TO KNOW. The functions keep no data of their own and allocate nothing. One
  * boot_t per device, and all calls on it (and on the writers that use it) from one task, or

@@ -42,8 +42,8 @@ against the DBC by `tests/python/test_gen_can_db.py`, so they cannot drift from 
 | 0x611 | BMS_BootInfo | BMS | 8 | 1000 ms | none | how the bootloader started the image (confirmed or trial, attempt, the state change it made), the image's version, the confirm of a trial |
 | 0x6F0 | TESTER_Ping | TESTER | 8 | event | none | any payload of 0 to 8 bytes, no signals |
 | 0x6F1 | BMS_Pong | BMS | 8 | event | none | the payload of the ping, no signals |
-| 0x7E0 | UDS_Request | TESTER | 8 | event | none | ISO 15765-2 frames (phase 5), no signals |
-| 0x7E8 | UDS_Response | BMS | 8 | event | none | ISO 15765-2 frames (phase 5), no signals |
+| 0x7E0 | UDS_Request | TESTER | 8 | event | none | ISO 15765-2 frames of the tester's UDS requests, no signals ([below](#diagnostics-uds_request-and-uds_response)) |
+| 0x7E8 | UDS_Response | BMS | 8 | event | none | ISO 15765-2 frames of the node's UDS responses, no signals |
 
 The DBC gives ping and pong a DLC of 8, the most they carry; the frames themselves may be
 shorter. `TESTER_Command` is sent cyclically although it carries commands, so that the node can
@@ -225,6 +225,28 @@ frames, app/app_tasks.h). Everything but ConfirmState and ConfirmSeconds comes f
 bootloader's hand-off at the start (platform/include/plat_retained.h) and stays as it is for the
 run. Bits 7, 13 to 15 and 56 to 63 are unused. Not protected end to end, like the other
 diagnostic messages of the node. [app/update.h](../app/update.h) describes the confirm.
+
+## Diagnostics: UDS_Request and UDS_Response
+
+Since phase 5 the two identifiers at the end of the table carry one ISO-TP connection (ISO
+15765-2: normal addressing, physical only, classical CAN, every frame 8 bytes): the tester's UDS
+requests on 0x7E0, the node's responses on 0x7E8. The DBC has no signals for them: what a frame
+carries is the transport's N_PCI and a piece of a message, which [diagnostics.md](diagnostics.md)
+describes with the services. On the wire:
+
+- every frame the node sends has DLC 8, its unused bytes 0xCC; the node accepts a tester's frame
+  whose DLC covers what its first byte says, padded or not;
+- the node's flow control is `30 10 00 CC CC CC CC CC` (ContinueToSend, a block of 16 consecutive
+  frames, no separation time), after a first frame and after every 16th consecutive frame; it
+  answers a first frame of more than 1026 bytes with `32 00 00 CC CC CC CC CC` (overflow);
+- a responsePending is `03 7F <SID> 78 CC CC CC CC`.
+
+Both are event messages: the node's frames go through the event FIFO of the transmit queue, never
+replaced, and are confirmed to the transport in the order of their transmit-done reports. Their
+identifiers are the highest on the bus, the lowest priority, so a download yields the bus to
+every periodic frame; the node does not listen to functional requests (0x7DF): it handles 0x7E0
+alone. A TransferData of 1024 bytes of data is 147 frames of the tester's and 11 of the node's:
+10 flow controls and the response.
 
 ## End-to-end protection
 

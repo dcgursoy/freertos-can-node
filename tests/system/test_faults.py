@@ -1553,7 +1553,8 @@ def test_a_fault_reaches_bms_fault_within_its_debounce_time_and_one_health_perio
 #: reference cycle and the correct count from the lowest to the highest, the reference cycle
 #: (one health period) and the failed tolerance; and the expired tolerance.
 SUPERVISION = [("can_rx", 2, 1, 65535, 1, 2), ("sensor", 10, 1, 20, 1, 2),
-               ("process", 10, 1, 20, 1, 2), ("can_tx", 2, 1, 65535, 1, 2)]
+               ("process", 10, 1, 21, 1, 2), ("can_tx", 2, 1, 65535, 1, 2),
+               ("diag", 2, 1, 65535, 1, 2), ("flash", 2, 1, 65535, 6, 1)]
 EXPIRED_TOLERANCE = 0
 
 
@@ -1577,9 +1578,9 @@ def test_a_run_without_faults_supervises_every_task_and_kicks_in_every_period(st
                    e["expected_alive"] + e["max_margin"], e["reference_cycle"],
                    e["failed_tolerance"]) for e in manager["entities"]]
     assert configured == SUPERVISION
-    for entity, (_, _, lower, upper, _, _) in zip(manager["entities"], SUPERVISION):
+    for entity, (_, _, lower, upper, reference_cycle, _) in zip(manager["entities"], SUPERVISION):
         assert entity["status"] == "OK" and entity["incorrect"] == 0, entity
-        assert entity["examinations"] == 20, entity
+        assert entity["examinations"] == 20 // reference_cycle, entity
         assert lower <= entity["min_count"] <= entity["max_count"] <= upper, entity
     hw = stats["hw_watchdog"]
     assert hw["started"] is True and hw["timeout_ms"] == 500

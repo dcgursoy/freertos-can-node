@@ -691,6 +691,11 @@ const can_txq_stats_t *can_txq_stats(const can_txq_t *queue)
     return &queue->stats;
 }
 
+uint32_t can_txq_events_held(const can_txq_t *queue)
+{
+    return queue->event_count + (queue->event_in_mailbox ? 1U : 0U);
+}
+
 const can_txq_slot_stats_t *can_txq_slot_stats(const can_txq_t *queue, uint8_t slot)
 {
     const can_txq_slot_stats_t *counts = NULL;

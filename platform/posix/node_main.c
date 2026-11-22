@@ -56,6 +56,7 @@ typedef struct {
     const char *flash_path;    /* NULL: no flash, plat_flash_device() is NULL */
     bool flash_cut_given;      /* --flash-cut: flash_cut is armed for this run */
     posix_flash_cut_t flash_cut;
+    uint32_t flash_hang; /* --flash-hang: the program or erase that hangs; 0: none */
     const char *can_spec;
     const char *can_fault; /* --can-fault: the bus fault in force from the start; NULL: none */
     uint32_t bitrate;
@@ -90,6 +91,8 @@ static void print_usage(const char *program)
                  "  --flash-cut N[:SEED]   cut the supply in the N-th flash program or erase of\n"
                  "                         this run (1 to %u), torn as SEED (0 to 4294967295,\n"
                  "                         default 0) says; the run ends as a power loss (12)\n"
+                 "  --flash-hang N         make the N-th flash program or erase of this run hang\n"
+                 "                         (1 to %u): its busy flag never clears\n"
                  "  --tick-mode MODE       locked (default) or stock\n"
                  "  --irq-mode MODE        signal (default) or poll\n"
                  "  --log-file PATH        write the log to PATH instead of stderr\n"
@@ -102,7 +105,8 @@ static void print_usage(const char *program)
                  "(platform/include/platform.h)\n",
                  program, (unsigned int)CAN_UDP_DEFAULT_PORT, (unsigned int)DEFAULT_BITRATE,
                  (unsigned int)POSIX_SENSOR_DEFAULT_SEED, (unsigned int)POSIX_FLASH_CUT_MAX,
-                 POSIX_EXIT_CAN_TRANSPORT_LOST, POSIX_EXIT_SHUTDOWN_TIMEOUT);
+                 (unsigned int)POSIX_FLASH_CUT_MAX, POSIX_EXIT_CAN_TRANSPORT_LOST,
+                 POSIX_EXIT_SHUTDOWN_TIMEOUT);
 }
 
 static bool parse_log_level(const char *text, log_level_t *out)
@@ -162,6 +166,7 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         OPT_RETAINED,
         OPT_FLASH,
         OPT_FLASH_CUT,
+        OPT_FLASH_HANG,
         OPT_VERSION,
         OPT_HELP
     };
@@ -180,6 +185,7 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         {"retained-file", required_argument, NULL, OPT_RETAINED},
         {"flash-file", required_argument, NULL, OPT_FLASH},
         {"flash-cut", required_argument, NULL, OPT_FLASH_CUT},
+        {"flash-hang", required_argument, NULL, OPT_FLASH_HANG},
         {"version", no_argument, NULL, OPT_VERSION},
         {"help", no_argument, NULL, OPT_HELP},
         {NULL, 0, NULL, 0}};
@@ -284,6 +290,15 @@ static int parse_options(int argc, char **argv, node_options_t *options)
             }
             break;
         }
+        case OPT_FLASH_HANG:
+            if (parse_number(optarg, POSIX_FLASH_CUT_MAX, &number) && (number != 0UL)) {
+                options->flash_hang = (uint32_t)number;
+            } else {
+                (void)fprintf(stderr, "invalid --flash-hang: %s (1 to %u)\n", optarg,
+                              (unsigned int)POSIX_FLASH_CUT_MAX);
+                result = 2;
+            }
+            break;
         case OPT_VERSION:
             (void)printf("fcn_node %s (FreeRTOS %s)\n", FCN_VERSION, tskKERNEL_VERSION_NUMBER);
             result = 1;
@@ -408,6 +423,8 @@ static void write_can_stats(FILE *file, const node_stats_t *stats)
     put_u64(file, "rx_cycles", stats->can_io.rx_cycles, ", ");
     put_u64(file, "rx_cycles_skipped", stats->can_io.rx_cycles_skipped, ", ");
     put_u64(file, "error_passive_entries", stats->can_io.error_passive_entries, ", ");
+    put_u64(file, "tx_done_reports", stats->can_io.tx_done_reports, ", ");
+    put_u64(file, "tx_quiet_enqueues", stats->can_io.tx_quiet_enqueues, ", ");
     put_u64(file, "rx_fifo_overruns", host.rx_fifo_overruns, ", ");
     put_u64(file, "event_fifo_overruns", host.event_fifo_overruns, ", ");
     put_u64(file, "state_events_merged", host.state_events_merged, ", ");
@@ -729,7 +746,184 @@ static void write_update_stats(FILE *file, const node_stats_t *stats)
 
     put_u64(file, "confirms", f->confirms, ", ");
     (void)fprintf(file, "\"confirm_status\": \"%s\", ", boot_status_name(f->confirm_status));
-    put_u64(file, "confirm_ns", f->confirm_ns, "}},\n");
+    put_u64(file, "confirm_ns", f->confirm_ns, ", ");
+    put_bool(file, "confirmed_by_routine", f->confirmed_by_routine, ", ");
+    put_u64(file, "self_skipped", f->self_skipped, ", ");
+    put_u64(file, "idle_passes", f->idle_passes, ",\n      \"jobs\": {");
+
+    /* Phase 5: the flash jobs of the diagnostic task, by kind (app/flash_job.h). */
+    for (uint32_t kind = 1U; kind < (uint32_t)FLASH_JOB_KINDS; kind++) {
+        (void)fprintf(file, "%s\"%s\": {", (kind == 1U) ? "" : ", ",
+                      flash_job_kind_name((flash_job_kind_t)kind));
+        put_u64(file, "run", f->jobs[kind], ", ");
+        (void)fprintf(file, "\"last_status\": \"%s\", ", boot_status_name(f->job_status[kind]));
+        put_u64(file, "last_steps", f->job_steps[kind], ", ");
+        put_u64(file, "last_ns", f->job_last_ns[kind], ", ");
+        put_u64(file, "max_ns", f->job_max_ns[kind], "}");
+    }
+
+    (void)fprintf(file, "}}},\n");
+}
+
+/* One object of counters indexed by an enumeration, keyed by the names `name` gives. */
+static void put_named_counts(FILE *file, const char *key, const uint32_t *counts, uint32_t n,
+                             const char *(*name)(uint32_t), const char *separator)
+{
+    (void)fprintf(file, "\"%s\": {", key);
+
+    for (uint32_t i = 0U; i < n; i++) {
+        (void)fprintf(file, "%s\"%s\": %lu", (i == 0U) ? "" : ", ", name(i),
+                      (unsigned long)counts[i]);
+    }
+
+    (void)fprintf(file, "}%s", separator);
+}
+
+static const char *result_name_of(uint32_t i)
+{
+    return isotp_result_name((isotp_result_t)i);
+}
+
+static const char *frame_kind_name_of(uint32_t i)
+{
+    return isotp_frame_kind_name((isotp_frame_kind_t)i);
+}
+
+static const char *ignored_name_of(uint32_t i)
+{
+    return isotp_ignored_name((isotp_ignored_t)i);
+}
+
+static const char *service_name_of(uint32_t i)
+{
+    return uds_service_name(uds_service_sid(i));
+}
+
+static const char *nrc_name_of(uint32_t i)
+{
+    return uds_nrc_name(uds_nrc_code(i));
+}
+
+/*
+ * "diag" (phase 5): the diagnostic connection (app/diag.h) with its parameters, lib/isotp's and
+ * lib/uds's counters, the UDS backend's (app/diag_backend.h), and the diagnostic task's and its
+ * queues' (app/app.c, THE DIAGNOSTIC TASK). Every name is a fixed word, which needs no escaping.
+ */
+static void write_diag_stats(FILE *file, const node_stats_t *stats)
+{
+    const node_diag_stats_t *d = &stats->diag;
+    const diag_stats_t *c = &d->core;
+    const isotp_stats_t *t = &d->isotp;
+    const uds_stats_t *u = &d->uds;
+    const uds_download_stats_t *dl = &u->download;
+    const diag_backend_stats_t *b = &d->backend;
+
+    (void)fprintf(file, "  \"diag\": {\"session\": \"%s\",\n    \"task\": {",
+                  uds_session_name(d->session));
+    put_u64(file, "events", d->events, ", ");
+    put_u64(file, "passes", d->passes, ", ");
+    put_u64(file, "budget_waits", d->budget_waits, ", ");
+    put_u64(file, "events_per_tick", APP_DIAG_EVENTS_PER_TICK, ", ");
+    put_u64(file, "rx_queue_length", APP_DIAG_RX_QUEUE_LENGTH, ", ");
+    put_u64(file, "rx_lost", d->rx_lost, ", ");
+    put_u64(file, "rx_high_water", d->rx_high_water, ", ");
+    put_u64(file, "tx_done_queue_length", APP_DIAG_TX_DONE_QUEUE_LENGTH, ", ");
+    put_u64(file, "tx_done_lost", d->tx_done_lost, "},\n    \"connection\": {");
+    put_u64(file, "frames_in", c->frames_in, ", ");
+    put_u64(file, "frames_out", c->frames_out, ", ");
+    put_u64(file, "frames_refused", c->frames_refused, ", ");
+    put_u64(file, "confirms", c->confirms, ", ");
+    put_u64(file, "confirms_passed", c->confirms_passed, ", ");
+    put_u64(file, "confirms_late", c->confirms_late, ", ");
+    put_u64(file, "confirms_unknown", c->confirms_unknown, ", ");
+    put_u64(file, "confirms_forgotten", c->confirms_forgotten, ", ");
+    put_u64(file, "requests", c->requests, ", ");
+    put_u64(file, "responses", c->responses, ", ");
+    put_u64(file, "responses_sent", c->responses_sent, ", ");
+    put_u64(file, "responses_failed", c->responses_failed, ", ");
+    put_u64(file, "responses_dropped", c->responses_dropped, ", ");
+    put_u64(file, "resets", c->resets, "},\n    \"isotp\": {");
+    (void)fprintf(file, "\"parameters\": {");
+    put_u64(file, "tx_id", DIAG_RESPONSE_ID, ", ");
+    put_u64(file, "rx_id", DIAG_REQUEST_ID, ", ");
+    put_u64(file, "bs", DIAG_BLOCK_SIZE, ", ");
+    put_u64(file, "stmin", DIAG_STMIN, ", ");
+    put_u64(file, "rx_buffer", DIAG_RX_BUFFER, ", ");
+    put_u64(file, "timeout_us", DIAG_TIMEOUT_US, ", ");
+    put_u64(file, "n_br_us", 0U, ", ");
+    put_u64(file, "n_cs_us", DIAG_N_CS_US, ", ");
+    put_u64(file, "rx_wft_max", 0U, ", ");
+    put_u64(file, "tx_wft_max", DIAG_TX_WFT_MAX, ", ");
+    put_u64(file, "pipeline", ISOTP_PIPELINE_DEPTH, "},\n      ");
+    put_u64(file, "tx_requests", t->tx_requests, ", ");
+    put_named_counts(file, "tx_results", t->tx_results, ISOTP_RESULTS, result_name_of, ", ");
+    put_u64(file, "ff_indications", t->ff_indications, ",\n      ");
+    put_named_counts(file, "rx_results", t->rx_results, ISOTP_RESULTS, result_name_of, ",\n      ");
+    put_named_counts(file, "frames_out", t->frames_out, ISOTP_FRAME_KINDS, frame_kind_name_of,
+                     ",\n      ");
+    put_named_counts(file, "frames_in", t->frames_in, ISOTP_FRAME_KINDS, frame_kind_name_of,
+                     ",\n      ");
+    put_named_counts(file, "ignored", t->ignored, ISOTP_IGNORED_REASONS, ignored_name_of,
+                     ",\n      ");
+    put_u64(file, "rx_overflow", t->rx_overflow, ", ");
+    put_u64(file, "rx_sf_too_long", t->rx_sf_too_long, ", ");
+    put_u64(file, "rx_sf_busy", t->rx_sf_busy, ", ");
+    put_u64(file, "fc_dropped", t->fc_dropped, ", ");
+    put_u64(file, "stmin_reserved", t->stmin_reserved, ", ");
+    put_u64(file, "send_refused", t->send_refused, ",\n      ");
+    put_u64(file, "confirmed", t->confirmed, ", ");
+    put_u64(file, "confirm_unmatched", t->confirm_unmatched, ", ");
+    put_u64(file, "unconfirmed", t->unconfirmed, ", ");
+    put_u64(file, "proven", t->proven, ", ");
+    put_u64(file, "outstanding", t->outstanding, ", ");
+    put_u64(file, "reentry_refused", t->reentry_refused, ",\n      ");
+    put_u64(file, "n_br_late", t->n_br_late, ", ");
+    put_u64(file, "n_cs_late", t->n_cs_late, ", ");
+    put_u64(file, "n_br_max_us", t->n_br_max_us, ", ");
+    put_u64(file, "n_cs_max_us", t->n_cs_max_us, "},\n    \"uds\": {");
+    put_named_counts(file, "requests", u->requests, UDS_SERVICE_COUNT, service_name_of, ", ");
+    put_u64(file, "requests_unsupported", u->requests_unsupported, ", ");
+    put_u64(file, "requests_empty", u->requests_empty, ",\n      ");
+    put_named_counts(file, "nrc", u->nrc, UDS_NRC_KINDS, nrc_name_of, ",\n      ");
+    put_u64(file, "response_pending", u->response_pending, ", ");
+    put_u64(file, "positive", u->positive, ", ");
+    put_u64(file, "suppressed", u->suppressed, ", ");
+    put_u64(file, "session_changes", u->session_changes, ", ");
+    put_u64(file, "s3_timeouts", u->s3_timeouts, ", ");
+    put_u64(file, "resets", u->resets, ", ");
+    put_u64(file, "pending_max_us", u->pending_max_us, ",\n      \"download\": {");
+    (void)fprintf(file, "\"state\": \"%s\", ", uds_dl_state_name(dl->state));
+    put_u64(file, "address", dl->address, ", ");
+    put_u64(file, "size", dl->size, ", ");
+    put_u64(file, "received", dl->received, ", ");
+    put_u64(file, "blocks", dl->blocks, ", ");
+    put_u64(file, "repeated_blocks", dl->repeated_blocks, ", ");
+    put_u64(file, "counter", dl->counter, ", ");
+    put_u64(file, "erases", dl->erases, ", ");
+    put_u64(file, "started", dl->started, ", ");
+    put_u64(file, "exited", dl->exited, ", ");
+    put_u64(file, "committed", dl->committed, ", ");
+    put_u64(file, "aborted", dl->aborted, ", ");
+    put_u64(file, "failed", dl->failed, ", ");
+    put_u64(file, "erase_us", dl->erase_us, ", ");
+    put_u64(file, "transfer_us", dl->transfer_us, ", ");
+    put_u64(file, "check_us", dl->check_us, "}},\n    \"backend\": {");
+    put_u64(file, "post_refused", b->post_refused, ", ");
+    put_u64(file, "snapshots", b->snapshots, ", ");
+    put_u64(file, "clears", b->clears, ", ");
+    put_u64(file, "clears_done", b->clears_done, ", ");
+    put_u64(file, "resets", b->resets, ",\n      \"jobs\": {");
+
+    for (uint32_t kind = 1U; kind < (uint32_t)FLASH_JOB_KINDS; kind++) {
+        (void)fprintf(file, "%s\"%s\": {", (kind == 1U) ? "" : ", ",
+                      flash_job_kind_name((flash_job_kind_t)kind));
+        put_u64(file, "posted", b->jobs[kind], ", ");
+        put_u64(file, "failed", b->jobs_failed[kind], ", ");
+        put_u64(file, "last_steps", b->last_steps[kind], ", ");
+        (void)fprintf(file, "\"last_status\": \"%s\"}", boot_status_name(b->last_status[kind]));
+    }
+
+    (void)fprintf(file, "}}},\n");
 }
 
 /* "command": the receiver of TESTER_Command (app/command.h). */
@@ -928,6 +1122,7 @@ static bool write_stats(const char *path, const node_options_t *options, uint64_
     write_platform_reset_stats(file);
     write_flash_stats(file, options);
     write_update_stats(file, stats);
+    write_diag_stats(file, stats);
     write_can_stats(file, stats);
     (void)fprintf(file, "  \"run_time_total_us\": %llu,\n",
                   (unsigned long long)stats->total_run_time_us);
@@ -1048,6 +1243,11 @@ static bool check_configuration(const node_options_t *options, char *error, size
         return false;
     }
 
+    if ((options->flash_hang != 0U) && (options->flash_path == NULL)) {
+        (void)snprintf(error, error_len, "--flash-hang needs a flash (--flash-file)");
+        return false;
+    }
+
     return output_path_usable(options->platform.log_path, "--log-file", error, error_len) &&
            output_path_usable(options->stats_path, "--stats-json", error, error_len);
 }
@@ -1141,6 +1341,8 @@ int main(int argc, char **argv)
         posix_flash_arm_cut(&options.flash_cut);
     }
 
+    posix_flash_arm_hang(options.flash_hang);
+
     posix_platform_init(&options.platform);
     LOG_INF("main", "fcn_node %s starting (FreeRTOS %s)", FCN_VERSION, tskKERNEL_VERSION_NUMBER);
 
@@ -1167,6 +1369,11 @@ int main(int argc, char **argv)
         } else {
             LOG_INF("main", "flash %s, no power cut: %s",
                     flash.created ? "created erased" : "opened", options.flash_path);
+        }
+
+        if (options.flash_hang != 0U) {
+            LOG_INF("main", "flash program or erase %lu of this run hangs (--flash-hang)",
+                    (unsigned long)options.flash_hang);
         }
     }
 
