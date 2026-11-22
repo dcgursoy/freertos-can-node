@@ -152,15 +152,53 @@ def test_every_received_frame_is_accounted_for_when_the_node_stops_during_traffi
     assert_every_received_frame_is_accounted_for(stats)
 
 
-# PLAT_CAN_RX_FIFO_DEPTH (platform/include/plat_can.h). A full 1 Mbit/s bus fills the FIFO in
-# 512 / 21.3 = 24 ms. The tick code (platform/posix/posix_tick.c) makes up a lag of up to 6
-# ticks one by one and gives up all but one tick of a longer lag, so a stall of 24 ms drops at
-# least 23 ticks by itself.
-RX_FIFO_DEPTH = 512
-STALL_DROPPED_TICKS = int(RX_FIFO_DEPTH / 21.3) - 1
-# The stall the test makes before its window: long enough to leave more than a batch of 16
-# frames waiting (about 200), short enough for a receive path that keeps up to drain them
-# (in about 18 ms at 32 per tick) long before the window begins.
+# The window over which load and losses are measured, the least load it must see (more frames
+# per millisecond than a batch of 16 per tick takes) and the share of the window's frames that
+# a receive path that keeps up may lose.
+WINDOW_S = 2.0
+LEAST_FRAMES_PER_MS = 16.8
+LOSS_LIMIT = 0.01
+# A full 1 Mbit/s bus: the shortest frame, 44 bits and the 3-bit intermission, every 47 us. It
+# fills the receive FIFO (PLAT_CAN_RX_FIFO_DEPTH, platform/include/plat_can.h: 512 frames) in
+# 24 ms.
+FULL_BUS_FRAMES_PER_MS = 21.3
+# CAN_CTRL_WIRE_QUEUE (lib/can/can_ctrl.h): the received frames the controller model holds
+# while they wait for the bus. The model delivers frames no faster than the bus carries them,
+# except these: a hardware thread that the host did not run for a while delivers them at once.
+WIRE_QUEUE = 64
+# A loss above LOSS_LIMIT is more than 336 frames at the least load. Less the WIRE_QUEUE frames
+# that can come at once, the bus needs 12.8 ms to deliver them, so a receive path that keeps up
+# loses that many only if the host held its receive task up for LEAST_STALL_MS or longer
+# inside the window.
+LEAST_STALL_MS = ((LOSS_LIMIT * LEAST_FRAMES_PER_MS * WINDOW_S * 1000 - WIRE_QUEUE)
+                  / FULL_BUS_FRAMES_PER_MS)
+# MAX_CATCH_UP_TICKS (platform/posix/posix_tick.c). While the receive task is held up with
+# frames waiting, the kernel counts at most one tick: ticks and the simulated interrupt are
+# taken on the thread of the running task, and the receive task, which outranks every other,
+# becomes the running task as soon as one of them has been taken. So the tick code's lag grows
+# by a tick per millisecond. It makes up a lag of up to 6 ticks and gives up all but one tick
+# of a longer one, at least 6 at a time: all at once when the tick thread runs again, if the
+# host held that thread up too, or 6 every 6 ms while the hold-up lasts, if it did not (the
+# last ticks of the lag are then made up, not given up). The part of a hold-up inside the
+# window alone takes the lag past 6, so at least one give-up is counted between the window's
+# start and the end of the run, however long before the window the hold-up began. (The run
+# does not end first: the health task ends it, on a tick, and the tick thread checks the lag,
+# and gives up one longer than 6, right after each tick it raises.) A whole-run count would add
+# the ticks given up at start-up and for the test's own stop; and 23, what a 24 ms hold-up
+# gives up when the tick thread is held up too, is no bound for a hold-up that the tick thread
+# ran through (18 or 24 then), nor for the part of one inside the window.
+# All of this is about a hold-up in one piece. A host that holds the task up in many short
+# pieces, running it late at every wake-up, after the next tick but before the one after it,
+# is not covered: the kernel takes the tick that came meanwhile as soon as the task runs, and
+# the task, which was not waiting for that tick, takes its batch and waits for the next one.
+# It gets a batch every other tick while the kernel misses no tick and nothing is given up,
+# and the test calls the losses a failure (docs/bug-log.md, 007, has a host made to do that).
+MAX_CATCH_UP_TICKS = 6
+STALL_DROPPED_TICKS = MAX_CATCH_UP_TICKS
+# The stop the test makes before its window. When the node runs again, the model delivers at
+# once the WIRE_QUEUE frames that waited for the bus (the tester's frames beyond those were
+# wire overruns): more than a batch of 16. A receive path that keeps up drains them in about
+# 6 ms, taking 32 per tick against 21.3 arriving, long before the window begins.
 STOP_S = 0.010
 
 
@@ -176,16 +214,25 @@ def test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_m
 
     What starts that is any delay of the task that leaves a full batch waiting; on a fast host
     the task may otherwise take the frames as they come. So the test makes the delay itself:
-    STOP_S into the load it stops the node (SIGSTOP), as a busy host would, which leaves about
-    200 frames waiting. A receive path that keeps up drains them in about 18 ms; one that takes
-    16 per tick never does while the load lasts. Then load and losses are measured over the same
-    2 s window, 0.2 s later. At the 16.8 frames/ms the window must see at least, a 16-per-tick
-    path loses at least 4.8 % of what the window delivers. A path that keeps up loses nothing in
-    the window unless the host stalls the node for longer than the FIFO lasts (24 ms at full
-    load), and such a stall drops at least STALL_DROPPED_TICKS ticks. Losses above 1 % of the
-    window are therefore a timing miss in a run that dropped that many ticks, and a plain
-    failure in one that did not: then the receive path did not keep up. (The stop and, on a busy
-    host, the start-up drop some ticks too; they count, which only makes the bound stricter.)"""
+    0.3 s into the load it stops the node (SIGSTOP) for STOP_S, as a busy host would, and when
+    the node runs again the model delivers WIRE_QUEUE frames at once. A receive path that keeps
+    up drains them in about 6 ms; one that takes 16 per tick falls behind. Then load and losses
+    are measured over the same window of WINDOW_S, 0.2 s later. At the LEAST_FRAMES_PER_MS the
+    window must see at least, a 16-per-tick path that stays behind for the whole window loses
+    at least 4.8 % of what the window delivers; the test allows LOSS_LIMIT.
+
+    A path that keeps up loses more than that only if the host held its receive task up for
+    LEAST_STALL_MS or longer inside the window. For a hold-up in one piece, the tick code gives
+    up ticks after the window has begun: at least STALL_DROPPED_TICKS, counted by the end of
+    the run (the constants above say why). So the test counts the ticks dropped from the
+    window's start (ticks_dropped in the first can.status) to the end of the run (the
+    statistics), and ends the run (SIGTERM) right after the window. That span takes in a
+    hold-up that overlaps the window's start or its end, and leaves out the start-up and the
+    test's own stop, both before the window. Losses above LOSS_LIMIT are a timing miss in a run
+    that dropped STALL_DROPPED_TICKS or more in that span, and a plain failure in one that
+    dropped fewer: then the receive path did not keep up, or the host ran it late at every
+    wake-up, which costs frames without a dropped tick (the constants above say how)."""
+    # The 4 s only bound a run that the test does not get to end itself.
     node = start_node("--bitrate", "1000000", "--duration-s", "4")
     with node.sim() as sim:
         sim.ping()
@@ -197,12 +244,15 @@ def test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_m
             time.sleep(0.2)
             first = sim.can_status()
             sent_first = flood.sent
-            time.sleep(2.0)
+            time.sleep(WINDOW_S)
             last = sim.can_status()
             sent_last = flood.sent
-            assert node.wait(timeout=20) == EXIT_OK
+            # The orderly end, under the load, right after the window: the span of the dropped
+            # ticks counted below ends soon after the window does.
+            assert node.stop() == EXIT_OK
 
-    stats = can_stats(node)
+    node_stats = node.stats()
+    stats = node_stats["can"]
     assert_every_received_frame_is_accounted_for(stats)
 
     window_ns = last["elapsed_ns"] - first["elapsed_ns"]
@@ -213,19 +263,22 @@ def test_the_receive_path_keeps_up_with_a_full_bus_of_the_shortest_frames_at_1_m
             f"largest wake-up lag of the hardware thread {last['wakeup_lag_max_ns'] / 1e6:.1f} ms")
     # First, the load was real: the model delivered more frames per millisecond than 16 per
     # tick. Without that the run says nothing about the receive path, either way.
-    check_timing(rate >= 16.8, f"too little load to show the bug ({load}): the tester or the "
-                               "host was too slow")
+    check_timing(rate >= LEAST_FRAMES_PER_MS, f"too little load to show the bug ({load}): the "
+                                              "tester or the host was too slow")
     delivered = last["rx"] - first["rx"]
     overruns = last["rx_fifo_overruns"] - first["rx_fifo_overruns"]
-    dropped = node.stats()["tick"]["dropped"]
+    # The statistics are written at the end of the run: from the window's start to then.
+    whole_run = node_stats["tick"]["dropped"]
+    dropped = whole_run - first["ticks_dropped"]
     lost = (f"{overruns} of {delivered} frames delivered in the window lost to receive FIFO "
-            f"overruns ({load}; whole run: rx_batches_cut {stats['driver']['rx_batches_cut']}, "
-            f"ticks dropped {dropped})")
+            f"overruns ({load}; ticks dropped from the window's start to the end of the run "
+            f"{dropped}, in the whole run {whole_run}; rx_batches_cut in the whole run "
+            f"{stats['driver']['rx_batches_cut']})")
     print(lost)  # shown for passing runs too with pytest -rP (the bug-log entry's test.sh)
     if dropped >= STALL_DROPPED_TICKS:
-        check_timing(overruns <= 0.01 * delivered, lost)
+        check_timing(overruns <= LOSS_LIMIT * delivered, lost)
     else:
-        assert overruns <= 0.01 * delivered, lost
+        assert overruns <= LOSS_LIMIT * delivered, lost
 
 
 # ----------------------------------------------------------------------------- host stalls

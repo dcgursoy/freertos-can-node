@@ -131,7 +131,8 @@ class SimControl:
     # ------------------------------------------------------------------ CAN controller model
 
     def can_status(self) -> dict:
-        """State, error counters and statistics of the CAN controller model.
+        """State, error counters and statistics of the CAN controller model, and the ticks the
+        node's tick code has given up so far (`ticks_dropped`, docs/can-simulation.md).
 
         Numeric values are converted to int; `state` (active, passive, busoff) and `fault`
         stay strings.

@@ -169,7 +169,7 @@ answered with `? err malformed request`.
 | Command | Effect |
 |---|---|
 | `ping` | replies with the node's process id |
-| `can.status` | state, error counters, fault, the counters of the model and of the transport (`transport_tx_failed` and `transport_rx_failed` among them), and how late the host carried out the model's times (`pacing_lag_*`, `wakeup_lag_*`, `rx_lag_*`; see [What the host adds to the timing](#what-the-host-adds-to-the-timing)) |
+| `can.status` | state, error counters, fault, the counters of the model and of the transport (`transport_tx_failed` and `transport_rx_failed` among them), how late the host carried out the model's times (`pacing_lag_*`, `wakeup_lag_*`, `rx_lag_*`; see [What the host adds to the timing](#what-the-host-adds-to-the-timing)), and the ticks the tick code has given up so far (`ticks_dropped`) |
 | `can.fault none\|short\|dominant\|noack` | applies or removes a bus fault |
 | `can.inject tx\|rx <count>` | destroys the next `count` transmission attempts or received frames |
 | `sensor.status` | the sensor model's seed, whether its front end is off line, its read counters and every channel's mode (see [sensor-model.md](sensor-model.md)) |
@@ -250,3 +250,12 @@ the time the frame waited for the bus. The wake-up lag shows such a stall, and s
 receive lag of a received frame that was on the bus during it
 (`test_a_host_stall_shows_in_the_wake_up_and_receive_lag` in
 [test_node_errors.py](../tests/system/test_node_errors.py)).
+
+A stall of the node's tasks for more than 6 ticks at a stretch shows in the tick. The tick code
+([posix_tick.c](../platform/posix/posix_tick.c)) makes up a lag of up to 6 ticks and gives up
+all but one tick of a longer one, and `ticks_dropped` in `can.status` is its count of the ticks
+given up so far: the count the node's statistics report at the end as `tick.dropped`. The reply
+has it together with `rx_fifo_overruns`, so a test can count both from the same moment: the
+receive-path test of
+[bug-log entry 007](bug-log.md#007-the-receive-task-took-fewer-frames-per-tick-than-a-full-1-mbits-bus-delivers)
+judges the receive FIFO's losses in its window by the ticks dropped from the window's start on.

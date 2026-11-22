@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The system test that loads the node's bus at 1 Mbit/s with the shortest frames, once with an
-# identifier nobody handles and once with the ping, and counts what the receive FIFO lost. It
-# is marked timing: a host too busy to load the bus, or one that stalls the node's tasks for
-# longer than the FIFO lasts (which shows as dropped ticks), misses a tolerance. As
+# identifier nobody handles and once with the ping, and counts what the receive FIFO lost in
+# its measurement window. It is marked timing: a host too busy to load the bus, or one that
+# holds the receive task up at a stretch for long enough to cost frames in the window (which
+# shows as ticks dropped from the window's start on), misses a tolerance. As
 # scripts/test-system.sh does, a run whose failures were all such misses is repeated once, and
 # if the repetition misses only timing tolerances too, the status is 75: the run neither shows
 # nor rules out the bug (scripts/buglog-verify.sh reports that as inconclusive).

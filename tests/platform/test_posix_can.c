@@ -869,6 +869,7 @@ static void test_the_status_reports_the_transport_and_the_host_lateness_in_full(
     plat_can_event_t event;
     can_frame_t heard;
     posix_can_stats_t stats;
+    posix_tick_stats_t tick;
     const char *reply;
 
     TEST_ASSERT_TRUE(plat_can_tx(&frame, 80U));
@@ -898,6 +899,12 @@ static void test_the_status_reports_the_transport_and_the_host_lateness_in_full(
     TEST_ASSERT_EQUAL_UINT64(stats.rx_lag_max_ns, sim_number(reply, "rx_lag_max_ns"));
     TEST_ASSERT_EQUAL_UINT64(stats.rx_lag_mean_ns, sim_number(reply, "rx_lag_mean_ns"));
     TEST_ASSERT_EQUAL_UINT64(2U, stats.rx_delivered);
+    /* The last key, the ticks the tick code has given up (posix_tick.c). No scheduler runs in
+     * this test, so the count cannot change between the reply and this check (it is 0 here).
+     * A count that is not 0 is checked against the node's statistics by
+     * test_a_stalled_host_is_accounted_as_dropped_ticks in tests/system/test_smoke.py. */
+    posix_tick_get_stats(&tick);
+    TEST_ASSERT_EQUAL_UINT64(tick.dropped_ticks, sim_number(reply, "ticks_dropped"));
     TEST_ASSERT_TRUE(strlen(reply) < POSIX_SIM_MAX_DATAGRAM);
 }
 

@@ -658,9 +658,13 @@ static bool sim_can_handler(const char *verb, const char *args, char *reply, siz
 
     if (strcmp(verb, "status") == 0) {
         const can_ctrl_stats_t *stats = can_ctrl_stats(&s_ctrl);
+        posix_tick_stats_t tick;
         int length;
 
         can_backend_refresh_counters(&s_backend);
+        /* The ticks the tick code has given up so far (posix_tick.c), in the same reply as the
+         * receive overruns, so that a test can count both from the same moment of the run. */
+        posix_tick_get_stats(&tick);
 
         /* New keys go at the end, so that a reader of the old ones is not disturbed. */
         length = snprintf(
@@ -671,7 +675,7 @@ static bool sim_can_handler(const char *verb, const char *args, char *reply, siz
             "transport_malformed=%llu transport_overflow=%llu pacing_lag_max_ns=%llu "
             "pacing_lag_mean_ns=%llu transport_tx_failed=%llu transport_rx_failed=%llu "
             "wakeup_lag_max_ns=%llu wakeup_lag_mean_ns=%llu rx_lag_max_ns=%llu "
-            "rx_lag_mean_ns=%llu",
+            "rx_lag_mean_ns=%llu ticks_dropped=%llu",
             state_name(can_ctrl_state(&s_ctrl)), (unsigned int)can_ctrl_tec(&s_ctrl),
             (unsigned int)can_ctrl_rec(&s_ctrl), fault_name(can_ctrl_fault(&s_ctrl)),
             (unsigned long long)stats->tx_frames, (unsigned long long)stats->tx_attempts_failed,
@@ -689,7 +693,7 @@ static bool sim_can_handler(const char *verb, const char *args, char *reply, siz
             (unsigned long long)atomic_load(&s_wakeup.max_ns),
             (unsigned long long)lag_mean(&s_wakeup),
             (unsigned long long)atomic_load(&s_rx_lag.max_ns),
-            (unsigned long long)lag_mean(&s_rx_lag));
+            (unsigned long long)lag_mean(&s_rx_lag), (unsigned long long)tick.dropped_ticks);
 
         /* A reply cut short would lose the keys at its end without anyone noticing. */
         if ((length < 0) || ((size_t)length >= reply_len)) {

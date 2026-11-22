@@ -12,6 +12,7 @@ import pytest
 
 from fcn_tools.bus import ID_STATUS, open_bus, status_queue_counts, wait_for_id
 from fcn_tools.node import EXIT_OK
+from fcn_tools.simctl import SimError
 from fcn_tools.timing import check_timing
 
 
@@ -139,9 +140,23 @@ def test_a_stalled_host_is_accounted_as_dropped_ticks(start_node, ports):
     # The host does not run the node for 1.5 s: far more ticks than the tick code makes up
     # (MAX_CATCH_UP_TICKS in platform/posix/posix_tick.c, 6), so it gives them up as dropped,
     # all at once when the node runs again.
-    node.send_signal(signal.SIGSTOP)
-    time.sleep(1.5)
-    node.send_signal(signal.SIGCONT)
+    with node.sim() as sim:
+        before = sim.can_status()["ticks_dropped"]
+        node.send_signal(signal.SIGSTOP)
+        time.sleep(1.5)
+        node.send_signal(signal.SIGCONT)
+        # can.status reports them once the tick thread has counted them, when it first runs
+        # after the stall; a reply right after the stall can come before that. The count comes
+        # with the first tick after the stall, long before the node has run its 2 s of ticks.
+        # So only a node that never reports it is still waited for when the run ends and
+        # can.status gets no reply; the assertions below then say what it reported.
+        after = sim.can_status()["ticks_dropped"]
+        try:
+            while after - before < 1490:
+                time.sleep(0.01)
+                after = sim.can_status()["ticks_dropped"]
+        except SimError:
+            pass
     assert node.wait(timeout=30) == EXIT_OK
 
     tick = node.stats()["tick"]
@@ -150,6 +165,10 @@ def test_a_stalled_host_is_accounted_as_dropped_ticks(start_node, ports):
     # The node's time stopped with it: the run still ends after 2 s of ticks.
     assert tick["dropped"] >= 1490, tick
     assert 2000 <= tick["count"] <= 2050, tick
+    # can.status (ticks_dropped) reports the same count while the node runs: it showed the
+    # stall's ticks, and no more than the statistics report at the end.
+    assert after - before >= 1490, (before, after, tick)
+    assert before <= after <= tick["dropped"], (before, after, tick)
 
 
 @pytest.mark.parametrize("stop_signal", [signal.SIGTERM, signal.SIGINT])
