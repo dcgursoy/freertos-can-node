@@ -17,7 +17,10 @@ jobs:
     # Pinned on purpose: ubuntu-latest moves between releases, and the toolchain versions
     # (gcc 13, cppcheck 2.13, clang-tidy 18) are part of what the results depend on.
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The limit stops a run that hangs; it is not a bound on a normal run. The job took 28.7 min
+    # at phase 5, and phase 6's bench tests made each functional system run 1413 tests, about
+    # 10.7 min each on this runner.
+    timeout-minutes: 60
     env:
       FCN_BUILD_ROOT: ${{ github.workspace }}/build
       FCN_VENV: ${{ github.workspace }}/.venv
