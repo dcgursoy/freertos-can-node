@@ -34,6 +34,11 @@
  *   watchdog-cause <timeout_ms> <path>
  *                                   a watchdog reset is recorded in the cell and seen by the
  *                                   next start
+ *                                   In both, every child leaves a keeper of its mapping of the
+ *                                   cell behind (THE KEEPERS below): the next start, which
+ *                                   follows at once, opens the cell only if the run before it
+ *                                   released the cell's lock itself, at its reset (from a task,
+ *                                   and from the watchdog's thread) or at its orderly end
  *   hang <on|spin>                  sensor.hang under the scheduler: with "on" the reading task
  *                                   is blocked and a task below it runs on; with "spin" that
  *                                   task does not run at all until the hang ends
@@ -63,6 +68,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
+#include "map_keeper.h"
 #include "plat_retained.h"
 #include "plat_sensor.h"
 #include "plat_wdg.h"
@@ -324,6 +330,7 @@ static int child_kicker(void *arg)
                  stats.started ? "true" : "false", (unsigned int)stats.timeout_ms,
                  (unsigned long long)stats.kicks, (double)stats.longest_unkicked_ns / 1e6,
                  (unsigned long long)stats.gaps);
+    posix_retained_close();
     return EXIT_SUCCESS;
 }
 
@@ -504,6 +511,14 @@ static int cmd_kick_cost(uint32_t kicks)
 
 /* ------------------------------------------------------------- the cell across resets */
 
+/* THE KEEPERS. While this is set, every child that opens the cell forks a keeper of its
+ * mapping (map_keeper.h) before it starts the platform. The mapping, and with it the cell's
+ * open file description, then outlives the child, as it does when another process holds the
+ * child's memory map at the moment of its end (docs/bug-log.md, 012), and the next step's
+ * child opens the cell at once. A run that left the cell's lock to its exit would make that
+ * child end with 3 ("in use by another node"). */
+static const map_keeper_t *s_keeper;
+
 typedef struct {
     const char *path;
     plat_reset_reason_t expect_cause;
@@ -560,6 +575,12 @@ static int child_start(void *arg)
         return 3;
     }
 
+    if ((s_keeper != NULL) && (map_keeper_fork(s_keeper) < 0)) {
+        (void)fprintf(stderr, "cannot fork the keeper of the cell's mapping\n");
+        posix_retained_close();
+        return 3;
+    }
+
     init_platform();
     create_task(start_task, "start", 3U, arg);
     run_scheduler();
@@ -606,9 +627,16 @@ static bool read_cell(const char *path, plat_retained_cell_t *cell)
 static int cmd_retained(const char *path)
 {
     plat_retained_cell_t cell = {0};
+    map_keeper_t keeper;
     bool ok = true;
 
     (void)unlink(path);
+
+    if (!map_keeper_prepare(&keeper)) {
+        return EXIT_FAILURE;
+    }
+
+    s_keeper = &keeper;
 
     /* A missing cell: power-on; then a requested reset. */
     {
@@ -665,6 +693,8 @@ static int cmd_retained(const char *path)
         ok = run_step(&s, EXIT_SUCCESS, "power-on from a removed file") && ok;
     }
 
+    s_keeper = NULL;
+    ok = map_keeper_end(&keeper) && ok;
     (void)unlink(path);
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
@@ -675,8 +705,15 @@ static int cmd_watchdog_cause(uint32_t timeout_ms, const char *path)
 {
     bool ok = true;
     plat_retained_cell_t cell = {0};
+    map_keeper_t keeper;
 
     (void)unlink(path);
+
+    if (!map_keeper_prepare(&keeper)) {
+        return EXIT_FAILURE;
+    }
+
+    s_keeper = &keeper;
     {
         start_step_t s = {path, PLAT_RESET_POWER_ON, "missing",
                           0U,   PLAT_RESET_POWER_ON, timeout_ms};
@@ -693,6 +730,8 @@ static int cmd_watchdog_cause(uint32_t timeout_ms, const char *path)
         start_step_t s = {path, PLAT_RESET_POWER_ON, "no reset", 0U, PLAT_RESET_POWER_ON, 0U};
         ok = run_step(&s, EXIT_SUCCESS, "then a power-on") && ok;
     }
+    s_keeper = NULL;
+    ok = map_keeper_end(&keeper) && ok;
     (void)unlink(path);
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

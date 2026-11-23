@@ -21,9 +21,17 @@
  * goes only with the last reference: closing the descriptor leaves it held while the mapping
  * exists, and the mapping of a process image that has exec'd or exited exists until the last
  * reference to the old memory map goes, which another process can hold (a read of
- * /proc/<pid>/stat or /proc/<pid>/maps takes one). posix_retained_unlock() releases the lock at
- * once, whatever still refers to the description; while it is released nothing here writes
- * into the cell (s_locked), until posix_retained_relock() has it again.
+ * /proc/<pid>/stat or /proc/<pid>/maps takes one). The next process on the cell, started the
+ * moment this one has exec'd or its exit has been seen, would then find the cell "in use". So
+ * nothing is left to the kernel: posix_retained_unlock() releases the lock at once, whatever
+ * still refers to the description, and it is called at every end of a run that does not close
+ * the cell: directly before the bootloader's exec, and after the reset is recorded and
+ * directly before _exit() in plat_reset() (every reset reason), in the shutdown guard
+ * (posix_lifecycle.c), at a power cut without a kernel (posix_flash.c) and in the test
+ * payloads. posix_retained_close(), the orderly end, releases it the same way after the unmap.
+ * While the lock is released nothing here writes into the cell (s_locked), until
+ * posix_retained_relock() has it again. A process that is killed (SIGKILL, a signal's default
+ * action, a sanitizer's abort) runs none of this: its lock goes with its memory map.
  */
 #include "posix_retained.h"
 
@@ -475,7 +483,11 @@ void posix_retained_close(void)
     if (s_cell != NULL) {
         (void)munmap(s_cell, sizeof(plat_retained_cell_t));
         s_cell = NULL;
-        (void)close(s_fd); /* releases the lock */
+        /* The lock explicitly, and only then the descriptor: the close alone removes the lock
+         * only when nothing else refers to the open file description, and the memory map of a
+         * process forked while the cell was mapped does, for as long as that map exists. */
+        (void)flock(s_fd, LOCK_UN);
+        (void)close(s_fd);
         s_fd = -1;
         s_locked = false;
     }

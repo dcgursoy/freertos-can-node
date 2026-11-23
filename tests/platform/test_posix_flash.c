@@ -2,19 +2,27 @@
 /*
  * The flash of the host build (platform/posix/posix_flash.c) without a kernel: the layout
  * table; the file (created erased, kept across a restart of the process, a file of another size
- * or kind refused and left alone, locked while open, and free for another process once the
- * bootloader's posix_flash_unlock() has released the lock while the file is still open and
- * mapped); the syntax of a cut; the device's rules
+ * or kind refused and left alone, locked while open, and free for another process once
+ * posix_flash_unlock() has given it up while it is still open and mapped, after which nothing
+ * this process stores reaches the file, or once posix_flash_close() has closed it, also while
+ * another process still maps it); the syntax of a cut; the device's rules
  * and counters; the wait function; the simulation commands flash.status and flash.cut with
  * every reply; a cut that ends the process with the status of a power loss (12), leaves exactly
- * the tear that lib/flash's model gives for its seed on a copy, and takes the retained cell
- * with it; and the commands served by another thread while operations run (also run under
- * ThreadSanitizer).
+ * the tear that lib/flash's model gives for its seed on a copy, takes the retained cell
+ * with it, and leaves both files free for the next process while mappings of them outlive the
+ * one that ended; and the commands served by another thread while operations run (also run
+ * under ThreadSanitizer).
  *
  * A test that needs a process to end plays the bench: it forks, the child opens the flash and
  * runs the operations of flash_script.c, and the parent, which has the flash closed, looks at
  * how the child ended and at the file it left. That the waits take the modelled time, and a
  * cut under the FreeRTOS scheduler, are tested by flash_selftest.c.
+ *
+ * A test of a lock that must be free although something still refers to the file's open file
+ * description uses a keeper (map_keeper.h): a process forked while the file was mapped, which
+ * has the mapping too. That is the state a process leaves behind that ended while another
+ * process held its memory map for a moment, as a reader of /proc/<pid>/maps does
+ * (docs/bug-log.md, 012), here for as long as the test wants and so without chance.
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -38,6 +46,7 @@
 #include "flash/flash.h"
 #include "flash/nor.h"
 #include "flash_script.h"
+#include "map_keeper.h"
 #include "plat_flash.h"
 #include "posix_flash.h"
 #include "posix_retained.h"
@@ -303,7 +312,7 @@ static void test_a_missing_file_is_created_erased_and_then_opened_as_it_is(void)
 }
 
 /* A child that opens the flash, runs the script and ends with _exit(0), as a reset ends a run:
- * no close, no flush. */
+ * the lock released (posix_flash_unlock(), as plat_reset() does), no close, no flush. */
 static int run_child_script(void)
 {
     const pid_t pid = fork();
@@ -318,7 +327,11 @@ static int run_child_script(void)
             _exit(2);
         }
 
-        _exit((flash_script_run(plat_flash_device(), NULL) == FLASH_SCRIPT_WRITES) ? 0 : 3);
+        const int result =
+            (flash_script_run(plat_flash_device(), NULL) == FLASH_SCRIPT_WRITES) ? 0 : 3;
+
+        posix_flash_unlock();
+        _exit(result);
     }
 
     TEST_ASSERT_EQUAL_INT(pid, waitpid(pid, &status, 0));
@@ -429,10 +442,11 @@ static void test_the_file_is_locked_while_it_is_open(void)
     open_flash(&FAST);
 }
 
-/* Another process tries to lock the flash file: a child opens it anew (an open file
- * description of its own) and tries flock(LOCK_EX | LOCK_NB). Its exit status: 0 it got the
- * lock (given up when it ends), 1 EWOULDBLOCK (another description holds it), 2 otherwise. */
-static int lock_from_another_process(void)
+/* Another process tries to lock the file `path` (the flash file, or the cell): a child opens it
+ * anew (an open file description of its own) and tries flock(LOCK_EX | LOCK_NB). Its exit
+ * status: 0 it got the lock (given up when it ends: its description has no mapping), 1
+ * EWOULDBLOCK (another description holds it), 2 otherwise. */
+static int lock_from_another_process(const char *path)
 {
     int status = -1;
     const pid_t pid = fork();
@@ -440,7 +454,7 @@ static int lock_from_another_process(void)
     TEST_ASSERT_TRUE(pid >= 0);
 
     if (pid == 0) {
-        const int fd = open(s_path, O_RDWR | O_CLOEXEC);
+        const int fd = open(path, O_RDWR | O_CLOEXEC);
         int found = 2;
 
         if (fd >= 0) {
@@ -469,20 +483,91 @@ static int lock_from_another_process(void)
 static void test_a_lock_released_while_the_file_stays_open_lets_another_process_take_it(void)
 {
     open_flash(&FAST);
-    TEST_ASSERT_EQUAL_INT(1, lock_from_another_process());
+    TEST_ASSERT_EQUAL_INT(1, lock_from_another_process(s_path));
 
     posix_flash_unlock();
     TEST_ASSERT_TRUE(flash_info().open);
     TEST_ASSERT_NOT_NULL(plat_flash_device());
-    TEST_ASSERT_EQUAL_INT(0, lock_from_another_process());
+    TEST_ASSERT_EQUAL_INT(0, lock_from_another_process(s_path));
     posix_flash_unlock();
-    TEST_ASSERT_EQUAL_INT(0, lock_from_another_process());
+    TEST_ASSERT_EQUAL_INT(0, lock_from_another_process(s_path));
     posix_flash_close();
     TEST_ASSERT_FALSE(flash_info().open);
 
     posix_flash_unlock();
     open_flash(&FAST);
-    TEST_ASSERT_EQUAL_INT(1, lock_from_another_process());
+    TEST_ASSERT_EQUAL_INT(1, lock_from_another_process(s_path));
+}
+
+/* The other half of giving the file up (posix_flash.c, THE LOCK AND THE END OF A RUN): once
+ * the lock is released, another process may hold the file, so nothing this process stores may
+ * reach it any more. A reset from the hardware watchdog's thread stops no task before the exit
+ * does, and a task in the middle of an update goes on programming until then: here the test
+ * goes on after the unlock. The device works as before, on this process's own copy; the file
+ * keeps what it held at the unlock, also after the close. */
+static void test_nothing_stored_after_the_file_is_given_up_reaches_the_file(void)
+{
+    uint8_t page[256];
+    uint8_t back[256];
+
+    for (uint32_t i = 0U; i < sizeof(page); i++) {
+        page[i] = (uint8_t)(i * 5U);
+    }
+
+    open_flash(&FAST);
+
+    const flash_dev_t *dev = plat_flash_device();
+
+    TEST_ASSERT_EQUAL_INT(FLASH_OK, dev->program(dev->ctx, 0x003000U, page, sizeof(page)));
+    read_file();
+    (void)memcpy(s_before, s_file, DEVICE_SIZE); /* the file as the unlock finds it */
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(page, &s_before[0x003000U], sizeof(page));
+
+    posix_flash_unlock();
+    TEST_ASSERT_EQUAL_INT(FLASH_OK, dev->read(dev->ctx, 0x003000U, back, sizeof(back)));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(page, back, sizeof(page)); /* still what the file held */
+
+    /* A program of an erased page and an erase of the programmed one, as the model takes them. */
+    TEST_ASSERT_EQUAL_INT(FLASH_OK, dev->program(dev->ctx, 0x104000U, page, sizeof(page)));
+    TEST_ASSERT_EQUAL_INT(FLASH_OK, dev->erase(dev->ctx, 0x003000U));
+    TEST_ASSERT_EQUAL_INT(FLASH_OK, dev->read(dev->ctx, 0x104000U, back, sizeof(back)));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(page, back, sizeof(page));
+    TEST_ASSERT_EQUAL_INT(FLASH_OK, dev->read(dev->ctx, 0x003000U, back, sizeof(back)));
+    TEST_ASSERT_EACH_EQUAL_HEX8(0xFFU, back, sizeof(back));
+
+    /* None of it is in the file, which another process could have locked by now. */
+    read_file();
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(s_before, s_file, DEVICE_SIZE);
+    TEST_ASSERT_EQUAL_INT(0, lock_from_another_process(s_path));
+    posix_flash_close();
+    read_file();
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(s_before, s_file, DEVICE_SIZE);
+}
+
+/* The orderly end: posix_flash_close() releases the lock itself. With a keeper that still maps
+ * the file, the open file description outlives the close, and a lock left to the description's
+ * end would still be held: another process, and this one again, could not open the file. */
+static void test_the_close_frees_the_file_while_another_process_still_maps_it(void)
+{
+    map_keeper_t keeper;
+    int status = -1;
+
+    open_flash(&FAST);
+    TEST_ASSERT_TRUE(map_keeper_prepare(&keeper));
+
+    const pid_t pid = map_keeper_fork(&keeper);
+
+    TEST_ASSERT_TRUE(pid > 0);
+    TEST_ASSERT_EQUAL_INT(1, lock_from_another_process(s_path));
+
+    posix_flash_close();
+    TEST_ASSERT_EQUAL_INT(0, lock_from_another_process(s_path));
+    open_flash(&FAST);
+    TEST_ASSERT_EQUAL_INT(1, lock_from_another_process(s_path));
+    posix_flash_close();
+
+    TEST_ASSERT_TRUE(map_keeper_end(&keeper));
+    TEST_ASSERT_EQUAL_INT(pid, waitpid(pid, &status, 0));
 }
 
 /* ------------------------------------------------------------------------- the cut syntax */
@@ -781,9 +866,11 @@ static void test_a_cut_from_simulation_control_tears_what_the_model_tears(void)
 /* ------------------------------------------------------------------- a cut ends the run */
 
 /* A child that runs the script with a retained cell and the flash, a cut armed as --flash-cut
- * arms it, and the default end of a run by a power cut; its stderr goes to s_stderr. Returns
- * its exit status, or -1 if it did not exit. */
-static int run_child_with_cut(uint32_t cut, uint32_t seed)
+ * arms it, and the default end of a run by a power cut; its stderr goes to s_stderr. With a
+ * `keeper`, the child forks it once both files are mapped, so that mappings of both outlive the
+ * child. A run whose cut does not fire ends as a reset ends one: the locks released, no close.
+ * Returns the child's exit status, or -1 if it did not exit. */
+static int run_child_with_cut(uint32_t cut, uint32_t seed, const map_keeper_t *keeper)
 {
     const pid_t pid = fork();
     int status = -1;
@@ -805,8 +892,18 @@ static int run_child_with_cut(uint32_t cut, uint32_t seed)
             _exit(2);
         }
 
+        if ((keeper != NULL) && (map_keeper_fork(keeper) < 0)) {
+            _exit(5);
+        }
+
         posix_flash_arm_cut(&armed);
-        _exit((flash_script_run(plat_flash_device(), NULL) == FLASH_SCRIPT_WRITES) ? 0 : 3);
+
+        const int result =
+            (flash_script_run(plat_flash_device(), NULL) == FLASH_SCRIPT_WRITES) ? 0 : 3;
+
+        posix_retained_unlock();
+        posix_flash_unlock();
+        _exit(result);
     }
 
     TEST_ASSERT_EQUAL_INT(pid, waitpid(pid, &status, 0));
@@ -841,7 +938,7 @@ static void test_a_cut_ends_the_process_as_a_power_loss_with_the_models_tear(voi
             prepare_before();
             (void)unlink(s_cell);
             TEST_ASSERT_EQUAL_INT_MESSAGE((int)PLAT_RESET_POWER_LOSS,
-                                          run_child_with_cut(cut, seeds[s]),
+                                          run_child_with_cut(cut, seeds[s], NULL),
                                           at("exit status, cut", (long)cut));
 
             /* The FATAL line names the operation. */
@@ -866,11 +963,55 @@ static void test_a_cut_ends_the_process_as_a_power_loss_with_the_models_tear(voi
 
     /* A cut beyond the run never fires: the run ends as it would without one. */
     prepare_before();
-    TEST_ASSERT_EQUAL_INT(0, run_child_with_cut(FLASH_SCRIPT_WRITES + 1U, 3U));
+    TEST_ASSERT_EQUAL_INT(0, run_child_with_cut(FLASH_SCRIPT_WRITES + 1U, 3U, NULL));
     flash_script_replay(s_before, s_expect, 0U, 0U);
     read_file();
     TEST_ASSERT_EQUAL_HEX8_ARRAY(s_expect, s_file, DEVICE_SIZE);
     TEST_ASSERT_NULL(strstr(child_stderr(), "FATAL"));
+}
+
+/* The end without a kernel releases both locks itself before the process exits
+ * (docs/bug-log.md, 012). A keeper forked by the child keeps mappings of the flash file and of
+ * the cell, and with them the two open file descriptions the child locked, alive after the
+ * child has ended with 12: a lock left to the exit would still be held when the parent has
+ * seen that exit, and the next process, started at once as a bench starts it, could open
+ * neither file. The first and the last write of the script, and one in between. */
+static void test_a_cut_leaves_both_files_free_while_mappings_of_them_outlive_the_process(void)
+{
+    const uint32_t cuts[] = {1U, 4U, FLASH_SCRIPT_WRITES};
+
+    for (uint32_t i = 0U; i < (sizeof(cuts) / sizeof(cuts[0])); i++) {
+        map_keeper_t keeper;
+        posix_retained_info_t cell;
+
+        prepare_before();
+        (void)unlink(s_cell);
+        TEST_ASSERT_TRUE(map_keeper_prepare(&keeper));
+        TEST_ASSERT_EQUAL_INT_MESSAGE((int)PLAT_RESET_POWER_LOSS,
+                                      run_child_with_cut(cuts[i], 11U, &keeper),
+                                      at("exit status, cut", (long)cuts[i]));
+
+        /* Another process can lock each file, */
+        TEST_ASSERT_EQUAL_INT_MESSAGE(0, lock_from_another_process(s_path),
+                                      at("the flash file after cut", (long)cuts[i]));
+        TEST_ASSERT_EQUAL_INT_MESSAGE(0, lock_from_another_process(s_cell),
+                                      at("the cell after cut", (long)cuts[i]));
+
+        /* and the next start opens both: the cell went with the supply. */
+        TEST_ASSERT_TRUE_MESSAGE(posix_retained_open(s_cell, s_error, sizeof(s_error)), s_error);
+        posix_retained_get_info(&cell);
+        posix_retained_close();
+        TEST_ASSERT_EQUAL_STRING("magic", cell.verdict);
+        open_flash(&FAST);
+        posix_flash_close();
+
+        /* The file holds the model's tear: the keeper's mapping changed nothing in it. */
+        flash_script_replay(s_before, s_expect, cuts[i], 11U);
+        read_file();
+        TEST_ASSERT_EQUAL_HEX8_ARRAY_MESSAGE(s_expect, s_file, DEVICE_SIZE,
+                                             at("cut", (long)cuts[i]));
+        TEST_ASSERT_TRUE(map_keeper_end(&keeper));
+    }
 }
 
 /* ------------------------------------------------------------------ from another thread */
@@ -989,6 +1130,8 @@ int main(void)
     RUN_TEST(test_a_file_that_cannot_be_used_is_refused_with_the_reason);
     RUN_TEST(test_the_file_is_locked_while_it_is_open);
     RUN_TEST(test_a_lock_released_while_the_file_stays_open_lets_another_process_take_it);
+    RUN_TEST(test_nothing_stored_after_the_file_is_given_up_reaches_the_file);
+    RUN_TEST(test_the_close_frees_the_file_while_another_process_still_maps_it);
     RUN_TEST(test_a_cut_is_written_n_or_n_colon_seed);
     RUN_TEST(test_the_device_follows_flash_h_and_counts_what_it_did);
     RUN_TEST(test_an_operation_waits_through_the_wait_function_until_its_time_has_passed);
@@ -997,6 +1140,7 @@ int main(void)
     RUN_TEST(test_a_wrong_flash_command_is_refused_with_its_usage);
     RUN_TEST(test_a_cut_from_simulation_control_tears_what_the_model_tears);
     RUN_TEST(test_a_cut_ends_the_process_as_a_power_loss_with_the_models_tear);
+    RUN_TEST(test_a_cut_leaves_both_files_free_while_mappings_of_them_outlive_the_process);
     RUN_TEST(test_commands_from_another_thread_reach_the_operations);
 
     const int status = UNITY_END();

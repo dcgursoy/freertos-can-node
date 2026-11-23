@@ -143,11 +143,13 @@ TOOL_TIMEOUT_S = 120.0
 #: (three attempts, the rollback, the image: five).
 MAX_STARTS = 6
 #: A start that finds the flash or the cell still locked by the run before it is made again,
-#: this often at most, after this pause, and counted (the row's lock_retries). A run's flock
-#: lives as long as its open file description, and a process that holds the ended run's memory
-#: map for a moment (one that reads its /proc entries does) keeps it alive after the run's exit:
-#: the mechanism of docs/bug-log.md 010, there at the bootloader's exec. Such a start ends at
-#: its first open (status 1, "in use by another ...") and changes nothing in the flash.
+#: this often at most, after this pause, and counted (the row's lock_retries). A flock lives as
+#: long as its open file description, which a process that holds the ended run's memory map for
+#: a moment (one that reads its /proc entries does) keeps alive after the run's exit. Since
+#: docs/bug-log.md 012 every run releases its locks itself before it ends (a cut, a reset, an
+#: orderly end), so only a run that was killed can leave one, and the count is expected to be
+#: 0. Such a start ends at its first open (status 1, "in use by another ...") and changes
+#: nothing in the flash.
 LOCK_RETRIES = 3
 LOCK_RETRY_S = 0.2
 #: The log's history is at most this many crashing trials long.

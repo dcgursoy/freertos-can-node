@@ -9,6 +9,22 @@
  * file, also after _exit() in the middle of a run. No msync() is needed for that; only a crash
  * of the host's kernel could lose the stores, as with the retained cell (posix_retained.c).
  *
+ * THE LOCK AND THE END OF A RUN. The file is locked with flock() while it is open. The lock
+ * belongs to the open file description, and the mapping refers to that description as the
+ * descriptor does: left to the kernel, the lock would go only with the process's memory map,
+ * which another process can keep alive for a moment after the process has ended
+ * (posix_retained.c, THE LOCK BELONGS TO THE OPEN FILE DESCRIPTION), and the next process to
+ * open the file would find it "in use". So the process gives the file up itself wherever a run
+ * ends: with posix_flash_close() at an orderly end, and with posix_flash_unlock() directly
+ * before the bootloader's exec and before every _exit() (the end without a kernel below;
+ * plat_reset() and the shutdown guard of a FreeRTOS program, posix_lifecycle.c). Both first put
+ * the file out of this process's reach and then remove the lock with flock(LOCK_UN), which acts
+ * at once whatever still refers to the description. The close unmaps the file. The unlock can
+ * come while another thread still operates the device (a reset from the hardware watchdog's
+ * thread stops no task before the exit does), so it replaces the shared mapping in place by a
+ * private copy-on-write mapping of the same file: a store made after that lands in a private
+ * page, never in the file, which another process may have locked by then.
+ *
  * CREATED WHOLE OR NOT AT ALL. A missing file is created with O_EXCL, locked, and then filled
  * with 0xFF by writing it from the start; the file only reaches the device's size once the
  * last byte is written. A process killed while it creates the file therefore leaves one that
@@ -109,6 +125,9 @@ static uint32_t s_erase_counts[SECTOR_COUNT];
 static flash_dev_t s_dev;
 static uint8_t *s_map; /* the mapping, or NULL */
 static int s_fd = -1;  /* open while the file is mapped; locked but after posix_flash_unlock() */
+/* s_map and s_fd are written by the main thread only, in the open and in the close, while no
+ * other thread uses the flash; posix_flash_unlock() reads them in whichever thread ends the
+ * run. */
 static uint32_t s_armed_seed;
 static posix_flash_wait_fn s_wait;             /* NULL: sleep */
 static posix_flash_power_loss_fn s_power_loss; /* NULL: the end without a kernel */
@@ -309,10 +328,14 @@ static void report_cut(void)
 }
 
 /* The end of a run by a loss of supply without a kernel: the RAM of the retained cell is
- * lost, and the process ends with the status of a power loss. */
+ * lost, the locks of the cell and of the flash file are released (THE LOCK AND THE END OF A
+ * RUN; the cut operation's stores are in the file, and nothing writes after this), and the
+ * process ends with the status of a power loss. */
 static void end_without_kernel(void)
 {
     posix_retained_note_reset(PLAT_RESET_POWER_LOSS);
+    posix_retained_unlock();
+    posix_flash_unlock();
     _exit((int)PLAT_RESET_POWER_LOSS);
 }
 
@@ -774,7 +797,11 @@ void posix_flash_close(void)
         atomic_store(&s_open, false);
         (void)munmap(s_map, FLASH_SIZE);
         s_map = NULL;
-        (void)close(s_fd); /* releases the lock */
+        /* The lock explicitly, and only then the descriptor: the close alone removes the lock
+         * only when nothing else refers to the open file description, and the memory map of a
+         * process forked while the file was mapped does, for as long as that map exists. */
+        (void)flock(s_fd, LOCK_UN);
+        (void)close(s_fd);
         s_fd = -1;
     }
 }
@@ -782,9 +809,19 @@ void posix_flash_close(void)
 void posix_flash_unlock(void)
 {
     if (atomic_load(&s_open)) {
-        /* LOCK_UN removes the lock of the open file description at once, also while the
-         * mapping still refers to the description. A second call finds no lock to remove. */
-        (void)flock(s_fd, LOCK_UN);
+        /* Out of reach first (THE LOCK AND THE END OF A RUN): MAP_FIXED puts the private
+         * mapping in the shared one's place in one step, so a thread in the middle of a
+         * program finds the address mapped at every instant, and its stores from here on stay
+         * in this process. Only then the lock: if the kernel refuses the mapping, the shared
+         * one may still be there and this process could still write the file, so the lock
+         * stays, until the memory map goes. A second call maps again and finds no lock to
+         * remove. */
+        if (mmap(s_map, FLASH_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, s_fd, 0) !=
+            MAP_FAILED) {
+            /* LOCK_UN removes the lock of the open file description at once, also while the
+             * mapping still refers to the description. */
+            (void)flock(s_fd, LOCK_UN);
+        }
     }
 }
 

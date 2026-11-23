@@ -17,10 +17,12 @@
  * size: its content would not be a flash of this layout. It is mapped shared (MAP_SHARED), so
  * every program and erase is in the file as soon as it is done, whether or not the process
  * ends in order, and the next process (the bootloader after the node, the node after a reset)
- * finds it there. It is locked (flock) while it is open, but for the bootloader's
- * posix_flash_unlock(): two processes driving one flash would each change it under the other.
- * Without the option there is no flash: plat_flash_device() returns NULL and nothing else
- * changes.
+ * finds it there. It is locked (flock) while it is open: two processes driving one flash would
+ * each change it under the other. The lock is released by posix_flash_close(), and by
+ * posix_flash_unlock() where a run ends without the close (before the bootloader's exec and
+ * before every _exit()), never left to the end of the process: posix_flash.c, THE LOCK AND THE
+ * END OF A RUN. Without the option there is no flash: plat_flash_device() returns NULL and
+ * nothing else changes.
  *
  * TIMING. Each program and erase waits the time the modelled part takes before it returns
  * (the figures below, or the ones given to posix_flash_open()): a read takes none. With no wait
@@ -35,10 +37,11 @@
  * operation is torn as nor.h describes, runs for the time up to its cut, and then the supply is
  * gone: a line "FATAL flash: power cut in operation ..." is written to stderr and the power-loss
  * function ends the run. Without one, the run ends as a loss of supply without a kernel: the
- * retained cell is destroyed (posix_retained_note_reset()) and the process exits with
- * PLAT_RESET_POWER_LOSS (12) at once (_exit: nothing buffered in stdio is written). Every
+ * retained cell is destroyed (posix_retained_note_reset()), the locks of the cell and of the
+ * flash file are released (posix_retained_unlock(), posix_flash_unlock()) and the process exits
+ * with PLAT_RESET_POWER_LOSS (12) at once (_exit: nothing buffered in stdio is written). Every
  * FreeRTOS program on this platform has plat_reset(PLAT_RESET_POWER_LOSS) set by
- * posix_platform_init(), which ends with the same status.
+ * posix_platform_init(), which ends with the same status and releases the same locks.
  *
  * A HANG. `--flash-hang N` (posix_flash_arm_hang()) makes the N-th program or erase of the run
  * hang: the model makes the operation, and then its busy flag never clears, as a part that has
@@ -80,7 +83,8 @@
  * command leaves its request in one atomic word that the next operation takes, and each
  * operation publishes its counters in atomics that the status reads. Nothing here takes a lock.
  * posix_flash_open(), the set functions and posix_flash_close() belong to the main thread,
- * before and after the others run.
+ * before and after the others run. posix_flash_unlock() belongs to the context that ends the
+ * run, whichever thread that is.
  */
 #ifndef FCN_POSIX_FLASH_H
 #define FCN_POSIX_FLASH_H
@@ -173,19 +177,28 @@ void posix_flash_set_wait(posix_flash_wait_fn wait);
  *  CUTS. Kept across open and close. Main thread, before the first operation. */
 void posix_flash_set_power_loss(posix_flash_power_loss_fn end);
 
-/** Unmap the flash and release the file; the flash stays in it. The counters stay readable.
+/** Unmap the flash, release its lock (flock LOCK_UN, whatever else still refers to the open
+ *  file description) and close the file; the flash stays in it. The counters stay readable.
  *  Main thread, after the last operation. */
 void posix_flash_close(void);
 
 /**
- * Release the lock of the open flash file at once (flock LOCK_UN), keeping the file open and
- * mapped. The lock belongs to the open file description (flock(2)), which the mapping refers
- * to as the descriptor does: without this call it lasts as long as any reference to the
- * description, also one that outlives the process image (an exec while another process holds
- * a reference to the old memory map, posix_retained.c). From the call on, another process can
- * open the file, so the caller operates the device no more; posix_flash_close() or the exec
- * closes it. Does nothing without a flash. The bootloader, directly before the exec of the
- * image, which opens and locks the file itself. Main thread.
+ * Give the open flash file up at once, keeping it open: no store of this process reaches the
+ * file any more, and its lock is released (flock LOCK_UN). The lock belongs to the open file
+ * description (flock(2)), which the mapping refers to as the descriptor does: without this
+ * call it lasts as long as any reference to the description, also one that outlives the
+ * process or its image (while another process holds a reference to the memory map,
+ * posix_retained.c). The mapping is replaced, at its address and in one step, by a private
+ * copy-on-write mapping of the file: the device's reads still come from the file, and a
+ * program or erase made after the call, by a thread that is still running when another ends
+ * the run, changes this process's copy only. From the call on another process can open and
+ * lock the file. If the mapping cannot be replaced, the lock is kept (it then goes with the
+ * memory map). Does nothing without a flash; a second call changes nothing in the file.
+ * For every end of a run that does not get to posix_flash_close(): the bootloader directly
+ * before the exec of the image, which opens and locks the file itself, and directly before
+ * _exit() the power cut without a kernel, plat_reset() and the shutdown guard
+ * (posix_lifecycle.c). The context that ends the run, any thread: two system calls (mmap,
+ * flock), and no lock of this process taken.
  */
 void posix_flash_unlock(void);
 

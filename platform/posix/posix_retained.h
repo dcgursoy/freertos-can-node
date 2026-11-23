@@ -8,7 +8,9 @@
  * The module knows nothing about FreeRTOS, so that its tests run without a kernel
  * (tests/platform/test_posix_retained.c). posix_retained_open() runs on the main thread before
  * anything else of the node; posix_retained_note_reset() is called by plat_reset() from
- * whichever context resets; the rest by the main thread.
+ * whichever context resets, and posix_retained_unlock() by the context that ends the run
+ * (plat_reset() after it has recorded the reset, the shutdown guard from the logger thread);
+ * the rest by the main thread.
  */
 #ifndef FCN_POSIX_RETAINED_H
 #define FCN_POSIX_RETAINED_H
@@ -50,8 +52,9 @@ typedef struct {
  * not the magic) are kept as before.
  *
  * The file is created if it does not exist and given the cell's size if it has another; it is
- * locked (flock) for as long as it is open (but for the bootloader's posix_retained_unlock()),
- * so that two nodes cannot share one cell. Returns false with a message for the user in
+ * locked (flock) for as long as it is open, until posix_retained_close() or
+ * posix_retained_unlock() releases the lock, so that two nodes cannot share one cell. Returns
+ * false with a message for the user in
  * `error` if the file cannot be opened, locked, sized or mapped, or a cell is already open;
  * nothing is changed then. Main thread, once, before anything that could call plat_reset().
  */
@@ -93,9 +96,14 @@ void posix_retained_clear_handoff(void);
  * FILE DESCRIPTION). From the call on, another process can open the cell, and nothing here
  * writes into it (posix_retained_set_handoff(), posix_retained_clear_handoff() and
  * posix_retained_note_reset() do nothing) until posix_retained_relock() has taken the lock
- * again. Does nothing without a cell or if the lock is released already. The bootloader, after
- * the hand-off is written and directly before the exec of the image, which opens and locks the
- * cell itself (plat_retained.h, THE REMAINING WINDOW). Main thread.
+ * again. Does nothing without a cell or if the lock is released already. For every end of a
+ * run that does not get to posix_retained_close(): the bootloader, after the hand-off is
+ * written and directly before the exec of the image, which opens and locks the cell itself
+ * (plat_retained.h, THE REMAINING WINDOW); and, after posix_retained_note_reset() and directly
+ * before _exit(), plat_reset(), the shutdown guard, the power cut without a kernel
+ * (posix_flash.c) and the test payloads. The context that ends the run, any thread; the caller
+ * makes sure that only one context does (plat_reset() and the shutdown guard share one claim,
+ * posix_lifecycle.c).
  */
 void posix_retained_unlock(void);
 
@@ -132,7 +140,8 @@ const char *posix_handoff_decode(const uint32_t words[PLAT_RETAINED_RESERVED_WOR
  */
 void posix_retained_note_reset(plat_reset_reason_t reason);
 
-/** Unmap the cell and release the file; the cell stays in it. Main thread, after the run. */
+/** Unmap the cell, release its lock (flock LOCK_UN, whatever else still refers to the open file
+ *  description) and close the file; the cell stays in it. Main thread, after the run. */
 void posix_retained_close(void);
 
 /** What the start found; valid after posix_retained_open(), also after posix_retained_close().

@@ -270,6 +270,11 @@ void posix_stack_init(void);
 void posix_stack_freeze(void);
 void posix_tick_check_active(void);
 void posix_shutdown_guard_arm(uint32_t timeout_ms);
+/* End the process at once with `status`, from any thread, where the end is no reset (the
+ * shutdown guard): one context ends the process, so a caller that comes while a reset or
+ * another call is ending it waits for that exit instead; then the locks of the retained cell
+ * and of the flash file are released, as plat_reset() releases them, and the process exits. */
+_Noreturn void posix_end_process(int status);
 
 /* Exit status when ending the scheduler hung and the guard had to end the process. */
 #define POSIX_EXIT_SHUTDOWN_TIMEOUT 70

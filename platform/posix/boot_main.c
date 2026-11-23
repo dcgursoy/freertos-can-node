@@ -32,7 +32,8 @@
  *      mappings refer to as well, and those can outlast the exec (while another process holds
  *      a reference to the old memory map: posix_retained.c, THE LOCK BELONGS TO THE OPEN FILE
  *      DESCRIPTION). So the locks go first, by flock(LOCK_UN), and the descriptors (close-on-
- *      exec) and mappings stay for a failed exec: then fcn_boot takes the cell's lock again
+ *      exec) and the cell's mapping stay for a failed exec (the flash's mapping is a private
+ *      one from the unlock on, posix_flash_unlock()): then fcn_boot takes the cell's lock again
  *      (posix_retained_relock()) and zeroes the hand-off's words through the mapping
  *      (posix_retained_clear_handoff()) before the run ends with 42. If another process locked
  *      the cell in between, fcn_boot writes nothing into it and says that the hand-off could
@@ -54,6 +55,12 @@
  * ends, only a kill between the write and the exec leaves one behind; and another program that
  * opens the cell between the unlock and the image's own open takes it as its own
  * (plat_retained.h, THE REMAINING WINDOW).
+ * Every one of these ends releases the locks of the flash file and the cell itself, as the
+ * jump does, so that the next start finds both free at once, whatever still refers to this
+ * process's memory map after it has ended (posix_flash.c, THE LOCK AND THE END OF A RUN): 0 and
+ * 1 before a file is open, or after the close of the one that was; 12 by the two unlocks of
+ * posix_flash.c's end without a kernel; 40, 41 and 42 by posix_flash_close() and
+ * posix_retained_close() at the end of main(). Only a kill leaves them to the kernel.
  *
  * THE LOG. Lines in lib/log's format, stamped with CLOCK_MONOTONIC like the node's, appended to
  * --log-file (default stderr): the start (reset cause, cell, the build id of build_id.h, which
@@ -528,7 +535,7 @@ static int jump(const boot_selection_t *sel, const boot_options_t *options)
 
     /* The locks go now, whatever still refers to the files' open descriptions after the exec
      * (step 6 at the top): the image locks both files itself. The descriptors, close-on-exec,
-     * and the mappings stay for a failed exec. */
+     * and the cell's mapping stay for a failed exec. */
     posix_flash_unlock();
     posix_retained_unlock();
     (void)fexecve(fd, argv, environ);

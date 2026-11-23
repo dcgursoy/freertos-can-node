@@ -37,7 +37,9 @@
  * counts (posix_flash.h). --no-wait leaves out the modelled times of programs and erases (a
  * tool that prepares a test need not wait 45 ms per sector); without it every operation waits
  * as on the node, by sleeping. --flash-cut cuts the supply in the N-th program or erase of the
- * run, which then ends as a loss of supply.
+ * run, which then ends as a loss of supply. The tool holds the flash file's lock while it works
+ * and releases it itself at every end, the cut's included (posix_flash.c, THE LOCK AND THE END
+ * OF A RUN): the next program can open the file as soon as this one's exit has been seen.
  *
  * EXIT STATUS: 0 done; 1 a usage or start-up error (the flash file cannot be opened, is in use,
  * is missing for stage or info, exists for factory; IMAGE cannot be read); 2 refused: lib/image

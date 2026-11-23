@@ -13,6 +13,7 @@ tests/system/test_faults.py. The C tests of the cell are tests/platform/test_pos
 (without a kernel) and wdg_selftest `retained` (across resets of a FreeRTOS program)."""
 from __future__ import annotations
 
+import fcntl
 import struct
 import subprocess
 import time
@@ -63,6 +64,27 @@ def wait_until_up(node, seconds: float = 10.0) -> None:
         assert node.running, f"the node ended with {node.wait(timeout=5)}: {node.stderr()}"
         assert time.monotonic() < deadline, "the node did not come up"
         time.sleep(0.01)
+
+
+def wait_until_free(path: Path, seconds: float = 10.0) -> None:
+    """Wait until no process holds the lock of the file `path`: after a kill. A node releases
+    its locks itself at every end it controls, a reset and a power cut among them, so the next
+    start can follow such an end at once. A killed node runs nothing: its lock goes when the
+    kernel has taken its memory map down, and another process can hold that map for a moment
+    after the kill has been seen (one that reads /proc/<pid>/stat does; docs/bug-log.md, 012).
+    The bench that pulled the plug therefore waits here, as it would wait for a supply to be
+    gone, before it switches the board on again; the node itself never waits for a file that
+    is in use. The lock is tried as the node tries it and given up at once. Not a timing
+    tolerance: the wait only bounds how long the test waits."""
+    deadline = time.monotonic() + seconds
+    with open(path, "rb") as file:
+        while True:
+            try:
+                fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return      # the close gives it up
+            except BlockingIOError:
+                assert time.monotonic() < deadline, f"{path} stayed locked after the kill"
+                time.sleep(0.01)
 
 
 def run_once(start_node, *args: str, name: str = "node") -> dict:
@@ -161,6 +183,7 @@ def test_a_killed_node_leaves_a_power_on(start_node, workdir):
     with node.sim() as sim:
         sim.ping()
     node.kill()
+    wait_until_free(path)
     assert run_once(start_node, "--retained-file", str(path), name="after") == {
         "cause": "POWER_ON", "cause_code": 0, "retained_cell": True, "verdict": "no reset",
         "resets_since_power_on": 0}

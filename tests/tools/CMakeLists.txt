@@ -40,12 +40,46 @@ endforeach()
 target_compile_definitions(fcn_payload_crash PRIVATE PAYLOAD_KIND=1 _POSIX_C_SOURCE=200809L)
 target_compile_definitions(fcn_payload_watchdog PRIVATE PAYLOAD_KIND=2 _POSIX_C_SOURCE=200809L)
 
+# The held end (exit_held.c): linked into a program, it keeps the program's memory map alive
+# after the program has ended, until the test lets it go, when the environment names the test's
+# FIFO (FCN_HELD_EXIT); without that the program ends as the real one. An object library, so
+# that the real programs' sources below are compiled exactly as for the real programs; every
+# program that links it gets -Wl,--wrap=_exit with it.
+add_library(fcn_exit_held OBJECT exit_held.c)
+target_compile_definitions(fcn_exit_held PRIVATE _GNU_SOURCE)
+target_link_options(fcn_exit_held INTERFACE -Wl,--wrap=_exit)
+fcn_target_defaults(fcn_exit_held NO_COVERAGE)
+
 # fcn_boot_held: the bootloader (the same boot_main.c as fcn_boot) whose exec keeps its old
 # memory map, and with it the open file descriptions of the flash and the cell, alive until the
-# image has ended (boot_held.c, by -Wl,--wrap=fexecve), for tests/system/test_boot.py.
+# image has ended (boot_held.c, by -Wl,--wrap=fexecve), for tests/system/test_boot.py; and
+# whose own ends are held ends, for tests/system/test_held_ends.py.
 add_executable(fcn_boot_held "${CMAKE_SOURCE_DIR}/platform/posix/boot_main.c" boot_held.c)
 target_compile_definitions(fcn_boot_held PRIVATE _GNU_SOURCE FCN_VERSION="${PROJECT_VERSION}")
-target_link_libraries(fcn_boot_held PRIVATE fcn_boot_host fcn_build_id)
+target_link_libraries(fcn_boot_held PRIVATE fcn_boot_host fcn_build_id fcn_exit_held)
 target_link_options(fcn_boot_held PRIVATE -Wl,--wrap=fexecve)
 set_target_properties(fcn_boot_held PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 fcn_target_defaults(fcn_boot_held NO_COVERAGE)
+
+# The flash tool, the node and the crash payload with held ends, for
+# tests/system/test_held_ends.py (docs/bug-log.md, 012): the sources, definitions and libraries
+# of fcn_flash, fcn_node and fcn_payload_crash, and the held end.
+add_executable(fcn_flash_held "${CMAKE_SOURCE_DIR}/platform/posix/flash_tool.c")
+target_compile_definitions(fcn_flash_held PRIVATE _POSIX_C_SOURCE=200809L
+                                                  FCN_VERSION="${PROJECT_VERSION}")
+target_link_libraries(fcn_flash_held PRIVATE fcn_boot_host fcn_build_id fcn_exit_held)
+
+add_executable(fcn_node_held "${CMAKE_SOURCE_DIR}/platform/posix/node_main.c")
+target_compile_definitions(fcn_node_held PRIVATE _POSIX_C_SOURCE=200809L
+                                                 FCN_VERSION="${PROJECT_VERSION}")
+target_link_libraries(fcn_node_held PRIVATE fcn_app fcn_platform_posix fcn_build_id fcn_exit_held)
+
+add_executable(fcn_payload_crash_held payload.c)
+target_compile_definitions(fcn_payload_crash_held PRIVATE PAYLOAD_KIND=1 _POSIX_C_SOURCE=200809L)
+target_link_libraries(fcn_payload_crash_held PRIVATE fcn_boot_host fcn_exit_held)
+
+foreach(program fcn_flash_held fcn_node_held fcn_payload_crash_held)
+    set_target_properties(${program} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    fcn_target_defaults(${program} NO_COVERAGE)
+endforeach()

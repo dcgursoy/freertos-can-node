@@ -78,32 +78,60 @@ void plat_end_scheduler(void)
     vTaskEndScheduler();
 }
 
+/* One context ends the process. Two that come to an end at once (the watchdog's thread and a
+ * task's assertion, or the shutdown guard next to a reset): the first goes on, and its reason
+ * or status is the one recorded and exited with; the other waits here for that exit. */
+static void claim_the_end(void)
+{
+    static atomic_flag s_ending = ATOMIC_FLAG_INIT;
+
+    if (atomic_flag_test_and_set(&s_ending)) {
+        for (;;) {
+            (void)pause();
+        }
+    }
+}
+
+/* The last step of an end that does not return from main(): the locks of the retained cell
+ * and of the flash file, then the process. A lock left to the exit would go only with the
+ * memory map, which another process can hold for a moment after the exit (posix_retained.c,
+ * THE LOCK BELONGS TO THE OPEN FILE DESCRIPTION), and the next start, which the bench makes as
+ * soon as it has seen this exit, would find the file "in use". The cell is written before
+ * this (s_locked refuses a write after it), and a task that is still running when the hardware
+ * watchdog's thread or the shutdown guard ends the run no longer reaches the flash file
+ * (posix_flash_unlock()). */
+static _Noreturn void release_and_exit(int status)
+{
+    posix_retained_unlock();
+    posix_flash_unlock();
+    _exit(status);
+}
+
+void posix_end_process(int status)
+{
+    claim_the_end();
+    release_and_exit(status);
+}
+
 void plat_reset(plat_reset_reason_t reason)
 {
-    static atomic_flag s_resetting = ATOMIC_FLAG_INIT;
     const plat_reset_reason_t recorded =
         posix_reset_reason_valid(reason) ? reason : PLAT_RESET_ASSERT;
 
     /* A reset is abrupt on purpose: like the reset line of a microcontroller it stops the
      * image wherever it is. Only what a test bench would still have afterwards is saved: the
      * retained cell, the log lines already produced and, in coverage builds, the counters.
+     * Then the files are given up and the process ends (release_and_exit()).
      * The hardware watchdog's thread is not a task and enters no critical section. */
     if (!posix_on_external_thread()) {
         vPortEnterCritical();
     }
 
-    /* Two contexts resetting at once (the watchdog's thread and a task's assertion): the first
-     * one's reason is recorded and exited with; the other waits here for the exit. */
-    if (atomic_flag_test_and_set(&s_resetting)) {
-        for (;;) {
-            (void)pause();
-        }
-    }
-
+    claim_the_end();
     posix_retained_note_reset(recorded);
     posix_log_drain();
 #if defined(FCN_COVERAGE)
     __gcov_dump();
 #endif
-    _exit((int)recorded);
+    release_and_exit((int)recorded);
 }

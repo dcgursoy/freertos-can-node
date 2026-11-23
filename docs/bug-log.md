@@ -31,6 +31,7 @@ scripts/buglog-verify.sh
 | [009](#009-the-stack-report-left-out-the-frame-of-the-task-function) | 0 | The stack depth was counted from the frame of `plat_task_enter()`, so a buffer in a task function's own body never appeared in the report | review of phase 1 (a buffer planted in a task's body); stack self-test added with the fix |
 | [010](#010-the-image-found-the-files-still-locked-by-the-bootloader-it-had-replaced) | 4 | The bootloader kept the flash and the retained cell locked up to its exec and left their release to the exec; when another process held a reference to the bootloader's memory map at that moment, the locks outlived the exec and the image it had started found both files "in use" | asan run of the system tests on CI (GitHub's ubuntu-24.04 runner); platform and system tests added with the fix |
 | [011](#011-a-tick-made-up-for-a-late-one-kept-the-count-a-tick-ahead-of-the-clock) | 0 | The locked tick made up a tick that was only late (pending on the thread of a task switched out) and was meant to give the one too many back, but decided that right after a raise, where a count one ahead looks on time: the tick count ran a tick ahead of the clock for long stretches, and tasks were released up to a tick before their tick was due | the node_timing bench of phase 6; unit test of the tick's decision added with the fix |
+| [012](#012-the-next-start-found-the-files-still-locked-by-the-run-that-had-just-ended) | 3 | Every end of a process that did not close the flash file and the retained cell first (a power cut in the flash tool or the bootloader, every reset of the node, the shutdown guard, the test payloads) left their locks to the kernel; when another process held the ended one's memory map for a moment, the locks outlived the exit, and the next program started on the files found them "in use" | asan run of the system tests on CI (GitHub's ubuntu-24.04 runner); platform and system tests added with the fix |
 
 ---
 
@@ -661,7 +662,9 @@ lock also goes only with the image's memory map. (The node's orderly end unmaps 
 both files itself before it exits.) In the release loop with the reader, 6 of the 2000 starts
 found the cell still locked by the payload that had just ended: `fcn_boot: --retained-file ...
 is in use by another node`. That was before the fix and again with it. No CI run has shown
-this so far.
+this so far. (A later one did, and since [012](#012-the-next-start-found-the-files-still-locked-by-the-run-that-had-just-ended)
+a reset, a power cut and the payloads release their locks themselves before they exit; a
+killed process cannot.)
 
 In a second run of the same loop on the fixed code the image never found a file still locked
 by fcn_boot: 3000 starts (asan, reader of `stat` and `maps`), 2000 (asan, `stat` only) and 2000
@@ -865,3 +868,235 @@ Dropped ticks on an idle machine are a separate, open matter.
 patch puts HEAD's give-back into posix_tick_plan.c: the sleep after a raise goes to the boundary
 of `max(counted, expected) + 1`, and the check at the boundary is taken out. The verification
 runs both tests against it. The bug is in commits `7a347ab` to `972fb22`.
+
+---
+
+## 012 The next start found the files still locked by the run that had just ended
+
+**Found** 2026-11-23 by CI run 45128453578 on GitHub's ubuntu-24.04 runner (commit `7de1f51`).
+In `scripts/test-system.sh` the functional run against the release build passed (1413 tests) and
+so did the timing run (46). The run against the asan build failed 3 tests. Each failed at
+`fcn_flash info`, which the test starts as soon as `fcn_flash stage --flash-cut` has ended with
+status 12, the simulated power cut, on the same flash file:
+
+```
+FAILED tests/python/test_flash_decoder.py::test_both_readings_agree_after_a_cut_at_every_operation_of_an_update[0] - AssertionError: fcn_flash ('info', '--flash-file', PosixPath('.../cut-10.bin')): 1
+  fcn_flash: --flash-file .../cut-10.bin is in use by another process
+FAILED tests/python/test_flash_decoder.py::test_both_readings_agree_after_a_cut_at_every_operation_of_an_update[1] - AssertionError: fcn_flash ('info', '--flash-file', PosixPath('.../cut-3.bin')): 1
+  fcn_flash: --flash-file .../cut-3.bin is in use by another process
+FAILED tests/system/test_update_cuts.py::test_a_cut_anywhere_in_staging_leaves_the_confirmed_image_and_the_next_update_works - AssertionError: fcn_flash ('info', '--flash-file', PosixPath('.../cut-424-733124982.bin')): 1
+fcn_flash: --flash-file .../cut-424-733124982.bin is in use by another process
+========== 3 failed, 1410 passed, 46 deselected in 636.44s (0:10:36) ===========
+```
+
+Each of the three files had been locked by one process only, the `fcn_flash stage` that had just
+ended. The tests have nothing to do with the change of `7de1f51` (the locked tick,
+[011](#011-a-tick-made-up-for-a-late-one-kept-the-count-a-tick-ahead-of-the-clock)).
+
+**Cause.** It is the fault of
+[010](#010-the-image-found-the-files-still-locked-by-the-bootloader-it-had-replaced) at the
+other way out of a process. A `flock` lock belongs to the open file description. The
+`MAP_SHARED` mapping of the file refers to that description as the descriptor does, and the
+mapping goes only with the process's memory map, when the last reference to the map is dropped.
+Another process can hold such a reference for a moment after the process has exited: the kernel
+takes one for each read of `/proc/<pid>/stat` or `/proc/<pid>/maps`. The exit is then complete
+for the parent, which has the status and starts the next program, while the map, its mappings,
+the descriptions and the locks still exist. The next program ends at its first open with "in
+use".
+
+Entry 010 fixed this for fcn_boot's exec with an explicit `flock(LOCK_UN)` and named the ends
+as not covered: "a lock held by an image that ends without closing the files: a reset or a power
+cut, which end with `_exit()`". Its reproduction loop had fcn_boot find the cell still locked
+by the payload that had just ended in 6 of 2000 starts. Every end that did not close the files
+left its locks to the kernel, the retained cell's since `934df0f` (phase 3) and the flash
+file's since `de16113` (phase 4):
+
+- the power cut without a kernel (`end_without_kernel()` in posix_flash.c): fcn_flash and
+  fcn_boot with `--flash-cut`, the three failures of this run;
+- `plat_reset()`: every reset of the node (the watchdog, a tester's ECUReset, an assertion, a
+  stack overflow, a failed allocation, a power cut in the flash task), from whichever thread;
+- the shutdown guard (posix_log.c, status 70);
+- the test payloads: their `_exit()` after they recorded the reset, and their return from
+  `main()` with the cell still open when the log cannot be opened.
+
+The orderly ends unmapped and closed the files first. That removes the lock unless another
+process maps the file too, and a process forked while the file was mapped does. The platform
+tests fork such processes to try the lock from outside, so their own closes depended on how soon
+a forked child's memory map was gone.
+
+As in 010, what read the `/proc` files on the runner is not known. An ASan process has a large
+memory map, which takes long to read and to take down, and the asan run is where both entries
+showed.
+
+**Reproduction** on the laptop (8 CPUs, kernel 6.6.87.2-microsoft-standard-WSL2), with the
+reader of entry 010: a small C program that finds every fcn_flash process in `/proc` and reads
+its `maps` and `stat` in a tight loop until the process is gone. The asan fcn_flash staged an
+image with `--flash-cut 3:<seed>` on a copy of a factory flash, which ends with 12, and the asan
+`fcn_flash info` was started on the same file at once, with `ASAN_OPTIONS` as
+`scripts/test-system.sh` sets them. Runs in which `fcn_flash info` found the file "in use":
+
+| Reader | Other load | `7de1f51` | With the fix |
+|---|---|---|---|
+| `stat` and `maps` | none | 0 of 2000 | |
+| `stat` and `maps` | a busy loop on each of the 8 CPUs | 3 of 4000 | 0 of 4000 |
+
+The loaded loop was run twice on each tree, 2000 runs each, alternating: 1 and 2 on `7de1f51`,
+0 and 0 with the fix. The reader alone did not show it in these runs. Unlike the image after
+fcn_boot's exec in 010, the next program is a new process that has to be started before it
+reaches its open, which presumably gives the reader the time to let go; with every CPU busy the
+reader is held up now and then while it holds its reference.
+
+A second campaign of the same loop, for the review of the fix, ran on the HEAD before it
+(`facab85`, whose platform code is `7de1f51`'s) and on the final fix. With the reader alone,
+`fcn_flash info` found the file "in use" in 1 of 2000 runs before the fix, so load is not
+needed for it. With a busy loop on each CPU as well, two rounds of 2000 on each tree,
+alternating: 3 and 0 before the fix, 0 and 0 with it.
+
+The same without chance, as in 010. The held variants of the programs (the regression test
+below) keep the ended program's memory map alive every time, through a process that shares the
+map and has no descriptor of either file. With the releases taken out of the fixed tree again
+(the patch below, release build), each of the eight system tests of an end that left its lock
+to the kernel failed in 200 of 200 runs, every time at a file "in use"; with the fix each
+passed in 200 of 200.
+
+**Fix.** A process releases its locks itself at every end it controls, with `flock(LOCK_UN)`,
+after its last write through the mapping and directly before it ends:
+
+- `end_without_kernel()` (posix_flash.c) calls `posix_retained_unlock()` and
+  `posix_flash_unlock()` before `_exit(12)`.
+- `plat_reset()` and the shutdown guard end through one function of posix_lifecycle.c,
+  `release_and_exit()`, which calls the two unlocks before `_exit()`: after the reset is
+  recorded in the cell, the log written out and, in coverage builds, the counters dumped. The
+  guard used to call `_exit(70)` on its own; it now takes the same claim as a reset
+  (`posix_end_process()`), so that one context ends the process and writes the cell.
+- The test payloads call `posix_retained_unlock()` before their `_exit()`, and close the cell
+  before they return 1.
+- `posix_flash_close()` and `posix_retained_close()`, the orderly ends, call `flock(LOCK_UN)`
+  after the unmap instead of leaving the lock to the close of the descriptor, so that they
+  release it whatever else maps the file.
+
+Nothing may change a file once its lock is released, because another process may hold it from
+then on. For the cell that was true already: `posix_retained` writes nothing while the lock is
+released, and the reset is recorded before the unlock. For the flash it was not. A reset from
+the hardware watchdog's thread, and the shutdown guard, stop no task before the exit does, and
+a task in the middle of an update goes on programming until then. So `posix_flash_unlock()`
+now gives the file up in two steps: it first replaces the shared mapping, at its address and in
+one step (`mmap` with `MAP_FIXED`), by a private copy-on-write mapping of the same file, and
+only then removes the lock. A store made after that changes the process's own copy. If the
+mapping cannot be replaced, the lock is kept and goes with the memory map, as before the fix.
+The same function serves fcn_boot before its exec.
+
+"In use" stays an immediate refusal. The opener does not wait or try again: a second live
+process on the same file is a real conflict, and a start that waited would hide it.
+
+No fix in the program covers an end the program does not control: SIGKILL, a signal's default
+action, a sanitizer's abort. No code of the process runs there, and its lock goes with its
+memory map. A sanitizer report or a crash fails its test anyway. One test kills a program on
+purpose and opens its file again at once:
+`tests/system/test_retained.py::test_a_killed_node_leaves_a_power_on` (SIGKILL, then a node on
+the same cell). That test now waits after the kill until the cell's lock can be taken
+(`wait_until_free()`): the bench that pulled the plug waits for the kernel, as it would wait for
+a supply to be gone, and the node itself never waits. A loop of that sequence on the fix (the
+asan node killed once its log had its first lines, then a node on the same cell at once, the
+reader on every fcn_node process) did not show the lock here: 0 of 500 starts with the reader
+alone and 0 of 500 with a busy loop on each CPU as well, in each of two runs of the loop.
+Nothing of a killed process runs, so the mechanism above is open to it all the same.
+bench/power_loss.py, which starts a board again after ends of every kind, makes a start that
+finds a file "in use" again and counts it (`lock_retries`); since this fix only a killed run
+can make it count.
+
+**Regression test.** Platform tests and a system test, none of which depends on the host's
+timing. The platform tests use a keeper
+([tests/platform/map_keeper.h](../tests/platform/map_keeper.h)): a process forked by the
+program under test once its files are mapped. It has the mappings too, closes every
+descriptor, and so keeps the open file descriptions that the program locked alive after the
+program has ended, until the test lets it go.
+
+- `tests/platform/test_posix_flash.c`:
+  - `test_a_cut_leaves_both_files_free_while_mappings_of_them_outlive_the_process`: a child
+    opens a retained cell and the flash, forks a keeper, and ends at a power cut with 12. Once
+    the test has seen that exit, another process must be able to lock each file, and the test
+    opens both. Cuts in the first, a middle and the last write of the script.
+  - `test_the_close_frees_the_file_while_another_process_still_maps_it`: the same for
+    `posix_flash_close()`.
+  - `test_nothing_stored_after_the_file_is_given_up_reaches_the_file`: after
+    `posix_flash_unlock()` a program and an erase work on the device as before and leave the
+    file as it was at the unlock. This one tests the new rule and not the missing release: it
+    fails with `7de1f51`'s `posix_flash_unlock()`, which left the mapping shared, and passes
+    with the patch below.
+- `tests/platform/test_posix_retained.c`:
+  `test_the_close_frees_the_cell_while_another_process_still_maps_it`, for
+  `posix_retained_close()`.
+- The self-tests that reset real FreeRTOS programs now leave a keeper behind each child, and
+  the next start follows at once: `wdg_selftest retained` (CTest `platform_retained_resets`:
+  `plat_reset()` from a task with six reasons, and two orderly ends, eight starts one after
+  the other), `wdg_selftest watchdog-cause` (`platform_retained_watchdog`: the reset from the
+  watchdog's thread) and `flash_selftest task-cut` (`platform_flash_task_cut_*`: the power cut
+  in a task, then the cell and the flash opened by the parent).
+- `flash_selftest end-while-writing watchdog` and `guard` (CTest
+  `platform_flash_end_while_writing_*`) end a run from outside the scheduler while a task
+  programs the flash, a unit every tick or two: by the hardware watchdog (`plat_reset()` from
+  the watchdog's thread, status 11) and by the shutdown guard (status 70), an end that nothing
+  outside a program can provoke. Neither stops the task before the exit does. The self-test is
+  linked with `-Wl,--wrap=_exit`, and its `_exit()` holds the end open at the point
+  `release_and_exit()` has reached, the locks released: it reads the flash file, waits until
+  the task has completed eight more programs, and reads it again. A file that changed ends the
+  child with 81 instead of the end's status. Its `flock()` (`--wrap=flock`) looks into
+  `/proc/self/maps` when the flash file's lock is removed: the mapping of the file has to be
+  the private one by then (else 85), the order `posix_flash_unlock()` keeps. The parent then
+  opens the cell and the flash at once, while a keeper has the child's mappings. This is the
+  test of the guard's end with both files open, and of the mapping replaced under a task that
+  stores through it.
+- `tests/system/test_held_ends.py` runs the programs themselves. `fcn_flash_held`,
+  `fcn_boot_held`, `fcn_node_held` and `fcn_payload_crash_held` are the programs' own sources
+  linked with `-Wl,--wrap=_exit` and [tests/tools/exit_held.c](../tests/tools/exit_held.c): an
+  `_exit()`, and through `atexit()` an `exit()` or a return from `main()`, first starts a
+  process that shares the program's memory map (`clone()` with `CLONE_VM`), closes every
+  descriptor of the two files and holds the map until the test ends it; no time limit ends
+  the hold (the holder waits for as long as the test has the FIFO open). That is what a reader
+  of `/proc/<pid>/stat` does by chance for a moment, here every time. The test learns the
+  holder's process id from a FIFO, starts the next program at once, and checks afterwards that
+  the holder was still there. Eight tests are of ends that left a lock to the kernel:
+  `fcn_flash info` after a cut in `fcn_flash stage` (cuts 3 and 10, the two of
+  test_flash_decoder.py that failed on CI); `fcn_flash info` and the next start through
+  fcn_boot after a reset of the node by its watchdog (from the watchdog's thread), by a
+  tester's ECUReset (from a task) and by a power cut in the confirm of a trial (from the flash
+  task), and after a power cut in fcn_boot; the next start after the crash payload's end and
+  after its start-up error. Three more are of ends that close the files in order (fcn_boot's
+  exit statuses 40 and 42, the node's orderly end); they pass with and without the bug and
+  fail for an end that forgets a close.
+
+Each new or changed test in a loop on the laptop (release build): with the releases taken out
+of the fixed tree again (the patch below) and with the fix. Runs that failed:
+
+| Test | Runs | Releases taken out | With the fix |
+|---|---|---|---|
+| test_held_ends.py: each of the eight tests of an end that left its lock to the kernel | 200 | 200 | 0 |
+| test_held_ends.py: each of the three tests of an end that closes in order | 200 | 0 | 0 |
+| test_posix_flash: the cut with a keeper and the close with a keeper, each | 200 | 200 | 0 |
+| test_posix_retained: the close with a keeper | 200 | 200 | 0 |
+| `wdg_selftest retained` and `wdg_selftest watchdog-cause 100`, each | 200 | 200 | 0 |
+| `flash_selftest task-cut` with the cuts 1:5, 6:77, 10:4242 and 11:1 (past the script's end: the closes), each | 200 | 200 | 0 |
+| `flash_selftest end-while-writing watchdog` and `guard`, each | 200 | 200 | 0 |
+
+The test of the stores after the unlock passes with that patch, which leaves the private mapping
+in place. With `posix_flash_unlock()` as `7de1f51` had it (the lock removed, the mapping left
+shared) in the fixed tree, it failed in 200 of 200 runs, and so did both `end-while-writing`
+tests, the child ending with 85 every time.
+
+Wrong fixes planted in the fixed tree one at a time, each of which at least one of these tests
+fails: the releases only where CI failed, in the power cut without a kernel; `plat_reset()`
+releasing before it records the reset, the power cut without a kernel before it destroys the
+cell, the payload before it records its reset; the flash file's lock released and the cell's
+not, and the reverse; no release at a power loss in `plat_reset()`; none when the reset comes
+from a thread outside the scheduler; none in the shutdown guard, which only
+`end-while-writing guard` catches; `posix_flash_unlock()` removing the lock before it replaces
+the mapping, which only the two `end-while-writing` tests catch (85); and fcn_boot or the node
+without the closes of its orderly end, which the tests of the ends that close in order catch.
+
+**Evidence.** [failing output](buglog/012-next-start-found-files-still-locked/failing-output.txt),
+[patch that re-creates the bug](buglog/012-next-start-found-files-still-locked/reintroduce.patch).
+The patch takes the releases out again: the unlocks before the three `_exit()` calls, the
+`flock(LOCK_UN)` of the two closes, and the payload's close. The verification runs the two
+Unity tests, `wdg_selftest retained`, `flash_selftest end-while-writing guard` and the eight
+system tests against it. The bug is in commits `934df0f` to `facab85`.

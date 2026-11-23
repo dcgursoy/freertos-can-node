@@ -11,7 +11,9 @@
  * anew and tries to lock it (or holds the lock until the test lets it go). The bootloader's
  * release of the lock before its exec (posix_retained_unlock()) is shown to work while the open
  * file description, and with it the mapping, still exists: that is the state an exec leaves
- * when another process holds a reference to the old memory map (docs/bug-log.md, 010).
+ * when another process holds a reference to the old memory map (docs/bug-log.md, 010). The
+ * close is shown to release the lock while a process forked from the test still maps the cell:
+ * the state an exit leaves in the same case (docs/bug-log.md, 012).
  *
  * What a real reset of the node does to the cell (plat_reset() from a task, and from the
  * hardware watchdog's thread) is tested by tests/platform/wdg_selftest.c, and a cell written by
@@ -32,6 +34,7 @@
 #include <unistd.h>
 
 #include "crc/crc.h"
+#include "map_keeper.h"
 #include "plat_retained.h"
 #include "posix_retained.h"
 #include "unity.h"
@@ -865,6 +868,37 @@ static void test_a_mapping_keeps_the_lock_after_its_descriptor_is_closed(void)
     TEST_ASSERT_EQUAL_INT(LOCKED, lock_from_another_process());
 }
 
+/* The orderly end: posix_retained_close() releases the lock itself. A keeper (map_keeper.h), a
+ * process forked while the cell was mapped, has the mapping too, and with it a reference to the
+ * open file description, which therefore outlives the close: a lock left to the description's
+ * end would still be held, and neither another process nor this one could open the cell
+ * again. */
+static void test_the_close_frees_the_cell_while_another_process_still_maps_it(void)
+{
+    map_keeper_t keeper;
+    int status = -1;
+
+    (void)start();
+    TEST_ASSERT_TRUE(map_keeper_prepare(&keeper));
+
+    const pid_t pid = map_keeper_fork(&keeper);
+
+    TEST_ASSERT_TRUE(pid > 0);
+    TEST_ASSERT_EQUAL_INT(IN_USE, lock_from_another_process());
+
+    posix_retained_close();
+    TEST_ASSERT_EQUAL_INT(LOCKED, lock_from_another_process());
+
+    const posix_retained_info_t info = start(); /* and this process opens it again */
+
+    ASSERT_START("POWER_ON", "no reset", 0U, info);
+    posix_retained_close();
+
+    TEST_ASSERT_TRUE(map_keeper_end(&keeper));
+    TEST_ASSERT_EQUAL_INT(pid, waitpid(pid, &status, 0));
+    TEST_ASSERT_TRUE(WIFEXITED(status) && (WEXITSTATUS(status) == 0));
+}
+
 /* The bootloader's release before the exec: while the cell is still open and mapped, so that
  * its open file description exists (as after an exec whose old memory map another process
  * still holds), posix_retained_unlock() lets another process lock the file; before it, that
@@ -1046,6 +1080,7 @@ int main(void)
     RUN_TEST(test_a_hand_off_taken_back_leaves_none_and_keeps_the_reason);
     RUN_TEST(test_taking_back_a_hand_off_where_there_is_none_changes_nothing);
     RUN_TEST(test_a_mapping_keeps_the_lock_after_its_descriptor_is_closed);
+    RUN_TEST(test_the_close_frees_the_cell_while_another_process_still_maps_it);
     RUN_TEST(test_a_lock_released_while_the_cell_stays_open_lets_another_process_take_it);
     RUN_TEST(test_the_lock_comes_back_only_while_nobody_else_holds_the_cell);
     RUN_TEST(test_every_valid_hand_off_survives_its_encoding);

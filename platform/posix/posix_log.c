@@ -129,7 +129,8 @@ void posix_shutdown_guard_arm(uint32_t timeout_ms)
 
 /* The logger thread doubles as the guard of an orderly stop: it is outside the scheduler, so
  * it still runs if ending the scheduler hangs, and then ends the process with a status that
- * says so instead of leaving a stuck node behind. */
+ * says so instead of leaving a stuck node behind (posix_end_process(): the locks of the
+ * retained cell and the flash file are released first, as at a reset). */
 static void check_shutdown_guard(void)
 {
     const uint64_t deadline_ns = atomic_load(&s_shutdown_deadline_ns);
@@ -139,7 +140,7 @@ static void check_shutdown_guard(void)
 
         posix_log_drain();
         (void)!write(STDERR_FILENO, message, sizeof(message) - 1U);
-        _exit(POSIX_EXIT_SHUTDOWN_TIMEOUT);
+        posix_end_process(POSIX_EXIT_SHUTDOWN_TIMEOUT);
     }
 }
 

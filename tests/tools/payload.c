@@ -18,7 +18,10 @@
  * first, as the node reads it, posix_retained_open(): the reset cause is spent and the
  * bootloader's hand-off taken) and --log-file (one line saying what the hand-off was, so that a
  * test sees which slot and attempt the bootloader started). Every other option, --flash-file
- * among them, is ignored. The line, after lib/log's prefix:
+ * among them, is ignored. Like the node, a payload releases the cell's lock itself before it
+ * ends (posix_retained_unlock() after the reset is recorded, posix_retained_close() at a
+ * start-up error), so that the next start of fcn_boot finds the cell free (docs/bug-log.md,
+ * 012). The line, after lib/log's prefix:
  *   payload <kind>: hand-off slot B trial attempt 2, image 1.1.0, event 0; reset cause
  *   IMAGE_FAULT
  * (the event as its number, plat_boot_event_t)
@@ -75,6 +78,7 @@ int main(int argc, char **argv)
         !boot_host_log_open(option_value(argc, argv, "--log-file"), LOG_LEVEL_INFO, error,
                             sizeof(error))) {
         (void)fprintf(stderr, "payload %s: %s\n", kind, error);
+        posix_retained_close(); /* open if it was the log that failed */
         return 1;
     }
 
@@ -104,5 +108,6 @@ int main(int argc, char **argv)
     (void)fprintf(stderr, "FATAL payload %s: a stand-in for broken firmware ends with status %d\n",
                   kind, (int)reason);
     posix_retained_note_reset(reason);
+    posix_retained_unlock();
     _exit((int)reason);
 }

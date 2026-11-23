@@ -16,17 +16,23 @@ set(_fcn_sanitizer_env
 set(_fcn_run_selftest "${CMAKE_CURRENT_SOURCE_DIR}/run_selftest.sh")
 
 # The self-tests of the hardware watchdog, the retained cell across resets and the sensor's
-# hang under the scheduler (wdg_selftest.c), a program of their own.
-add_executable(wdg_selftest wdg_selftest.c)
+# hang under the scheduler (wdg_selftest.c), a program of their own. map_keeper.c is the
+# process that keeps a child's mapping of a file alive past the child's end, for this program,
+# flash_selftest and the two Unity tests of the files' locks.
+add_executable(wdg_selftest wdg_selftest.c map_keeper.c)
 target_compile_definitions(wdg_selftest PRIVATE _POSIX_C_SOURCE=200809L)
 target_link_libraries(wdg_selftest PRIVATE fcn_platform_posix)
 fcn_target_defaults(wdg_selftest NO_COVERAGE)
 
 # The self-tests of the host's flash that need real time or the scheduler (flash_selftest.c).
-add_executable(flash_selftest flash_selftest.c flash_script.c)
+add_executable(flash_selftest flash_selftest.c flash_script.c map_keeper.c)
 target_include_directories(flash_selftest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(flash_selftest PRIVATE _POSIX_C_SOURCE=200809L)
 target_link_libraries(flash_selftest PRIVATE fcn_platform_posix)
+# Every _exit() and every flock() of the program and of the platform goes through
+# flash_selftest.c's own, where end-while-writing holds the end of a run open and sees the
+# order of its release.
+target_link_options(flash_selftest PRIVATE -Wl,--wrap=_exit -Wl,--wrap=flock)
 fcn_target_defaults(flash_selftest NO_COVERAGE)
 
 # fcn_add_platform_test(<name> STATUS <exit status> LABELS <labels...>
@@ -71,7 +77,8 @@ endfunction()
 #   test_posix_sensor  the sensor front-end model and its "sensor." commands, also served
 #                      from a thread of their own while the test reads (run under TSan too),
 #                      and the hang of "sensor.hang" with a reader thread of its own
-#   test_posix_retained the retained-RAM cell: starts and resets played by the test
+#   test_posix_retained the retained-RAM cell: starts and resets played by the test, and its
+#                      lock against other processes (with a keeper, map_keeper.h)
 #   test_posix_can_trace the ring and the text of the CAN controller's bus-off trace, and the
 #                      cost of a record (printed, not judged)
 #   test_posix_tick_plan the locked tick's decisions (posix_tick_plan.h) against a model of the
@@ -89,12 +96,14 @@ foreach(_test IN ITEMS can_backend posix_sim posix_sensor posix_retained posix_c
     set_tests_properties(platform_${_test} PROPERTIES
         LABELS "platform" TIMEOUT 60 ENVIRONMENT "${_fcn_sanitizer_env}")
 endforeach()
+target_sources(test_posix_retained PRIVATE map_keeper.c)
 
 # The flash of the host (posix_flash.c) without a kernel: the file, the device, the simulation
 # commands, cuts that end a child process with the model's tear, and the commands served from
 # a thread of their own while operations run (run under TSan too). flash_script.c is the
-# sequence of operations it shares with flash_selftest below.
-add_executable(test_posix_flash test_posix_flash.c flash_script.c)
+# sequence of operations it shares with flash_selftest below; map_keeper.c the process that
+# keeps a mapping of the file alive for the tests of the lock (docs/bug-log.md, entry 012).
+add_executable(test_posix_flash test_posix_flash.c flash_script.c map_keeper.c)
 target_compile_definitions(test_posix_flash PRIVATE _POSIX_C_SOURCE=200809L)
 target_link_libraries(test_posix_flash PRIVATE fcn_host_io unity Threads::Threads)
 fcn_target_defaults(test_posix_flash NO_COVERAGE)
@@ -189,6 +198,9 @@ fcn_add_platform_test(wdg_start_rules STATUS 0 LABELS platform PROGRAM wdg_selft
 fcn_add_platform_test(wdg_kick_cost STATUS 0 LABELS platform PROGRAM wdg_selftest
                       ARGS kick-cost 100000)
 # The retained cell across real resets of a FreeRTOS program, a watchdog reset among them.
+# Every child leaves a keeper of its mapping of the cell behind (map_keeper.h), so each next
+# start, which follows at once, opens the cell only if the run before it released the cell's
+# lock itself, at its reset or at its close (docs/bug-log.md, entry 012).
 fcn_add_platform_test(retained_resets STATUS 0 LABELS platform PROGRAM wdg_selftest
                       ARGS retained "${_dir}/selftest_retained_cell.bin")
 fcn_add_platform_test(retained_watchdog STATUS 0 LABELS platform PROGRAM wdg_selftest
@@ -208,12 +220,25 @@ fcn_add_platform_test(flash_waits STATUS 0 LABELS platform timing PROGRAM flash_
 fcn_add_platform_test(flash_task_wait STATUS 0 LABELS platform timing PROGRAM flash_selftest
                       ARGS task-wait "${_dir}/selftest_flash_task_wait.bin")
 # A cut under the scheduler ends the child through plat_reset() with status 12 and the model's
-# tear: the first, a middle and the last write of the script, and one past its end.
+# tear: the first, a middle and the last write of the script, and one past its end. A keeper of
+# the child's mappings outlives it, and the parent opens the cell and the flash at once: both
+# locks were released by the child itself (entry 012).
 foreach(_cut IN ITEMS 1:5 6:77 10:4242 11:1)
     string(REPLACE ":" "_" _name "${_cut}")
     fcn_add_platform_test(flash_task_cut_${_name} STATUS 0 LABELS platform PROGRAM flash_selftest
                           ARGS task-cut "${_dir}/selftest_flash_cut_${_name}.bin"
                           "${_dir}/selftest_flash_cut_${_name}.cell" ${_cut})
+endforeach()
+# A run ended from outside the scheduler while a task programs the flash, by the hardware
+# watchdog's thread (status 11) and by the shutdown guard (70): the lock is removed only once
+# the mapping of the file is private, nothing the task programs after that reaches the file,
+# and the parent opens the cell and the flash at once while a keeper still has the child's
+# mappings (entry 012).
+foreach(_end IN ITEMS watchdog guard)
+    fcn_add_platform_test(flash_end_while_writing_${_end} STATUS 0 LABELS platform
+                          PROGRAM flash_selftest
+                          ARGS end-while-writing ${_end} "${_dir}/selftest_flash_end_${_end}.bin"
+                          "${_dir}/selftest_flash_end_${_end}.cell")
 endforeach()
 
 # An orderly stop on SIGTERM must leave through main() with status 0.

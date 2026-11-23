@@ -592,7 +592,8 @@ killed process: the bench switched the board off) leads to a power-on at the nex
 reset**, `plat_reset()` writes its reason, counts the reset and seals the cell with a new CRC
 before the process exits; `plat_reset(PLAT_RESET_POWER_LOSS)` zeroes the cell instead, as a loss
 of supply would. A value that is no reset reason (`PLAT_RESET_POWER_ON` among them) is a
-programming error and resets as `PLAT_RESET_ASSERT`.
+programming error and resets as `PLAT_RESET_ASSERT`. On the host its last step before the exit
+is to release the locks of the cell's file and of the flash file (below).
 
 **On the host** ([platform/posix/posix_retained.c](../platform/posix/posix_retained.c)) the cell is
 the file named with `--retained-file PATH`, mapped with `mmap(MAP_SHARED)`: every store lands in
@@ -602,6 +603,17 @@ the next start takes as a power-on. The bench removes the file to cut the power.
 locked with `flock()` while a node runs; a second node that names it fails to start
 (`--retained-file PATH is in use by another node`, exit status 1), and so does a path that cannot
 be created (`cannot write --retained-file PATH`). Without the option every start is a power-on.
+
+The node releases that lock itself at every end it controls, and the flash file's with it: by
+the close at an orderly stop, and with `flock(LOCK_UN)` as the last step before `_exit()` at
+every reset (`plat_reset()`, whatever the reason and whichever thread resets) and in the
+shutdown guard, after the reset has been recorded: once the lock is released nothing writes
+into the cell. A lock left to the exit would last as long as the process's memory map, because
+the cell's mapping refers to the locked open file description, and another process can hold
+that map for a moment after the exit; the next start, which a bench makes as soon as it has seen
+the exit, then failed with "in use" ([bug 012](bug-log.md#012-the-next-start-found-the-files-still-locked-by-the-run-that-had-just-ended)).
+A killed node (SIGKILL) releases nothing: its lock goes when the kernel has taken its memory map
+down.
 
 The node reports what it found in its log (`reset cause WATCHDOG (retained cell: reset, 1 resets
 since power-on)`) and in its statistics (`reset`: `cause`, `cause_code`, `retained_cell`,
