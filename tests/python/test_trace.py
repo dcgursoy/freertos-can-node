@@ -1,11 +1,13 @@
 """The node's host-only trace as fcn_tools.trace reads it and takes it apart: the file, the tick's
-grid, the running intervals, the jobs of a task and the frames, on constructed traces whose answers
-are worked out by hand in the comments."""
+grid, the tick count against it, the running intervals, the jobs of a task and the frames, on
+constructed traces whose answers are worked out by hand in the comments, and on two slices of real
+traces (traces/, read by trace_slices) whose answers the comments take from the trace."""
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
+import trace_slices
 from fcn_tools import trace
 from fcn_tools.trace import (DELAY_UNTIL, FLAG_BLOCKED, READY, SENSOR, SWITCH, TICK_BASE, TX,
                              EVENT_DTYPE, HEADER, Trace)
@@ -95,6 +97,124 @@ def test_a_trace_without_a_base_or_with_two_periods_has_no_grid():
     with pytest.raises(trace.TraceError, match="period"):
         trace.tick_grid(make({"kind": TICK_BASE, "time_ns": 0, "value": 1, "arg": 1000},
                              {"kind": TICK_BASE, "time_ns": 0, "value": 9, "arg": 2000}))
+
+
+# ----------------------------------------------------------------- the count against the grid
+
+MS = 1_000_000
+#: Tick k due at k ms: base 1 ms for ticks from 1, period 1 ms.
+BASE = {"kind": TICK_BASE, "time_ns": MS, "value": 1, "arg": MS}
+
+
+def lead_of(*rows: dict, margin_ns: int = 100_000) -> trace.TickLead:
+    found = make(BASE, *rows)
+    return trace.tick_lead(found, trace.tick_grid(found), margin_ns)
+
+
+def test_a_count_seen_after_its_tick_was_due_is_not_ahead():
+    # Ticks 1, 2, 3 due at 1, 2, 3 ms; each seen after that.
+    lead = lead_of(ready(1_200_000, 2, tick=1), switch(1_250_000, 2, 1, tick=1),
+                   ready(2_100_000, 3, tick=2), switch(3_300_000, 3, 2, tick=3))
+    assert lead == trace.TickLead(counts_seen=3, seen_before_due=0, seen_beyond=0,
+                                  most_before_due_ns=0, longest_ns=0, longest_from_ns=0,
+                                  longest_counts=0)
+
+
+def test_a_count_seen_just_when_its_tick_was_due_is_on_the_grid():
+    # Count 2 first seen at 2 ms, the moment tick 2 was due: on the grid, not ahead.
+    lead = lead_of(ready(2_000_000, 2, tick=2), ready(3_100_000, 3, tick=3))
+    assert (lead.counts_seen, lead.seen_before_due, lead.longest_ns) == (2, 0, 0)
+
+
+def test_a_count_seen_before_its_tick_was_due_is_ahead_until_that_tick_was_due():
+    # Count 5 first seen at 4.4 ms, 0.6 ms before tick 5 was due (one ahead): a stretch from
+    # 4.4 ms to 5 ms. Count 6 seen at 6.2 ms is on time.
+    lead = lead_of(switch(4_100_000, 2, 1, tick=4), ready(4_400_000, 2, tick=5),
+                   switch(4_500_000, 2, 1, tick=5), ready(6_200_000, 3, tick=6))
+    assert lead == trace.TickLead(counts_seen=3, seen_before_due=1, seen_beyond=0,
+                                  most_before_due_ns=600_000, longest_ns=600_000,
+                                  longest_from_ns=4_400_000, longest_counts=1)
+
+
+def test_only_the_first_sight_of_a_count_counts():
+    # Count 5 first seen at 5.3 ms, after tick 5 was due; seen again later (still 5), and the
+    # events of the same time in their slot order: no count ahead.
+    lead = lead_of(ready(5_300_000, 2, tick=5), switch(5_300_000, 2, 1, tick=5),
+                   switch(5_900_000, 1, 2, tick=5), ready(6_100_000, 3, tick=6))
+    assert (lead.counts_seen, lead.seen_before_due, lead.longest_ns) == (2, 0, 0)
+
+
+def test_a_count_two_ahead_is_seen_more_than_a_period_before_its_tick_was_due():
+    # Tick 3 seen at 3.1 ms (on time), 4 at 3.3 ms (0.7 ms early), 5 at 3.4 ms (1.6 ms early:
+    # two ahead, beyond a period and the 100 us margin), 6 at 6.05 ms (on time again). The
+    # stretch: from 3.3 ms to tick 5's due time, 5 ms.
+    lead = lead_of(ready(3_100_000, 2, tick=3), ready(3_300_000, 3, tick=4),
+                   ready(3_400_000, 2, tick=5), switch(3_450_000, 2, 1, tick=5),
+                   ready(6_050_000, 3, tick=6))
+    assert lead == trace.TickLead(counts_seen=4, seen_before_due=2, seen_beyond=1,
+                                  most_before_due_ns=1_600_000, longest_ns=1_700_000,
+                                  longest_from_ns=3_300_000, longest_counts=2)
+
+
+def test_more_than_a_tick_early_means_beyond_the_period_and_the_margin():
+    # Count 5 seen at 3.95 ms: 1.05 ms before tick 5 was due.
+    rows = (ready(3_950_000, 2, tick=5),)
+    assert lead_of(*rows, margin_ns=100_000).seen_beyond == 0
+    assert lead_of(*rows, margin_ns=0).seen_beyond == 1
+
+
+def test_the_longest_stretch_is_the_longest_run_of_counts_seen_ahead():
+    # Stretch A: 2 at 1.5 ms, 3 at 2.6 ms (each ahead), 1.5 ms to tick 3's due time 3 ms.
+    # 4 at 4.1 ms is late and ends it. Stretch B: 10 at 9.2 ms, 11 at 9.3 ms (1.7 ms early),
+    # 12 at 11.5 ms, from 9.2 ms to 12 ms, 2.8 ms; ticks 5 to 9 were never seen. 13 at 13.4 ms
+    # is late. Stretch C, the last: 14 at 13.8 ms, 0.2 ms to tick 14's due time. B is the
+    # longest, neither the first nor the last.
+    lead = lead_of(ready(1_500_000, 2, tick=2), ready(2_600_000, 2, tick=3),
+                   ready(4_100_000, 2, tick=4), ready(9_200_000, 2, tick=10),
+                   ready(9_300_000, 3, tick=11), switch(11_500_000, 3, 2, tick=12),
+                   ready(13_400_000, 2, tick=13), ready(13_800_000, 3, tick=14))
+    assert lead == trace.TickLead(counts_seen=8, seen_before_due=6, seen_beyond=1,
+                                  most_before_due_ns=1_700_000, longest_ns=2_800_000,
+                                  longest_from_ns=9_200_000, longest_counts=3)
+
+
+def test_the_count_is_held_against_the_base_in_force_for_it():
+    # Ticks given up at count 10: from tick 10 on the base is 3 ms later, tick 10 due at 13 ms.
+    # Count 10 seen at 12.5 ms is ahead on that base (it would be late on the first).
+    later = {"kind": TICK_BASE, "time_ns": 4 * MS, "value": 10, "arg": MS}
+    lead = lead_of(later, ready(9_500_000, 2, tick=9), ready(12_500_000, 2, tick=10))
+    assert (lead.seen_before_due, lead.longest_ns) == (1, 500_000)
+
+
+def test_counts_before_the_first_tick_and_a_trace_without_counts_give_no_lead():
+    # Count 0 seen before the first tick was due is the kernel before its first tick.
+    assert lead_of(ready(500_000, 2, tick=0), switch(600_000, 2, 1, tick=0)) == \
+        trace.TickLead(0, 0, 0, 0, 0, 0, 0)
+    assert lead_of() == trace.TickLead(0, 0, 0, 0, 0, 0, 0)
+
+
+def test_a_real_trace_with_the_count_two_ahead_for_a_moment():
+    # traces/two-ahead.txt (with bug 011's fix) sees the 13 counts 3191 to 3203. Of them 3201
+    # and 3202 were first seen 629.2 us and 1519.6 us before their ticks were due (at 3199.371
+    # and 3199.480 ms after the base), and 3203 on time again; the stretch runs from 3201's sight
+    # to 3202's due time, 3201 ms.
+    found = trace_slices.load("two-ahead.txt")
+    grid = trace.tick_grid(found)
+    lead = trace.tick_lead(found, grid, 100_000)
+    assert lead.seen_beyond == 1 and lead.most_before_due_ns == 1_519_634
+    assert lead.longest_counts == 2 and lead.longest_ns == 1_629_171
+    assert lead.longest_from_ns - int(grid.bases_ns[0]) == 3_199_370_829
+    assert lead.counts_seen == 13 and lead.seen_before_due == 2
+
+
+def test_a_real_trace_of_the_old_give_back_has_every_count_ahead():
+    # traces/old-give-back.txt (before bug 011's fix): 80 ms in which every count the trace saw
+    # (80 of them) was seen before its tick was due, by less than a period: one ahead throughout.
+    found = trace_slices.load("old-give-back.txt")
+    lead = trace.tick_lead(found, trace.tick_grid(found), 100_000)
+    assert lead.counts_seen == lead.seen_before_due == lead.longest_counts == 80
+    assert lead.seen_beyond == 0 and lead.most_before_due_ns < MS
+    assert 79 * MS < lead.longest_ns < 80 * MS
 
 
 # --------------------------------------------------------------------------- running intervals

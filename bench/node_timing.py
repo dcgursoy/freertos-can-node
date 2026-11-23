@@ -26,11 +26,16 @@ statistics (run_time_us per task, stack_peak_bytes, the counters every check bel
             the CPU shares with and without the trace show what the trace costs the node
 
 From the trace (fcn_tools.trace, fcn_tools.latency):
+  tick lead the kernel's tick count against the tick's grid over each whole run: the counts
+            seen before their tick was due, and the longest stretch with the count ahead. A
+            count ahead is real (a tick made up for one that was only late, until it is given
+            back: EARLY_MARGIN_NS); a stretch longer than LEAD_LIMIT_PERIODS refuses the run
   release   per periodic task (sensor 10 ms, health 100 ms) and per job: the arrival (its
             period's tick as posix_tick.c had it due), the release (when the kernel's tick made
             the task ready), the start (its first switch-in), the end (its block in
             xTaskDelayUntil), the execution time between; for the processing task, released by
-            the sensor task's sample, the same from the sensor job's arrival
+            the sensor task's sample, the same from the sensor job's arrival; the jobs released
+            before their tick was due, and more than a tick early, are counted
   latency   per frame of the protected telemetry (BMS_PackStatus, BMS_CellVoltages1/2,
             BMS_Temperatures): from the release of the sensor job whose sample it carries to the
             model's end of frame (transmit done), and to the observer's kernel timestamp; the
@@ -112,10 +117,31 @@ SETTLE_S = 1.0
 #: late, the tick made up for it (platform/posix/posix_tick_plan.h) puts the tick count one ahead
 #: of the clock from the moment the late one is taken to the next tick boundary, where the tick
 #: thread skips a raise to give it back (docs/bug-log.md, entry 011), and a task woken at that
-#: count is released less than one period early. Further than one period and this margin before
-#: takes two late ticks taken in the same period (the count two ahead), or a trace whose tick does
-#: not match the kernel's: the analysis refuses it, since either needs a look.
+#: count is released less than one period early: a count one ahead reaches the task's tick no
+#: earlier than the tick before it was due. A release more than one period and this margin early
+#: (room for the clock reads: the base is read just after the port raised the first tick) takes
+#: the count two or more ahead, as when two late ticks are taken in the same period; one is
+#: given back at each of the following boundaries. Such releases are real, and are counted
+#: (released_more_than_a_tick_early) and kept in the distributions; so are the counts the trace
+#: saw that far ahead (tick_lead).
 EARLY_MARGIN_NS = 100_000
+
+#: The longest stretch with the tick count ahead of the grid (fcn_tools.trace.tick_lead()) that
+#: a correct node and a correct trace can give, in tick periods; a longer one refuses the run.
+#: With bug 011's fix the tick thread raises no tick at a boundary while the kernel already
+#: holds it and makes none up unless the count is behind (posix_tick_plan.h), so a count ahead
+#: rises only by ticks that were pending when it got ahead, one at most on each task's thread (a
+#: second SIGALRM sent to a thread that holds one merges with it): with the node's 8 tasks it is
+#: back on the grid within 8 periods. The stretch the trace measures can join two of them when
+#: the trace saw no new count on time in between; the verifier of bug 011 measured 0.7 to 1.9
+#: ms in 27 conditions of 24 s rehearsals of the fix (docs/measurements.md, node_timing). The old
+#: give-back of bug 011 kept the count ahead for 250 ms to 1.8 s in the same rehearsals, and a
+#: grid whose ticks fall due most of a period or more later than the kernel's (a TICK_BASE with
+#: too late a time) keeps nearly every count ahead for as long as that base holds: either is far
+#: above 50 periods. A base less late than that keeps ahead only the counts the trace sees soon
+#: enough after their tick, and is not always refused; nor is a trace that missed a base, whose
+#: counts look late (docs/measurements.md, node_timing).
+LEAD_LIMIT_PERIODS = 50
 
 US = 1e-3  # ns to µs
 
@@ -289,44 +315,73 @@ def in_window(values: np.ndarray, window: tuple[int, int] | None) -> np.ndarray:
     return (values >= window[0]) & (values <= window[1])
 
 
+def tick_lead_of(run: Run, grid: trace_module.TickGrid) -> trace_module.TickLead:
+    """The tick count against the grid over the whole run (fcn_tools.trace.tick_lead()).
+    BenchFailure for a stretch ahead longer than LEAD_LIMIT_PERIODS, which a node that gives its
+    made-up ticks back and a trace whose grid is the kernel's cannot give."""
+    assert run.trace is not None
+    lead = trace_module.tick_lead(run.trace, grid, EARLY_MARGIN_NS)
+    if lead.longest_ns > LEAD_LIMIT_PERIODS * grid.period_ns:
+        since = (lead.longest_from_ns - int(grid.bases_ns[0])) / 1e6
+        raise runner.BenchFailure(
+            f"{run.name}: the tick count ran ahead of the trace's grid for "
+            f"{lead.longest_ns / 1e6:.1f} ms ({lead.longest_counts} counts in a row seen before "
+            f"their tick was due, from {since:.1f} ms after the first tick), more than "
+            f"{LEAD_LIMIT_PERIODS} periods: a node that gives its made-up ticks back "
+            "(posix_tick_plan.h) is back on the grid within a few periods, so either the node "
+            "keeps them (as before bug 011's fix) or the trace's grid is not the kernel's (a "
+            "TICK_BASE event with too late a time)")
+    return lead
+
+
+def periodic_release(run: Run, name: str, grid: trace_module.TickGrid,
+                     intervals: trace_module.Intervals,
+                     window: tuple[int, int] | None) -> tuple[dict, trace_module.Jobs, np.ndarray]:
+    """The release figures of the periodic task `name` in the window (raw, in ns, for pooling
+    over runs), and every job of it in the trace with its arrival."""
+    trace = run.trace
+    assert trace is not None
+    period_ns = task_table(run.stats)[name]["period_us"] * 1000
+    jobs, merged = trace_module.periodic_jobs(trace, trace.number(name), intervals)
+    if len(jobs) == 0:
+        raise runner.BenchFailure(f"{run.name}: the trace has no job of {name}")
+    arrival = grid.due_ns(jobs.wake_tick)
+    lateness = jobs.release_ns - arrival
+    keep = in_window(jobs.release_ns, window)
+    entry = {
+        "early": int((lateness[keep] < 0).sum()),
+        # The tick count two or more ahead (see EARLY_MARGIN_NS).
+        "beyond_a_tick": int((lateness[keep] < -(grid.period_ns + EARLY_MARGIN_NS)).sum()),
+        "release_lateness": lateness[keep],
+        "start_lateness": jobs.start_ns[keep] - arrival[keep],
+        # From the release to the start: what the scheduler added, whatever the tick's error
+        # against the clock (a release before its tick was due included).
+        "start_after_release": jobs.start_ns[keep] - jobs.release_ns[keep],
+        "response": jobs.end_ns[keep] - arrival[keep],
+        "exec": jobs.exec_ns[keep],
+        # From one job's start to the next one's, less the period: the period jitter.
+        "period": np.diff(jobs.start_ns[keep]) - period_ns,
+        "jobs": int(keep.sum()), "merged": merged,
+        "late_ticks": int((jobs.release_tick[keep] != jobs.wake_tick[keep]).sum())}
+    return entry, jobs, arrival
+
+
 def analyse_trace(run: Run, window: tuple[int, int] | None) -> dict:
-    """Release, latency and CPU figures of one traced run (raw, in ns, for pooling over runs)."""
+    """Release, latency and CPU figures of one traced run (raw, in ns, for pooling over runs),
+    and the tick count against the grid over the whole run."""
     trace = run.trace
     assert trace is not None
     grid = trace_module.tick_grid(trace)
     intervals = trace_module.running_intervals(trace)
-    out: dict = {"release": {}, "latency": {}, "cpu_trace": {}, "checks": {}}
+    out: dict = {"release": {}, "latency": {}, "cpu_trace": {}, "checks": {},
+                 "tick_lead": tick_lead_of(run, grid)}
     table = task_table(run.stats)
 
     periodic: dict[str, tuple[trace_module.Jobs, np.ndarray]] = {}
     for name in PERIODIC:
-        period_ns = table[name]["period_us"] * 1000
-        number = trace.number(name)
-        jobs, merged = trace_module.periodic_jobs(trace, number, intervals)
-        if len(jobs) == 0:
-            raise runner.BenchFailure(f"{run.name}: the trace has no job of {name}")
-        arrival = grid.due_ns(jobs.wake_tick)
-        lateness = jobs.release_ns - arrival
-        if int(lateness.min()) < -(grid.period_ns + EARLY_MARGIN_NS):
-            raise runner.BenchFailure(f"{run.name}: {name} released {-int(lateness.min())} ns "
-                                      "before its tick was due, more than a tick: two late "
-                                      "ticks taken in one period (tick_give_backs), or the "
-                                      "trace's tick does not match the kernel's")
+        entry, jobs, arrival = periodic_release(run, name, grid, intervals, window)
+        out["release"][name] = entry
         periodic[name] = (jobs, arrival)
-        keep = in_window(jobs.release_ns, window)
-        out["release"][name] = {
-            "early": int((lateness[keep] < 0).sum()),
-            "release_lateness": jobs.release_ns[keep] - arrival[keep],
-            "start_lateness": jobs.start_ns[keep] - arrival[keep],
-            # From the release to the start: what the scheduler added, whatever the tick's
-            # error against the clock (a release before its tick was due included).
-            "start_after_release": jobs.start_ns[keep] - jobs.release_ns[keep],
-            "response": jobs.end_ns[keep] - arrival[keep],
-            "exec": jobs.exec_ns[keep],
-            # From one job's start to the next one's, less the period: the period jitter.
-            "period": np.diff(jobs.start_ns[keep]) - period_ns,
-            "jobs": int(keep.sum()), "merged": merged,
-            "late_ticks": int((jobs.release_tick[keep] != jobs.wake_tick[keep]).sum())}
 
     # The processing task: released by the sensor task's sample, measured from that job's
     # arrival; a stretch released by the health task (the pack mutex given) continues a job.
@@ -463,13 +518,42 @@ def pooled(parts: list[dict], key: str) -> np.ndarray:
     return np.concatenate(arrays) if arrays else np.zeros(0)
 
 
+#: How the stretch of tick_lead_data() is measured (fcn_tools.trace.tick_lead()).
+STRETCH_MEASURED = (
+    "consecutive counts each first seen before its tick was due, from the first sight of the "
+    "first to the due time of the last; the trace sees the count only at a SWITCH or READY "
+    "event, so a stretch begins at a sight, which can be after the count got ahead")
+
+
+def tick_lead_data(leads: list[trace_module.TickLead]) -> dict:
+    """The tick count against the grid, over the whole of each run of a condition: the counts
+    the trace saw added up over the runs, and the most and the longest of any run."""
+    longest = max(lead.longest_ns for lead in leads)
+    return {"counts_seen": sum(lead.counts_seen for lead in leads),
+            "seen_before_due": sum(lead.seen_before_due for lead in leads),
+            "seen_more_than_a_tick_before_due": sum(lead.seen_beyond for lead in leads),
+            "most_before_due_us": round(max(lead.most_before_due_ns for lead in leads) * US, 3),
+            "longest_stretch_ahead": results.figure(round(longest / 1e6, 3), "ms"),
+            "stretch": STRETCH_MEASURED}
+
+
+def release_counts(parts: list[dict]) -> dict:
+    """The jobs of a periodic task (periodic_release()'s entries of a condition's runs) released
+    at a later tick than the one they waited for (the scheduler was suspended at its tick),
+    released before their tick was due, and of those the ones released more than a period and
+    EARLY_MARGIN_NS early (the tick count two or more ahead), added up over the runs."""
+    return {"released_at_a_later_tick": sum(part["late_ticks"] for part in parts),
+            "released_before_due": sum(part["early"] for part in parts),
+            "released_more_than_a_tick_early": sum(part["beyond_a_tick"] for part in parts)}
+
+
 def condition_data(runs: list[Run], analyses: list[dict], observers: list[dict]) -> dict:
     """One condition of one transport: the figures pooled over its runs."""
     first = runs[0].stats
     responses = design_responses(first)
     table = task_table(first)
-    data: dict = {"runs": [], "release": {}, "latency": {}, "periods": {}, "cpu": {},
-                  "stack": []}
+    data: dict = {"runs": [], "tick_lead": {}, "release": {}, "latency": {}, "periods": {},
+                  "cpu": {}, "stack": []}
     for run, analysis in zip(runs, analyses):
         stats = run.stats
         data["runs"].append({
@@ -516,11 +600,9 @@ def condition_data(runs: list[Run], analyses: list[dict], observers: list[dict])
         if name == SAMPLE_TASK:
             entry["not_released_by_a_sample"] = sum(part["not_by_a_sample"] for part in parts)
         else:
-            # Released at a later tick than the one it waited for (the scheduler was suspended
-            # at its tick), and released before its tick was due (see EARLY_MARGIN_NS).
-            entry["released_at_a_later_tick"] = sum(part["late_ticks"] for part in parts)
-            entry["released_before_due"] = sum(part["early"] for part in parts)
+            entry.update(release_counts(parts))
         data["release"][name] = entry
+    data["tick_lead"] = tick_lead_data([analysis["tick_lead"] for analysis in analyses])
 
     for name in TELEMETRY.values():
         to_tx, to_tx_arrival, to_obs, to_obs_arrival, delivery = [], [], [], [], []
@@ -708,12 +790,15 @@ def summary_of(data: dict) -> dict:
             group[condition] = {
                 "sensor_release_lateness": entry["release"]["sensor"]["release_lateness"],
                 "sensor_start_lateness": entry["release"]["sensor"]["start_lateness"],
-                # The jobs released before their tick was due (the tick count one ahead of the
-                # clock until a made-up tick is given back, see EARLY_MARGIN_NS): the lateness
+                # The jobs released before their tick was due (the tick count ahead of the clock
+                # until a made-up tick is given back), and of those the ones more than a tick
+                # early (the count two or more ahead, see EARLY_MARGIN_NS): the lateness
                 # figures include them.
                 "sensor_jobs": results.figure(entry["release"]["sensor"]["jobs"], "jobs"),
                 "sensor_released_before_due": results.figure(
                     entry["release"]["sensor"]["released_before_due"], "jobs"),
+                "sensor_released_more_than_a_tick_early": results.figure(
+                    entry["release"]["sensor"]["released_more_than_a_tick_early"], "jobs"),
                 # From the release to the start, which the tick's error does not touch.
                 "sensor_start_after_release": entry["release"]["sensor"]["start_after_release"],
                 "health_start_lateness": entry["release"]["health"]["start_lateness"],
@@ -748,7 +833,7 @@ def config_of(args: argparse.Namespace, binaries: runner.Binaries) -> dict:
             "trace_events_per_s": TRACE_EVENTS_PER_S, "binaries": binaries.origin,
             "settle_s": SETTLE_S, "after_download_s": AFTER_DOWNLOAD_S,
             "clock_offset_noise_ns": capture.OFFSET_NOISE_NS, "early_margin_ns": EARLY_MARGIN_NS,
-            "max_latency_ns": latency.MAX_LATENCY_NS}
+            "lead_limit_periods": LEAD_LIMIT_PERIODS, "max_latency_ns": latency.MAX_LATENCY_NS}
 
 
 TIMING_NOTE = (
@@ -926,10 +1011,13 @@ def main(argv: list[str] | None = None) -> int:
             sensor = entry["release"]["sensor"]["start_lateness"]
             after = entry["release"]["sensor"]["start_after_release"]
             early = entry["release"]["sensor"]["released_before_due"]
+            beyond = entry["release"]["sensor"]["released_more_than_a_tick_early"]
+            stretch = entry["tick_lead"]["longest_stretch_ahead"]["value"]
             pack = entry["latency"]["BMS_PackStatus"]["sample_to_tx_done"]
             print(f"{transport:9s} {condition:8s} sensor start lateness p50 {sensor['p50']} us "
-                  f"max {sensor['max']} us (n {sensor['n']}, {early} released before due), "
-                  f"after release p50 {after['p50']} us max {after['max']} us; "
+                  f"max {sensor['max']} us (n {sensor['n']}, {early} released before due, "
+                  f"{beyond} more than a tick early), after release p50 {after['p50']} us max "
+                  f"{after['max']} us; tick count ahead {stretch} ms in a row at most; "
                   f"PackStatus sample to tx done p50 "
                   f"{pack['p50']} us max {pack['max']} us (n {pack['n']}); idle "
                   f"{entry['cpu']['idle_share'] * 100:.2f} %")

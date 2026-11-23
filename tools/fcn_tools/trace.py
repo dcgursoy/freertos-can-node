@@ -14,7 +14,8 @@ run_time_us count the same intervals.
 
 THE TICK. TICK_BASE events say when each tick was due: tick k at base + (k - 1) * period, for k
 from the event's first tick on, until a later base (posix_tick.c moves it when it gives ticks
-up). TickGrid.due_ns() is that function.
+up). TickGrid.due_ns() is that function. tick_lead() holds the kernel's tick count, which every
+SWITCH and READY event carries, against it.
 
 JOBS. A task's job begins when the kernel makes it ready from the blocked state (a READY event
 while the task was blocked: released), starts at its first switch-in after that, and ends when it
@@ -140,6 +141,66 @@ def tick_grid(trace: Trace) -> TickGrid:
     return TickGrid(first_ticks=bases["value"][order].astype(np.int64),
                     bases_ns=bases["time_ns"][order].astype(np.int64),
                     period_ns=int(periods[0]))
+
+
+@dataclass(frozen=True)
+class TickLead:
+    """The kernel's tick count against the grid as the trace saw it (tick_lead()): how many
+    counts it saw, how many of them before their tick was due (the count ahead of the clock),
+    how many more than a period and a margin before (two or more ahead), the most a count was
+    seen before its tick was due, and the longest stretch ahead: its length, the time of the
+    sight that began it and the counts in it (0 when no count was seen ahead). Times in ns on
+    CLOCK_MONOTONIC."""
+    counts_seen: int
+    seen_before_due: int
+    seen_beyond: int
+    most_before_due_ns: int
+    longest_ns: int
+    longest_from_ns: int
+    longest_counts: int
+
+
+def tick_lead(trace: Trace, grid: TickGrid, margin_ns: int = 0) -> TickLead:
+    """The kernel's tick count against `grid`, from the trace's SWITCH and READY events, which
+    carry the count at their time. Each count is taken at its first sight, the first of these
+    events that carries it. A count seen before its tick was due was ahead of the clock then: the
+    kernel held a tick that was not due yet. One seen more than a period and `margin_ns` before
+    was two or more ahead. A stretch ahead is a run of consecutive counts that were each first
+    seen before their tick was due, from the first sight of the first to the time the last one's
+    tick was due, when the clock had caught up with it. The trace sees the count only at these
+    events: a stretch begins at a sight, which can be after the count got ahead, and a count the
+    trace never saw (one followed by the next before any event) is taken to be like the counts
+    around it. Counts below the grid's first tick (0, before the kernel's first tick) are left
+    out."""
+    events = trace.of_kind(SWITCH, READY)
+    counts = events["value"].astype(np.int64)
+    times = events["time_ns"].astype(np.int64)
+    ticked = counts >= grid.first_ticks[0]
+    counts, times = counts[ticked], times[ticked]
+    if counts.size == 0:
+        return TickLead(0, 0, 0, 0, 0, 0, 0)
+    # A count's first sight: the first event that carries a count above every one before it.
+    first = np.ones(counts.size, dtype=bool)
+    first[1:] = counts[1:] > np.maximum.accumulate(counts)[:-1]
+    counts, times = counts[first], times[first]
+    due = grid.due_ns(counts)
+    before = due - times                      # > 0: seen before its tick was due
+    ahead = before > 0
+    out = {"counts_seen": int(counts.size), "seen_before_due": int(ahead.sum()),
+           "seen_beyond": int((before > grid.period_ns + margin_ns).sum()),
+           "most_before_due_ns": max(int(before.max()), 0),
+           "longest_ns": 0, "longest_from_ns": 0, "longest_counts": 0}
+    if ahead.any():
+        # The runs of counts ahead: where `ahead` turns on, and the last count before it turns
+        # off.
+        edges = np.diff(np.concatenate(([0], ahead.astype(np.int8), [0])))
+        starts = np.flatnonzero(edges == 1)
+        ends = np.flatnonzero(edges == -1) - 1
+        lengths = due[ends] - times[starts]
+        best = int(np.argmax(lengths))
+        out.update(longest_ns=int(lengths[best]), longest_from_ns=int(times[starts[best]]),
+                   longest_counts=int(ends[best] - starts[best] + 1))
+    return TickLead(**out)
 
 
 # ------------------------------------------------------------------------ running intervals

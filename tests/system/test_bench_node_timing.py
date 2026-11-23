@@ -59,6 +59,26 @@ def test_the_quick_run_writes_a_consistent_result(tmp_path, transport):
                         "execution"):
                 check_distribution(release[key], release["jobs"])
             assert release["raw_start_lateness"]["n"] == release["jobs"]
+        # A job released more than a tick early is one of those released before due, and they
+        # are among the jobs (how many there are is the host's matter).
+        for task in ("sensor", "health"):
+            release = entry["release"][task]
+            assert 0 <= release["released_more_than_a_tick_early"] \
+                <= release["released_before_due"] <= release["jobs"]
+        summary = result["summary"][transport][condition]
+        assert summary["sensor_released_more_than_a_tick_early"] == results.figure(
+            entry["release"]["sensor"]["released_more_than_a_tick_early"], "jobs")
+        # The tick count against the grid: the counts first seen ahead are among the counts
+        # seen, and a stretch ahead needs a count seen ahead; a result is written only when the
+        # longest is within the limit (the node's tick period is 1 ms).
+        lead = entry["tick_lead"]
+        assert 0 <= lead["seen_more_than_a_tick_before_due"] <= lead["seen_before_due"] \
+            <= lead["counts_seen"] and lead["counts_seen"] > 0
+        stretch = lead["longest_stretch_ahead"]
+        assert stretch["unit"] == "ms" and 0 <= stretch["value"]
+        if lead["seen_before_due"] == 0:
+            assert stretch["value"] == 0 and lead["most_before_due_us"] == 0
+        assert stretch["value"] <= result["config"]["lead_limit_periods"]
         # Every processing job counted was released by a sample, and a sensor job takes one
         # sample, or more after an overrun: no more processing jobs than that, but for a job at
         # an edge of the window. (Not fewer is the host's matter: a processing task held up past

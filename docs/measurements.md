@@ -247,20 +247,65 @@ participant of the UDP bus, keeps every frame with its kernel receive time on CL
   the raise if the kernel already holds that tick
   ([posix_tick_plan.h](../platform/posix/posix_tick_plan.h)). A late tick can therefore make a
   release early by less than one period, and only in the period in which it was taken; two late
-  ticks taken in the same period put the count two ahead, and the second is given back at the
-  boundary after. (Until
+  ticks taken in the same period put the count two ahead, one is given back at each of the two
+  boundaries after, and a task released at the second extra tick is released one to two periods
+  early. (Until
   [bug 011](bug-log.md#011-a-tick-made-up-for-a-late-one-kept-the-count-a-tick-ahead-of-the-clock)
   was fixed the give-back rarely worked and the count stayed a tick ahead for long stretches.)
-  The bench measures this as it is: such a job's release and start lateness are negative, and
-  the result counts these jobs (`released_before_due`, and in the summary
-  `sensor_released_before_due` of `sensor_jobs`) and, per run, the ticks the node made up and
-  gave back (`tick_catch_ups`, `tick_give_backs`, next to `tick_dropped`). Start after release
-  is not shifted by it, and is the figure for the kernel's own delay (to its decision, see
-  above); release and start lateness are the figures for the timing against the clock, the
-  tick's error included. A release more than one tick and 100 µs early would take two late ticks
-  in the same period, or a trace whose tick does not match the kernel's; the bench refuses it,
-  since either needs a look. The period deviation, between consecutive starts, is not shifted
-  by it, but for the two intervals on either side of a job released early.
+  The bench measures this as it is: such a job's release and start lateness are negative and
+  stay in the distributions, and the result counts these jobs (`released_before_due`) and, of
+  them, those released more than one period and 100 µs early (`EARLY_MARGIN_NS`, room for the
+  clock reads), which takes the count two or more ahead (`released_more_than_a_tick_early`); the
+  summary gives both for the sensor task (`sensor_released_before_due`,
+  `sensor_released_more_than_a_tick_early`, of `sensor_jobs`). Per run it gives the ticks the
+  node made up and gave back (`tick_catch_ups`, `tick_give_backs`, next to `tick_dropped`). Start
+  after release is not shifted by it, and is the figure for the kernel's own delay (to its
+  decision, see above); release and start lateness are the figures for the timing against the
+  clock, the tick's error included. The period deviation, between consecutive starts, is not
+  shifted by it, but for the two intervals on either side of a job released early.
+- *The tick count against the grid* (`tick_lead`, per condition, over the whole of each run, its
+  start included). Every SWITCH and READY event of the trace carries the kernel's tick count,
+  and each count is taken at its first sight
+  ([fcn_tools.trace.tick_lead()](../tools/fcn_tools/trace.py)): the counts the trace saw
+  (`counts_seen`), those first seen before their tick was due (`seen_before_due`: the count was
+  ahead of the clock), those seen more than a period and 100 µs before (two or more ahead,
+  `seen_more_than_a_tick_before_due`), the most a count was seen early (`most_before_due_us`),
+  and the longest stretch with the count ahead (`longest_stretch_ahead`, in ms): consecutive
+  counts each first seen before their tick was due, from the first sight of the first to the
+  time the last one's tick was due. The trace sees the count only at these events, so a stretch
+  begins at a sight, which can be after the count got ahead, and a count it never saw (followed
+  by the next before any event) is taken to be like the counts around it. Nor is a stretch a
+  time with the count ahead throughout: it goes on as long as each new count is first seen
+  before its tick was due, also where the count stood on the grid for a moment in between (with
+  the old give-back of bug 011, at every boundary until the tick raised there was taken).
+
+  With the fix of bug 011 a correct node cannot keep the count ahead for long. The tick thread
+  raises no tick at a boundary while the kernel already holds it, and makes none up unless the
+  count is behind, so a count ahead rises only by ticks that were already pending, at most one
+  on each task's thread (a second SIGALRM to a thread that holds one merges with it): with the
+  node's 8 tasks it is back on the grid within 8 periods. In the verification of that fix
+  (`--seconds 24 --downloads 1 --control-seconds 12` rehearsals on the laptop on battery, the
+  bench's traces read with this rule), the longest stretch per condition was 0.7 to 1.9 ms with
+  the fix (27 conditions of 5 runs) and 250 ms to 1.8 s with the old give-back (24 conditions of
+  4 runs); counts seen more than a period early came 9 times in 7 of the 27 conditions with the
+  fix. The bench refuses a run with a stretch longer than 50 periods (`LEAD_LIMIT_PERIODS`, in
+  `config` as `lead_limit_periods`), which a node that keeps its made-up ticks gives (each of the
+  24 conditions of the old give-back above). Before this rule the bench refused every release
+  more than a tick and 100 µs early instead: in those rehearsals 1 of the 4 runs of the old
+  give-back and 2 of the 5 runs of the fix, each for one sensor job 1.5 to 1.7 ms early with the
+  count two ahead. The two conditions of the fix that were refused so (both flood runs) have
+  longest stretches of 1.6 and 1.9 ms; their jobs are now counted.
+
+  The rule also refuses a trace whose grid falls due most of a period or more later than the
+  kernel's ticks (a TICK_BASE event with too late a time), but not every trace whose grid is
+  wrong. A base less late keeps ahead only the counts seen soon enough after their tick: moved
+  later in those two flood traces and in the download run of a `--seconds 24 --downloads 1
+  --control-seconds 12` rehearsal of this rule (on AC power), by 0.8 ms or more it was refused
+  in all three, by 0.2 or 0.5 ms only in the download run. Nor does the rule refuse a trace that
+  missed a base: a drop gives up at least 6 ticks and moves the base later, so the counts after
+  a missed base look late, not ahead. Left out one at a time, the two later bases of that
+  download run (34 ticks dropped) made the sensor's releases after them about 15 and 19 ms late,
+  which the bench reports as lateness and does not question.
 - *The processing task.* Its jobs are those the sensor task released (its sample's queue send),
   measured from that sensor job's arrival, which is how the schedulability check counts its
   response. A stretch released by the health task (the pack mutex given back) continues the job
@@ -864,15 +909,15 @@ and timers, which is exactly what they are meant to show; they say nothing about
   (node_timing), which says nothing about a Cortex-M3. Phase 7 builds the node for a Cortex-M3
   under QEMU, which is not cycle-accurate either. "Schedulable" therefore still means: schedulable
   as long as no job runs longer than its budget ([docs/architecture.md](architecture.md#schedulability)).
-- **A release can come up to a tick early.** As described under node_timing, a tick that
+- **A release can come before its tick was due.** As described under node_timing, a tick that
   posix_tick.c made up for one that was only late puts the kernel's tick count one tick ahead of
   CLOCK_MONOTONIC from the moment the late one is taken to the next tick boundary, where it is
   given back ([bug 011](bug-log.md#011-a-tick-made-up-for-a-late-one-kept-the-count-a-tick-ahead-of-the-clock)).
   A task released in that time is released less than a period before its tick was due;
-  node_timing counts those jobs. (Two late ticks taken in the same period put the count two
-  ahead, and a task released at the second up to two periods early; node_timing refuses a
-  release more than a tick and 100 µs early.) The platform's long-run tick period
-  (platform_timing) is not affected.
+  node_timing counts those jobs. Two late ticks taken in the same period put the count two
+  ahead, and a task released at the second one to two periods early; node_timing counts those
+  apart (`released_more_than_a_tick_early`) and gives the longest stretch with the count ahead
+  of the grid. The platform's long-run tick period (platform_timing) is not affected.
 - **Host stacks are not target stacks** (node_timing), **the recovery sequence is the model's**
   (bus_off), **the 2048-byte block is a projection** (isotp_throughput), and **the power-loss
   counts hold under lib/flash's tear model** (power_loss).
