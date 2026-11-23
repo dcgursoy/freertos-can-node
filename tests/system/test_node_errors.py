@@ -172,21 +172,22 @@ WIRE_QUEUE = 64
 # inside the window.
 LEAST_STALL_MS = ((LOSS_LIMIT * LEAST_FRAMES_PER_MS * WINDOW_S * 1000 - WIRE_QUEUE)
                   / FULL_BUS_FRAMES_PER_MS)
-# MAX_CATCH_UP_TICKS (platform/posix/posix_tick.c). While the receive task is held up with
-# frames waiting, the kernel counts at most one tick: ticks and the simulated interrupt are
-# taken on the thread of the running task, and the receive task, which outranks every other,
-# becomes the running task as soon as one of them has been taken. So the tick code's lag grows
-# by a tick per millisecond. It makes up a lag of up to 6 ticks and gives up all but one tick
-# of a longer one, at least 6 at a time: all at once when the tick thread runs again, if the
-# host held that thread up too, or 6 every 6 ms while the hold-up lasts, if it did not (the
-# last ticks of the lag are then made up, not given up). The part of a hold-up inside the
-# window alone takes the lag past 6, so at least one give-up is counted between the window's
-# start and the end of the run, however long before the window the hold-up began. (The run
-# does not end first: the health task ends it, on a tick, and the tick thread checks the lag,
-# and gives up one longer than 6, right after each tick it raises.) A whole-run count would add
-# the ticks given up at start-up and for the test's own stop; and 23, what a 24 ms hold-up
-# gives up when the tick thread is held up too, is no bound for a hold-up that the tick thread
-# ran through (18 or 24 then), nor for the part of one inside the window.
+# POSIX_TICK_MAX_CATCH_UP_TICKS (platform/posix/posix_tick_plan.h, which posix_tick.c carries
+# out). While the receive task is held up with frames waiting, the kernel counts at most one
+# tick: ticks and the simulated interrupt are taken on the thread of the running task, and the
+# receive task, which outranks every other, becomes the running task as soon as one of them
+# has been taken. So the tick code's lag grows by a tick per millisecond. It makes up a lag of
+# up to 6 ticks and gives up all but one tick of a longer one, at least 6 at a time: all at
+# once when the tick thread runs again, if the host held that thread up too, or 6 every 6 ms
+# while the hold-up lasts, if it did not (the last ticks of the lag are then made up, not
+# given up). The part of a hold-up inside the window alone takes the lag past 6, so at least one
+# give-up is counted between the window's start and the end of the run, however long before the
+# window the hold-up began. (The run does not end first: the health task ends it, on a tick,
+# and the tick thread checks the lag, and gives up one longer than 6, right after each tick it
+# raises.) A whole-run count would add the ticks given up at start-up and for the test's own
+# stop; and 23, what a 24 ms hold-up gives up when the tick thread is held up too, is no bound
+# for a hold-up that the tick thread ran through (18 or 24 then), nor for the part of one inside
+# the window.
 # All of this is about a hold-up in one piece. A host that holds the task up in many short
 # pieces, running it late at every wake-up, after the next tick but before the one after it,
 # is not covered: the kernel takes the tick that came meanwhile as soon as the task runs, and

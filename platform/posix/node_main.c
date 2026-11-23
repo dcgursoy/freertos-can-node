@@ -1205,13 +1205,14 @@ static bool write_stats(const char *path, const node_options_t *options, uint64_
     (void)fprintf(file,
                   "  \"tick\": {\"mode\": \"%s\", \"rate_hz\": %u, \"count\": %llu, "
                   "\"thread_seen\": %s, \"signals_sent\": %llu, \"catch_ups\": %llu, "
-                  "\"dropped\": %llu},\n",
+                  "\"dropped\": %llu, \"give_backs\": %llu},\n",
                   /* The mode the tick code ran in, not the option: a test can then tell
                    * whether the option took effect. */
                   (tick.mode == POSIX_TICK_LOCKED) ? "locked" : "stock",
                   (unsigned int)configTICK_RATE_HZ, (unsigned long long)stats->tick_count,
                   tick.tick_thread_seen ? "true" : "false", (unsigned long long)tick.signals_sent,
-                  (unsigned long long)tick.catch_ups, (unsigned long long)tick.dropped_ticks);
+                  (unsigned long long)tick.catch_ups, (unsigned long long)tick.dropped_ticks,
+                  (unsigned long long)tick.give_backs);
     (void)fprintf(file,
                   "  \"irq\": {\"mode\": \"%s\", \"raised\": %llu, \"signals_sent\": %llu, "
                   "\"serviced_by_signal\": %llu, \"serviced_by_tick\": %llu, "

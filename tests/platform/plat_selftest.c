@@ -9,6 +9,9 @@
  *                                      tick period is counted or reported as dropped, and
  *                                      few are dropped; stock: as slow as the unmodified port
  *   suspend <milliseconds>             the tick keeps time across a suspended scheduler
+ *   tick-late <rounds>                 a tick made up for one that was only late is given
+ *                                      back at the next boundary: the count is never ahead
+ *                                      of the clock for long
  *   irq <mode> <period_us> <seconds> <load>
  *                                      simulated interrupts from a free-running source:
  *                                      latency of every raise, sampled at the task's first
@@ -43,6 +46,7 @@
  * result. The fatal-path commands exit with the platform's reset status instead.
  */
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -197,10 +201,10 @@ static void init_platform(posix_tick_mode_t tick, posix_irq_mode_t irq, const ch
  * Only a wake-up later than WITNESS_LATE_NS counts as a stall. Under CPU contention the
  * witness is also kept waiting for a CPU, a few milliseconds at a time, and every such wait
  * would excuse ticks; a tick that is slow by itself could hide behind them. A stall shorter
- * than MAX_CATCH_UP_TICKS (6) periods drops no tick (posix_tick.c makes those up), so a
- * threshold of 5 ms leaves out only stalls too short to explain a drop. Measured on the
- * development laptop with the process on 2 CPUs shared with 2 busy loops, `tick locked 3` and
- * `suspend 20`: the unmodified code left at most 0.79 % unexcused (40 runs each, debug and
+ * than POSIX_TICK_MAX_CATCH_UP_TICKS (6) periods drops no tick (posix_tick_plan.h makes those
+ * up), so a threshold of 5 ms leaves out only stalls too short to explain a drop. Measured on
+ * the development laptop with the process on 2 CPUs shared with 2 busy loops, `tick locked 3`
+ * and `suspend 20`: the unmodified code left at most 0.79 % unexcused (40 runs each, debug and
  * asan, raw drops up to 6.8 %); a tick 3.3 % slow left at least 3.7 % unexcused in every one
  * of 10 runs (with a 2 ms threshold: 4.8 % at the median, against 6.1 % with 5 ms). A
  * threshold of 10 ms was too high: the unmodified code then missed the bound in 1 of 10 asan
@@ -426,7 +430,8 @@ static int cmd_tick(posix_tick_mode_t mode)
     /* What locked mode promises is an identity: every tick period of wall time is either
      * counted by the kernel or reported as dropped, so (counted + dropped) periods equal the
      * time that passed. It holds on a loaded host too, up to the few ticks that are being
-     * made up when the span ends (posix_tick.c, MAX_CATCH_UP_TICKS); a miss is a defect.
+     * made up or given back when the span ends (posix_tick_plan.h,
+     * POSIX_TICK_MAX_CATCH_UP_TICKS); a miss is a defect.
      * How many ticks were dropped is bounded separately (DROPPED_SHARE_MAX).
      * The stock mode is the port as it comes: it never makes up or drops a tick, and its
      * figure is simply how far the tick count fell behind. */
@@ -437,12 +442,13 @@ static int cmd_tick(posix_tick_mode_t mode)
     (void)printf("\"mode\": \"%s\", \"seconds\": %u, "
                  "\"nominal_tick_period_us\": %.1f, \"effective_tick_period_us\": %.3f, "
                  "\"drift_us\": %.1f, \"tick_thread_seen\": %s, \"signals_sent\": %llu, "
-                 "\"catch_ups\": %llu, \"dropped_ticks\": %llu, "
+                 "\"catch_ups\": %llu, \"dropped_ticks\": %llu, \"give_backs\": %llu, "
                  "\"unaccounted_time_percent\": %.3f, ",
                  (mode == POSIX_TICK_LOCKED) ? "locked" : "stock", (unsigned int)s_run_seconds,
                  nominal_us, period_us, drift_us, tick.tick_thread_seen ? "true" : "false",
                  (unsigned long long)tick.signals_sent, (unsigned long long)tick.catch_ups,
-                 (unsigned long long)tick.dropped_ticks, unaccounted * 100.0);
+                 (unsigned long long)tick.dropped_ticks, (unsigned long long)tick.give_backs,
+                 unaccounted * 100.0);
     print_drop_account(&drops, span_ticks);
     dump_samples(interval_ns, n - 1U);
     print_stats_us("wake_interval_us", interval_ns, n - 1U);
@@ -458,9 +464,13 @@ static int cmd_tick(posix_tick_mode_t mode)
         status = EXIT_FAILURE;
     }
 
-    if ((mode == POSIX_TICK_STOCK) && ((tick.catch_ups != 0U) || (tick.dropped_ticks != 0U))) {
-        (void)fprintf(stderr, "stock mode changed the tick: %llu catch-ups, %llu dropped\n",
-                      (unsigned long long)tick.catch_ups, (unsigned long long)tick.dropped_ticks);
+    if ((mode == POSIX_TICK_STOCK) &&
+        ((tick.catch_ups != 0U) || (tick.dropped_ticks != 0U) || (tick.give_backs != 0U))) {
+        (void)fprintf(stderr,
+                      "stock mode changed the tick: %llu catch-ups, %llu dropped, %llu given "
+                      "back\n",
+                      (unsigned long long)tick.catch_ups, (unsigned long long)tick.dropped_ticks,
+                      (unsigned long long)tick.give_backs);
         status = EXIT_FAILURE;
     }
 
@@ -511,10 +521,11 @@ static int cmd_tick(posix_tick_mode_t mode)
 #define SUSPEND_SETTLE_MS 50U
 #define SUSPEND_AFTER_MS  1000U
 /* Ticks. At any moment the tick count may trail the clock by the ticks that are still being
- * made up (posix_tick.c, MAX_CATCH_UP_TICKS = 6) plus the one just raised, and ticks given up
- * are booked when the tick thread next wakes, a period later. An interval between two readings
- * can therefore be off by 8 ticks either way without anything being wrong; on two CPUs shared
- * with two busy loops a tolerance of 3 failed 2 runs of 40 with 4 and 5 ticks. */
+ * made up (posix_tick_plan.h, POSIX_TICK_MAX_CATCH_UP_TICKS = 6) plus the one just raised, or
+ * lead it by a made-up tick that is given back at the next boundary, and ticks given up are
+ * booked when the tick thread next wakes, a period later. An interval between two readings can
+ * therefore be off by 8 ticks either way without anything being wrong; on two CPUs shared with
+ * two busy loops a tolerance of 3 failed 2 runs of 40 with 4 and 5 ticks. */
 #define SUSPEND_TOLERANCE 8U
 
 static uint32_t s_suspend_ms = 20U;
@@ -623,8 +634,9 @@ static int cmd_suspend(void)
                  (unsigned long long)(s_suspend_wall_after_ns / 1000ULL),
                  (unsigned long long)after.dropped);
     print_drop_account(&whole, span_ticks);
-    (void)printf("\"catch_ups\": %llu, \"dropped_ticks\": %llu}\n",
-                 (unsigned long long)tick.catch_ups, (unsigned long long)tick.dropped_ticks);
+    (void)printf("\"catch_ups\": %llu, \"dropped_ticks\": %llu, \"give_backs\": %llu}\n",
+                 (unsigned long long)tick.catch_ups, (unsigned long long)tick.dropped_ticks,
+                 (unsigned long long)tick.give_backs);
 
     status = worse(status, check_ticks_against_wall("while the scheduler was suspended",
                                                     s_suspend_ticks_during,
@@ -633,6 +645,214 @@ static int cmd_suspend(void)
                                                     s_suspend_ticks_after, s_suspend_wall_after_ns,
                                                     after.dropped));
     return worse(status, check_drop_account(&whole, span_ticks));
+}
+
+/* ------------------------------------------------------------------- a tick taken late */
+
+/*
+ * A tick that the port aims at a task's thread while that task is being switched out stays
+ * pending on the thread, with its signals blocked, until the task runs again. If that is more
+ * than a period later, the locked tick takes it for lost and makes it up; when the task runs
+ * again it takes the late one as well, and the kernel holds one tick more than the clock. The
+ * locked tick has to give it back at the next boundary (platform/posix/posix_tick_plan.h,
+ * docs/bug-log.md, entry 011).
+ *
+ * The test makes that happen on purpose, round after round. The holder task enters a critical
+ * section (the port blocks its thread's signals) and waits there until the tick is pending on
+ * its thread (sigpending()). Still inside, it notifies the runner, of a higher priority, and
+ * the kernel switches to the runner at once: the holder's thread is suspended with the tick
+ * pending. The runner works for LATE_RUNNER_NS, 3.5 periods, taking the ticks the port now
+ * sends to its own thread, while the locked tick makes up the one pending on the holder's.
+ * Then the runner blocks, the holder leaves its critical section and takes the late tick.
+ *
+ * From there the holder watches the tick count for LATE_WATCH_PERIODS periods. A count seen
+ * before its tick was due (posix_tick_due_ns()) was reached early: a task waiting for that
+ * tick would have been released early. The late tick itself is early (by about half a period),
+ * and the next tick may not be: given back at the boundary, the count is on the grid again. A
+ * count one ahead for good makes every tick after it early. Two early ticks in a row fail the
+ * test (status 1). This verdict does not depend on how promptly the host runs the threads: a
+ * tick raised late is late, not early, and a count that changed between two looks of the
+ * holder ends a row instead of making one.
+ *
+ * What depends on the host is whether the late tick is made up at all: the locked tick takes a
+ * tick for lost only if the tick it has just raised is not yet taken when it reads the count
+ * (posix_tick_plan.h). A round in which every raise to the runner was taken before that read
+ * makes nothing up and shows no early tick. At least a quarter of the rounds have to show one;
+ * fewer means the host did not let the test provoke what it tests (75).
+ */
+#define LATE_RUNNER_NS            3500000ULL
+#define LATE_WATCH_PERIODS        6U
+#define LATE_PENDING_WAIT_PERIODS 5U
+#define LATE_MAX_ROUNDS           1000U
+
+static uint32_t s_late_rounds = 50U;
+static TaskHandle_t s_late_runner;
+
+typedef struct {
+    bool pended;          /* the tick became pending on the holder's thread */
+    uint32_t early_ticks; /* counts the holder saw before their tick was due */
+    uint32_t early_row;   /* the most of them in a row */
+    uint64_t earliest_ns; /* how long before its tick was due the earliest was seen */
+} late_round_t;
+
+static late_round_t s_late[LATE_MAX_ROUNDS];
+
+static bool alarm_pending_here(void)
+{
+    sigset_t pending;
+
+    return (sigpending(&pending) == 0) && (sigismember(&pending, SIGALRM) == 1);
+}
+
+static void busy_until_ns(uint64_t until_ns)
+{
+    static volatile uint32_t sink;
+
+    while (plat_time_ns() < until_ns) {
+        sink++;
+    }
+}
+
+static void late_runner_task(void *arg)
+{
+    (void)arg;
+    plat_task_enter("runner");
+
+    for (;;) {
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        busy_until_ns(plat_time_ns() + LATE_RUNNER_NS);
+    }
+}
+
+/* Watches the tick count until `until_ns`: every count at its first sight, early or not. */
+static void watch_early(uint64_t until_ns, late_round_t *r)
+{
+    uint64_t last = 0U;
+    uint32_t row = 0U;
+
+    for (;;) {
+        /* The count first: it was reached before the time is read. */
+        const uint64_t count = (uint64_t)xTaskGetTickCount();
+        const uint64_t now = plat_time_ns();
+
+        if (count != last) {
+            const uint64_t due_ns = posix_tick_due_ns(count);
+
+            /* A count that went up by more than one hides the ones between: a new row. */
+            row = ((last != 0U) && (count == (last + 1U))) ? row : 0U;
+
+            if (now < due_ns) {
+                row++;
+                r->early_ticks++;
+                r->early_row = (row > r->early_row) ? row : r->early_row;
+                r->earliest_ns =
+                    ((due_ns - now) > r->earliest_ns) ? (due_ns - now) : r->earliest_ns;
+            } else {
+                row = 0U;
+            }
+
+            last = count;
+        }
+
+        if (now >= until_ns) {
+            break;
+        }
+    }
+}
+
+static void late_holder_task(void *arg)
+{
+    const uint64_t period_ns = 1000000000ULL / (uint64_t)configTICK_RATE_HZ;
+
+    (void)arg;
+    plat_task_enter("holder");
+    vTaskDelay(pdMS_TO_TICKS(SUSPEND_SETTLE_MS));
+
+    for (uint32_t round = 0U; round < s_late_rounds; round++) {
+        late_round_t *r = &s_late[round];
+
+        vTaskDelay(1U + (round % 3U));
+
+        const uint64_t give_up_ns = plat_time_ns() + (LATE_PENDING_WAIT_PERIODS * period_ns);
+
+        taskENTER_CRITICAL();
+
+        while (!r->pended && (plat_time_ns() < give_up_ns)) {
+            r->pended = alarm_pending_here();
+        }
+
+        if (r->pended) {
+            /* Switches to the runner at once: this thread is suspended with the tick pending. */
+            (void)xTaskNotifyGive(s_late_runner);
+        }
+
+        taskEXIT_CRITICAL(); /* the late tick is taken here */
+        watch_early(plat_time_ns() + (LATE_WATCH_PERIODS * period_ns), r);
+    }
+
+    plat_end_scheduler();
+
+    for (;;) {
+    }
+}
+
+static int cmd_tick_late(void)
+{
+    posix_tick_stats_t tick;
+    uint32_t pended = 0U;
+    uint32_t provoked = 0U;
+    uint32_t failed = 0U;
+    uint32_t early_ticks = 0U;
+    uint32_t longest_row = 0U;
+    uint64_t earliest_ns = 0U;
+    int status = EXIT_SUCCESS;
+
+    init_platform(POSIX_TICK_LOCKED, POSIX_IRQ_SIGNAL, NULL);
+    create_task(late_holder_task, "holder", 2U, NULL);
+    create_task(late_runner_task, "runner", 4U, &s_late_runner);
+    posix_platform_run();
+    posix_platform_shutdown();
+    posix_tick_get_stats(&tick);
+
+    for (uint32_t i = 0U; i < s_late_rounds; i++) {
+        const late_round_t *r = &s_late[i];
+
+        pended += r->pended ? 1U : 0U;
+        provoked += (r->early_ticks > 0U) ? 1U : 0U;
+        failed += (r->early_row > 1U) ? 1U : 0U;
+        early_ticks += r->early_ticks;
+        longest_row = (r->early_row > longest_row) ? r->early_row : longest_row;
+        earliest_ns = (r->earliest_ns > earliest_ns) ? r->earliest_ns : earliest_ns;
+    }
+
+    print_report_head("tick-late");
+    (void)printf("\"rounds\": %u, \"tick_pending_in_rounds\": %u, \"rounds_with_an_early_tick\": "
+                 "%u, \"rounds_with_early_ticks_in_a_row\": %u, \"early_ticks\": %u, "
+                 "\"most_early_ticks_in_a_row\": %u, \"earliest_us\": %.1f, "
+                 "\"catch_ups\": %llu, \"give_backs\": %llu, \"dropped_ticks\": %llu}\n",
+                 (unsigned int)s_late_rounds, (unsigned int)pended, (unsigned int)provoked,
+                 (unsigned int)failed, (unsigned int)early_ticks, (unsigned int)longest_row,
+                 (double)earliest_ns / 1e3, (unsigned long long)tick.catch_ups,
+                 (unsigned long long)tick.give_backs, (unsigned long long)tick.dropped_ticks);
+
+    if (failed > 0U) {
+        (void)fprintf(stderr,
+                      "after a late tick the count stayed ahead of the clock: %u ticks early in "
+                      "a row (at most 1: the late one, given back at the next boundary), in %u "
+                      "of %u rounds\n",
+                      (unsigned int)longest_row, (unsigned int)failed, (unsigned int)s_late_rounds);
+        status = EXIT_FAILURE;
+    } else if ((provoked * 4U) < s_late_rounds) {
+        (void)fprintf(stderr,
+                      "an early tick in only %u of %u rounds (the tick pending in %u): the host "
+                      "did not let the test provoke a tick made up for a late one\n",
+                      (unsigned int)provoked, (unsigned int)s_late_rounds, (unsigned int)pended);
+        status = TIMING_MISSED;
+    } else {
+        /* every round within the rule, enough of them provoked */
+    }
+
+    return status;
 }
 
 /* ---------------------------------------------------------------------- interrupt modes */
@@ -2360,6 +2580,7 @@ static int usage(void)
     (void)fprintf(stderr,
                   "usage: plat_selftest tick <locked|stock> <seconds>\n"
                   "       plat_selftest suspend <milliseconds>\n"
+                  "       plat_selftest tick-late <rounds, 1 to 1000>\n"
                   "       plat_selftest irq <mode> <period_us, 0: storm> <seconds> <load 0|1>\n"
                   "       plat_selftest irq-rounds <mode> <rounds>\n"
                   "       plat_selftest irq-lines <mode>\n"
@@ -2405,6 +2626,16 @@ int main(int argc, char **argv)
     if ((strcmp(command, "suspend") == 0) && (argc == 3)) {
         s_suspend_ms = (uint32_t)strtoul(argv[2], NULL, 10);
         return cmd_suspend();
+    }
+
+    if ((strcmp(command, "tick-late") == 0) && (argc == 3)) {
+        s_late_rounds = (uint32_t)strtoul(argv[2], NULL, 10);
+
+        if ((s_late_rounds == 0U) || (s_late_rounds > LATE_MAX_ROUNDS)) {
+            return usage();
+        }
+
+        return cmd_tick_late();
     }
 
     if ((strcmp(command, "irq") == 0) && (argc == 6) && parse_irq_mode(argv[2], &mode)) {

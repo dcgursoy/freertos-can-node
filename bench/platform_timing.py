@@ -95,6 +95,8 @@ def measure(binary: Path, seconds: int) -> tuple[dict, dict, set[str]]:
             "drift_over_run_us": report["drift_us"],
             "tick_signals_sent": report["signals_sent"],
             "catch_up_ticks": report["catch_ups"],
+            # Raises skipped because a made-up tick had been one too many (posix_tick_plan.h).
+            "given_back_ticks": report["give_backs"],
             "dropped_ticks": report["dropped_ticks"],
             "dropped_ticks_in_measured_span": report["dropped_ticks_in_span"],
             # Stalls of the whole process, seen by a witness thread outside the scheduler, and

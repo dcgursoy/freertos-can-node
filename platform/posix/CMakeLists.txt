@@ -3,12 +3,13 @@ find_package(Threads REQUIRED)
 
 # The parts of the host layer that know nothing about FreeRTOS: the CAN transports (SocketCAN,
 # UDP), the simulation control socket, the model of the sensor front end (plat_sensor.h), the
-# retained-RAM cell (plat_retained.h), the flash (plat_flash.h) and the ring of the CAN
-# controller's bus-off trace (posix_can_trace.h). A library of their own, so that their tests,
-# the bootloader and the tools link without a kernel. The host-only trace (posix_trace.h) is
-# here as well: it records for the models and for the kernel's hooks alike, and the objects of
-# fcn_platform_posix, which every program with a kernel links whole, always refer to it, so the
-# kernel's references to its hooks are always resolved.
+# retained-RAM cell (plat_retained.h), the flash (plat_flash.h), the ring of the CAN
+# controller's bus-off trace (posix_can_trace.h) and the decisions of the locked tick
+# (posix_tick_plan.h: pure functions, which posix_tick.c carries out). A library of their own,
+# so that their tests, the bootloader and the tools link without a kernel. The host-only trace
+# (posix_trace.h) is here as well: it records for the models and for the kernel's hooks alike,
+# and the objects of fcn_platform_posix, which every program with a kernel links whole, always
+# refer to it, so the kernel's references to its hooks are always resolved.
 add_library(fcn_host_io STATIC
     can_backend.c
     can_backend_socketcan.c
@@ -18,6 +19,7 @@ add_library(fcn_host_io STATIC
     posix_retained.c
     posix_sensor.c
     posix_sim.c
+    posix_tick_plan.c
     posix_trace.c)
 target_include_directories(fcn_host_io PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"

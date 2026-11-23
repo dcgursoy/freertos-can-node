@@ -13,24 +13,32 @@
  *   1. The sleep is relative, so every tick lasts the period plus the loop's own latency.
  *      results/platform_timing.json (tick.stock) has the measured size of the error.
  *   2. SIGALRM is not queued. A tick raised while the previous one is still pending merges
- *      with it, and the kernel counts one tick where two were due. (A tick aimed at a thread
- *      that was switched out in the meantime is not lost: it stays pending on that thread
- *      and is counted late, when its task next runs.)
+ *      with it, and the kernel counts one tick where two were due.
+ *
+ * A third makes a tick late rather than lost: a tick aimed at a thread whose task is being
+ * switched out stays pending on that thread, with its signals blocked, and is counted when its
+ * task next runs.
  *
  * The kernel is a pinned, unmodified submodule, so the correction is applied at link time:
  * the executables are linked with -Wl,--wrap=usleep, which routes the port's call to
  * __wrap_usleep() below. For the tick thread it replaces the relative sleep with a sleep
- * until an absolute deadline that is derived from the number of ticks the kernel has actually
- * counted. A lost tick therefore shortens the next sleep and is made up, and the tick count
- * tracks CLOCK_MONOTONIC instead of drifting away from it.
+ * until an absolute deadline on a grid of CLOCK_MONOTONIC (tick k due at base + (k - 1)
+ * periods), and it compares the number of ticks the kernel has actually counted with that
+ * grid. The decisions are posix_tick_plan.h's, which says each step: a tick missing after a
+ * period is taken for lost and made up at once; a made-up tick that turns out one too many,
+ * because the tick it replaced was only late, is given back at the next boundary, where the
+ * raise of a tick the kernel already holds is skipped. The tick count therefore tracks
+ * CLOCK_MONOTONIC instead of drifting away from it, and is ahead of it only by ticks taken
+ * late, each from the moment it is taken to the boundary that gives it back: the next one, or
+ * for a second taken in the same period the one after.
  *
  * What cannot be fixed from here: whenever the kernel's count trails the wall clock by more
- * than MAX_CATCH_UP_TICKS, the missing ticks are given up rather than replayed as a burst (a
- * burst would make every periodic task run back to back). That happens when the host does not
- * run the task threads for that long, for whatever reason: a loaded machine, a stopped
- * process, and equally a task that keeps a critical section for several milliseconds. The
- * ticks given up are counted as dropped_ticks and reported with every measurement, because a
- * run that dropped ticks did not keep time and has to say so.
+ * than POSIX_TICK_MAX_CATCH_UP_TICKS, the missing ticks are given up rather than replayed as a
+ * burst (a burst would make every periodic task run back to back). That happens when the host
+ * does not run the task threads for that long, for whatever reason: a loaded machine, a
+ * stopped process, and equally a task that keeps a critical section for several milliseconds.
+ * The ticks given up are counted as dropped_ticks and reported with every measurement, because
+ * a run that dropped ticks did not keep time and has to say so.
  */
 #include "posix_platform.h"
 
@@ -42,17 +50,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "posix_tick_plan.h"
 #include "posix_trace.h"
 #include "task.h"
 
 /* Name the port gives its tick thread (prvTimerTickHandler in port.c). */
 #define PORT_TICK_THREAD_NAME "Scheduler timer"
-
-/* Longest run of lost ticks that is made up one by one. */
-#define MAX_CATCH_UP_TICKS 6ULL
-
-/* Spacing of catch-up ticks: long enough for the previous signal to be handled. */
-#define CATCH_UP_SPACING_NS 100000L
 
 enum { ROLE_UNKNOWN = 0, ROLE_TICK_THREAD = 1, ROLE_OTHER = 2 };
 
@@ -61,7 +64,12 @@ static _Atomic bool s_tick_thread_seen;
 static _Atomic uint64_t s_signals_sent;
 static _Atomic uint64_t s_catch_ups;
 static _Atomic uint64_t s_dropped_ticks;
+static _Atomic uint64_t s_give_backs;
 static _Atomic uint64_t s_ticks_taken;
+
+/* The grid, published for posix_tick_due_ns(): written by the tick thread only. */
+static _Atomic uint64_t s_grid_base_ns;
+static _Atomic uint64_t s_grid_period_ns;
 
 /*
  * Called from the tick hook: one more tick interrupt has reached the kernel.
@@ -80,6 +88,12 @@ void posix_tick_taken(void)
     (void)atomic_fetch_add(&s_ticks_taken, 1U);
 }
 
+/* The number of tick interrupts the kernel has taken (see posix_tick_taken()). */
+static uint64_t ticks_counted(void)
+{
+    return atomic_load(&s_ticks_taken);
+}
+
 /* The names are fixed by the linker's --wrap convention. */
 int __real_usleep(useconds_t usec);
 int __wrap_usleep(useconds_t usec);
@@ -96,6 +110,14 @@ void posix_tick_get_stats(posix_tick_stats_t *out)
     out->signals_sent = atomic_load(&s_signals_sent);
     out->catch_ups = atomic_load(&s_catch_ups);
     out->dropped_ticks = atomic_load(&s_dropped_ticks);
+    out->give_backs = atomic_load(&s_give_backs);
+}
+
+uint64_t posix_tick_due_ns(uint64_t tick)
+{
+    const uint64_t period_ns = atomic_load(&s_grid_period_ns);
+
+    return (period_ns == 0U) ? 0U : (atomic_load(&s_grid_base_ns) + ((tick - 1U) * period_ns));
 }
 
 /* Called once, a little after start-up. If the wrapper below never saw the port's tick thread,
@@ -138,10 +160,19 @@ static int identify_caller(void)
     return role;
 }
 
+/* The grid has a new base from tick `first_tick` on: tell posix_tick_due_ns() and the trace. */
+static void publish_base(const posix_tick_plan_t *plan, uint64_t first_tick)
+{
+    atomic_store(&s_grid_base_ns, plan->base_ns);
+    atomic_store(&s_grid_period_ns, plan->period_ns);
+    posix_trace_tick_base(plan->base_ns, first_tick, (uint32_t)plan->period_ns);
+}
+
 int __wrap_usleep(useconds_t usec)
 {
     static _Thread_local int role = ROLE_UNKNOWN;
-    static _Thread_local uint64_t start_ns;
+    static _Thread_local posix_tick_plan_t plan;
+    static _Thread_local bool base_published = false;
 
     /* The variable is thread-local and static: it keeps its value between calls. */
     /* cppcheck-suppress knownConditionTrueFalse */
@@ -157,7 +188,8 @@ int __wrap_usleep(useconds_t usec)
                 (void)prctl(PR_SET_TIMERSLACK, 1UL);
             }
 
-            start_ns = posix_monotonic_ns();
+            /* The port has just raised its first tick: tick 1 is due now. */
+            posix_tick_plan_init(&plan, posix_monotonic_ns(), (uint64_t)usec * 1000ULL);
             atomic_store(&s_tick_thread_seen, true);
         }
     }
@@ -172,51 +204,48 @@ int __wrap_usleep(useconds_t usec)
         return __real_usleep(usec);
     }
 
-    /* The port has just raised a tick. `expected` is the number of ticks that should have
-     * been taken by now (the first one was raised at start_ns), `counted` the number of tick
-     * interrupts the kernel has taken (see posix_tick_taken() for why that is not the tick
-     * count). The tick that was just raised may not have been taken yet, so the kernel is
-     * only behind if it trails by more than that one. */
-    const uint64_t period_ns = (uint64_t)usec * 1000ULL;
-    const uint64_t now_ns = posix_monotonic_ns();
-    uint64_t expected = ((now_ns - start_ns) / period_ns) + 1ULL;
-    const uint64_t counted = atomic_load(&s_ticks_taken);
-    static _Thread_local bool base_traced = false;
-
-    /* The host-only trace (posix_trace.h) learns when every tick is due: tick k at start_ns +
+    /* The host-only trace (posix_trace.h) learns when every tick is due: tick k at the base +
      * (k - 1) periods, from here until a drop moves the base. */
-    if (!base_traced) {
-        base_traced = true;
-        posix_trace_tick_base(start_ns, 1U, (uint32_t)period_ns);
+    if (!base_published) {
+        base_published = true;
+        publish_base(&plan, 1U);
     }
 
-    if ((counted + 1ULL) < expected) {
-        const uint64_t lag = expected - counted;
+    /* The port has just raised a tick. The plan (posix_tick_plan.h) decides what follows;
+     * this loop only carries it out and counts. The clock is read before the count, so that
+     * a tick taken between the two reads is not taken for missing. */
+    const uint64_t now_ns = posix_monotonic_ns();
+    uint64_t counted = ticks_counted();
+    posix_tick_step_t step = posix_tick_plan_after_raise(&plan, now_ns, counted);
 
-        if (lag > MAX_CATCH_UP_TICKS) {
-            /* The task threads did not run for too long to make up. Shift the time base
-             * instead of bursting. */
-            const uint64_t excess = lag - 1ULL;
-
-            start_ns += excess * period_ns;
-            expected -= excess;
-            (void)atomic_fetch_add(&s_dropped_ticks, excess);
+    for (;;) {
+        if (step.dropped > 0U) {
+            (void)atomic_fetch_add(&s_dropped_ticks, step.dropped);
             /* From the tick after the ones counted, every tick is due on the new base. */
-            posix_trace_tick_base(start_ns, counted + 1ULL, (uint32_t)period_ns);
-        } else {
-            /* A tick was lost: return quickly so the port raises another one. */
-            const struct timespec spacing = {0, CATCH_UP_SPACING_NS};
-
-            (void)atomic_fetch_add(&s_catch_ups, 1U);
-            (void)nanosleep(&spacing, NULL);
-            return 0;
+            publish_base(&plan, counted + 1U);
         }
+
+        if (step.given_back) {
+            /* The kernel already held the tick due here: no raise, on to the next boundary. */
+            (void)atomic_fetch_add(&s_give_backs, 1U);
+        }
+
+        if (step.action != POSIX_TICK_SLEEP) {
+            break;
+        }
+
+        sleep_until_ns(step.deadline_ns);
+        counted = ticks_counted();
+        step = posix_tick_plan_at_deadline(&plan, counted);
     }
 
-    /* Sleep to the boundary of the next tick. If a made-up tick turned out to be one too
-     * many, `counted` is ahead and the sleep is one period longer, which gives it back. */
-    const uint64_t next = (counted > expected) ? counted : expected;
+    if (step.action == POSIX_TICK_CATCH_UP) {
+        /* A tick was lost: return soon so that the port raises another one. */
+        const struct timespec spacing = {0, (long)POSIX_TICK_CATCH_UP_SPACING_NS};
 
-    sleep_until_ns(start_ns + (next * period_ns));
+        (void)atomic_fetch_add(&s_catch_ups, 1U);
+        (void)nanosleep(&spacing, NULL);
+    }
+
     return 0;
 }

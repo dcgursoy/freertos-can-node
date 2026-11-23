@@ -74,8 +74,13 @@ endfunction()
 #   test_posix_retained the retained-RAM cell: starts and resets played by the test
 #   test_posix_can_trace the ring and the text of the CAN controller's bus-off trace, and the
 #                      cost of a record (printed, not judged)
+#   test_posix_tick_plan the locked tick's decisions (posix_tick_plan.h) against a model of the
+#                      tick thread and the kernel: lost, late and given-back ticks, stalls,
+#                      random orders of events (fixed seeds), independent of the host's timing
+#                      (docs/bug-log.md, entry 011)
 find_package(Threads REQUIRED)
-foreach(_test IN ITEMS can_backend posix_sim posix_sensor posix_retained posix_can_trace)
+foreach(_test IN ITEMS can_backend posix_sim posix_sensor posix_retained posix_can_trace
+                       posix_tick_plan)
     add_executable(test_${_test} test_${_test}.c)
     target_compile_definitions(test_${_test} PRIVATE _POSIX_C_SOURCE=200809L)
     target_link_libraries(test_${_test} PRIVATE fcn_host_io unity Threads::Threads)
@@ -115,6 +120,11 @@ set(_dir "${CMAKE_CURRENT_BINARY_DIR}")
 fcn_add_platform_test(tick_locked STATUS 0 LABELS platform timing ARGS tick locked 3)
 fcn_add_platform_test(tick_stock STATUS 0 LABELS platform ARGS tick stock 1)
 fcn_add_platform_test(tick_suspended_scheduler STATUS 0 LABELS platform timing ARGS suspend 20)
+# A tick pending on a thread that was switched out, made up and then taken late, is given back
+# at the next boundary: never two ticks early in a row (docs/bug-log.md, entry 011). Timing:
+# whether the late tick is made up at all depends on when the host delivers the tick signal,
+# and a run that provoked too few is status 75.
+fcn_add_platform_test(tick_late STATUS 0 LABELS platform timing ARGS tick-late 50)
 
 # Simulated interrupts from a free-running source, with the load task. "signal-only" switches
 # the tick hook's safety net off: the signal path has to serve every interrupt alone. Period 0

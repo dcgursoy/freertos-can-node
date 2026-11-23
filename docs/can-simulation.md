@@ -270,6 +270,11 @@ has it together with `rx_fifo_overruns`, so a test can count both from the same 
 receive-path test of
 [bug-log entry 007](bug-log.md#007-the-receive-task-took-fewer-frames-per-tick-than-a-full-1-mbits-bus-delivers)
 judges the receive FIFO's losses in its window by the ticks dropped from the window's start on.
+The statistics also count the ticks made up (`tick.catch_ups`) and the raises skipped at a tick
+boundary because a made-up tick had turned out one too many, the tick it replaced being only
+late (`tick.give_backs`,
+[bug-log entry 011](bug-log.md#011-a-tick-made-up-for-a-late-one-kept-the-count-a-tick-ahead-of-the-clock));
+neither is a dropped tick, and neither shows in `ticks_dropped`.
 
 ### The bus-off trace
 

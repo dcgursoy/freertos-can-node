@@ -239,24 +239,28 @@ participant of the UDP bus, keeps every frame with its kernel receive time on CL
   tick handler as its release unless can_rx is ready or the scheduler is suspended. It is in the
   job's execution and response instead, as it is in FreeRTOS's own run-time counter, which counts
   between the same switches.
-- *Releases before they were due.* posix_tick.c makes up a tick it takes for lost; when that tick
-  was only late (pending on a task's thread that was switched out), the kernel's tick count runs
-  one tick ahead of CLOCK_MONOTONIC, and its give-back (one period longer to the next tick) works
-  only when the wrapper sees the tick it has just raised already taken. Until then every task is
-  released up to one tick before its tick was due. In two rehearsals of the verification on an
-  idle machine that was 2 % to 43 % of the sensor jobs of a 24 s run (idle, flood and download,
-  on both transports), and in one quick run 95 of the 98 jobs of a download's window, whose
-  median start lateness was then −0.84 ms. The bench measures this as it is: the release and
-  start lateness then lie near −1 ms + the usual lateness, and the result counts these jobs
-  (`released_before_due`, and
-  in the summary `sensor_released_before_due` of `sensor_jobs`). Start after release is not
-  shifted by it, and is the figure for the kernel's own delay (to its decision, see above);
-  release and start lateness are the figures for the timing against the clock, the tick's error
-  included. A release more than
-  one tick and 100 µs early would mean that the trace and the kernel disagree, and the bench
-  refuses it. The period deviation, between consecutive starts, is not shifted by it, but for the
-  one period in which the count jumps ahead or back. (A fix belongs to posix_tick.c and is open;
-  see [the limits](#what-the-figures-do-not-say).)
+- *Releases before they were due.* posix_tick.c makes up a tick it takes for lost. When that
+  tick was only late (pending on the thread of a task that was switched out), the kernel holds
+  one tick more than the clock from the moment the late one is taken, and a task released at
+  that count is released before its tick was due. The tick thread gives the tick back at the
+  next tick boundary: there, before it raises the next tick, it reads the count again and skips
+  the raise if the kernel already holds that tick
+  ([posix_tick_plan.h](../platform/posix/posix_tick_plan.h)). A late tick can therefore make a
+  release early by less than one period, and only in the period in which it was taken; two late
+  ticks taken in the same period put the count two ahead, and the second is given back at the
+  boundary after. (Until
+  [bug 011](bug-log.md#011-a-tick-made-up-for-a-late-one-kept-the-count-a-tick-ahead-of-the-clock)
+  was fixed the give-back rarely worked and the count stayed a tick ahead for long stretches.)
+  The bench measures this as it is: such a job's release and start lateness are negative, and
+  the result counts these jobs (`released_before_due`, and in the summary
+  `sensor_released_before_due` of `sensor_jobs`) and, per run, the ticks the node made up and
+  gave back (`tick_catch_ups`, `tick_give_backs`, next to `tick_dropped`). Start after release
+  is not shifted by it, and is the figure for the kernel's own delay (to its decision, see
+  above); release and start lateness are the figures for the timing against the clock, the
+  tick's error included. A release more than one tick and 100 µs early would take two late ticks
+  in the same period, or a trace whose tick does not match the kernel's; the bench refuses it,
+  since either needs a look. The period deviation, between consecutive starts, is not shifted
+  by it, but for the two intervals on either side of a job released early.
 - *The processing task.* Its jobs are those the sensor task released (its sample's queue send),
   measured from that sensor job's arrival, which is how the schedulability check counts its
   response. A stretch released by the health task (the pack mutex given back) continues the job
@@ -337,9 +341,14 @@ carries which sample, the jobs, the gaps. The times do not.
 - The execution times and CPU shares are x86-64 times and say nothing about a Cortex-M3; the
   task table's budgets stay design figures (see [the limits](#what-the-figures-do-not-say)).
 - The stack depths are those of host threads with x86-64 frames. They include the signal frames
-  of the port's tick and interrupt signals, which land on whichever task runs; on a Cortex-M3
-  exceptions use the main stack, not the task's, so a host peak above a task's configured size
-  is no overflow of the target.
+  of the port's tick and interrupt signals, which land on whichever task runs and hold the
+  thread's whole register and floating-point state. A Cortex-M3 takes far less from a task's
+  stack: on exception entry the hardware stacks an 8-word frame (32 bytes, no FPU, and one word
+  of padding when it realigns the stack to 8 bytes) onto the stack in use, under FreeRTOS the
+  task's process stack (PSP); the handler then runs on the main stack (MSP), and so does any
+  exception nested in it; a context switch saves r4 to r11, 8 words more, on the task's stack. A
+  host peak above a task's configured size is therefore no overflow of the target; the target's
+  own high-water marks are for phase 7's Cortex-M3 build.
 
 **Command.** `python bench/node_timing.py`; `--transport`, `--seconds`, `--downloads`,
 `--control-seconds`, `--flood-load` and `--sensor-seed` change the plan, and each is recorded in
@@ -829,8 +838,8 @@ self-test (tests/platform/plat_selftest, its own process):
 1. *Tick accuracy.* The FreeRTOS POSIX port makes its tick with a relative sleep and so runs slow
    against the wall clock; platform/posix/posix_tick.c locks the tick count to CLOCK_MONOTONIC.
    Both are measured with a 10 ms periodic task: the effective tick period, the drift over the run,
-   the catch-up and dropped ticks, the stalls of the whole process a witness thread saw, and the
-   interval between the task's wake-ups.
+   the catch-up, given-back and dropped ticks, the stalls of the whole process a witness thread
+   saw, and the interval between the task's wake-ups.
 2. *Simulated interrupt latency.* From a peripheral model raising an interrupt line to the task it
    wakes, for every raise (one every 250 µs, about the frame rate of a saturated 500 kbit/s bus),
    with signal delivery and with tick-hook polling (platform/posix/posix_irq.c), while a
@@ -855,11 +864,15 @@ and timers, which is exactly what they are meant to show; they say nothing about
   (node_timing), which says nothing about a Cortex-M3. Phase 7 builds the node for a Cortex-M3
   under QEMU, which is not cycle-accurate either. "Schedulable" therefore still means: schedulable
   as long as no job runs longer than its budget ([docs/architecture.md](architecture.md#schedulability)).
-- **The tick can run one tick ahead.** As described under node_timing, posix_tick.c's catch-up can
-  leave the kernel's tick count one tick ahead of CLOCK_MONOTONIC for long stretches, so releases
-  measured against the wall clock's grid come up to a tick early. node_timing reports it; the
-  platform's long-run tick period (platform_timing) is not affected. A fix belongs to posix_tick.c
-  and changes the node's timing; it is open for the lead.
+- **A release can come up to a tick early.** As described under node_timing, a tick that
+  posix_tick.c made up for one that was only late puts the kernel's tick count one tick ahead of
+  CLOCK_MONOTONIC from the moment the late one is taken to the next tick boundary, where it is
+  given back ([bug 011](bug-log.md#011-a-tick-made-up-for-a-late-one-kept-the-count-a-tick-ahead-of-the-clock)).
+  A task released in that time is released less than a period before its tick was due;
+  node_timing counts those jobs. (Two late ticks taken in the same period put the count two
+  ahead, and a task released at the second up to two periods early; node_timing refuses a
+  release more than a tick and 100 µs early.) The platform's long-run tick period
+  (platform_timing) is not affected.
 - **Host stacks are not target stacks** (node_timing), **the recovery sequence is the model's**
   (bus_off), **the 2048-byte block is a projection** (isotp_throughput), and **the power-loss
   counts hold under lib/flash's tear model** (power_loss).

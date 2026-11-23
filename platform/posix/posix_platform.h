@@ -119,9 +119,17 @@ typedef struct {
     uint64_t signals_sent;  /**< tick signals the port's thread has raised */
     uint64_t catch_ups;     /**< extra signals sent to make up for a lost tick */
     uint64_t dropped_ticks; /**< ticks given up because the count had fallen too far behind */
+    uint64_t give_backs;    /**< raises skipped because the kernel already held that tick: a
+                                 made-up tick that was one too many (posix_tick_plan.h) */
 } posix_tick_stats_t;
 
 void posix_tick_get_stats(posix_tick_stats_t *out);
+
+/** When tick `tick` (a tick count, 1 or more) is due on the locked tick's grid: the base the
+ *  host-only trace records (posix_trace_tick_base()) plus (tick - 1) periods. 0 in stock mode,
+ *  which keeps no grid, and before the port's tick thread first ran. Any thread; the base it
+ *  reads moves only when ticks are given up. */
+uint64_t posix_tick_due_ns(uint64_t tick);
 
 /* ------------------------------------------------------------- the CAN controller hardware */
 

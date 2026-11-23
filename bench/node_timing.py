@@ -109,10 +109,12 @@ SETTLE_S = 1.0
 
 
 #: A release can come before its tick was due: when a tick the platform took for lost was only
-#: late, its catch-up tick (posix_tick.c) puts the tick count one ahead of the clock until the
-#: next sleep gives the period back, and a task woken at that count is released up to one period
-#: early. Further than one period and this margin before, and the trace's tick and the kernel's
-#: disagree: the analysis refuses it.
+#: late, the tick made up for it (platform/posix/posix_tick_plan.h) puts the tick count one ahead
+#: of the clock from the moment the late one is taken to the next tick boundary, where the tick
+#: thread skips a raise to give it back (docs/bug-log.md, entry 011), and a task woken at that
+#: count is released less than one period early. Further than one period and this margin before
+#: takes two late ticks taken in the same period (the count two ahead), or a trace whose tick does
+#: not match the kernel's: the analysis refuses it, since either needs a look.
 EARLY_MARGIN_NS = 100_000
 
 US = 1e-3  # ns to µs
@@ -307,8 +309,9 @@ def analyse_trace(run: Run, window: tuple[int, int] | None) -> dict:
         lateness = jobs.release_ns - arrival
         if int(lateness.min()) < -(grid.period_ns + EARLY_MARGIN_NS):
             raise runner.BenchFailure(f"{run.name}: {name} released {-int(lateness.min())} ns "
-                                      "before its tick was due, more than a tick: the trace's "
-                                      "tick does not match the kernel's")
+                                      "before its tick was due, more than a tick: two late "
+                                      "ticks taken in one period (tick_give_backs), or the "
+                                      "trace's tick does not match the kernel's")
         periodic[name] = (jobs, arrival)
         keep = in_window(jobs.release_ns, window)
         out["release"][name] = {
@@ -481,6 +484,7 @@ def condition_data(runs: list[Run], analyses: list[dict], observers: list[dict])
                                       * stats["trace"]["event_cost_ns"] * 1e-9, 7),
             "analysis_window_s": round(analysis["cpu_trace_window_ns"] / 1e9, 3),
             "tick_dropped": stats["tick"]["dropped"], "tick_catch_ups": stats["tick"]["catch_ups"],
+            "tick_give_backs": stats["tick"]["give_backs"],
             "sensor_overruns": stats["sensor"]["overruns"],
             "sensor_skipped_periods": stats["sensor"]["skipped_periods"],
             "overrun_samples_in_trace": analysis["checks"]["overrun_samples"],
@@ -704,8 +708,9 @@ def summary_of(data: dict) -> dict:
             group[condition] = {
                 "sensor_release_lateness": entry["release"]["sensor"]["release_lateness"],
                 "sensor_start_lateness": entry["release"]["sensor"]["start_lateness"],
-                # The jobs released before their tick was due (posix_tick.c's tick count one
-                # ahead of the clock, see EARLY_MARGIN_NS): the lateness figures include them.
+                # The jobs released before their tick was due (the tick count one ahead of the
+                # clock until a made-up tick is given back, see EARLY_MARGIN_NS): the lateness
+                # figures include them.
                 "sensor_jobs": results.figure(entry["release"]["sensor"]["jobs"], "jobs"),
                 "sensor_released_before_due": results.figure(
                     entry["release"]["sensor"]["released_before_due"], "jobs"),
@@ -791,7 +796,8 @@ def plot(result: dict, path: Path) -> None:
                 label=f"{condition}: p50 {entry['start_lateness']['p50']} µs, max "
                       f"{entry['start_lateness']['max']} µs (n {entry['start_lateness']['n']})")
     ax.set_yscale("log")
-    # Symmetric: a start can come before its tick was due (a catch-up tick, posix_tick.c).
+    # Symmetric: a start can come before its tick was due (a tick made up for one that was only
+    # late, until it is given back: posix_tick_plan.h).
     ax.set_xscale("symlog", linthresh=10.0)
     ax.set_title("Sensor task (10 ms): start after its tick was due")
     ax.set_xlabel("start lateness (µs, log scale beyond ±10 µs)")

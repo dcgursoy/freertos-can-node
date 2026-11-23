@@ -167,8 +167,8 @@ def test_a_stalled_host_is_accounted_as_dropped_ticks(start_node, ports):
     finally:
         bus.shutdown()
     # The host does not run the node for 1.5 s: far more ticks than the tick code makes up
-    # (MAX_CATCH_UP_TICKS in platform/posix/posix_tick.c, 6), so it gives them up as dropped,
-    # all at once when the node runs again.
+    # (POSIX_TICK_MAX_CATCH_UP_TICKS in platform/posix/posix_tick_plan.h, 6), so it gives them
+    # up as dropped, all at once when the node runs again.
     with node.sim() as sim:
         before = sim.can_status()["ticks_dropped"]
         node.send_signal(signal.SIGSTOP)
@@ -243,8 +243,9 @@ def test_the_alternative_platform_modes_still_run(start_node, option, value):
     # The tick statistics report the mode the tick code ran in, not the option echoed back.
     assert tick["mode"] == ("stock" if value == "stock" else "locked")
     if value == "stock":
-        # The unmodified port never makes up for a tick and never gives one up.
-        assert tick["catch_ups"] == 0 and tick["dropped"] == 0
+        # The unmodified port never makes up for a tick, never gives one up and never skips a
+        # raise to give one back.
+        assert tick["catch_ups"] == 0 and tick["dropped"] == 0 and tick["give_backs"] == 0
     if value == "poll":
         # Polling only: no signal is ever sent, and every interrupt is served from the tick.
         assert irq["signals_sent"] == 0 and irq["serviced_by_signal"] == 0

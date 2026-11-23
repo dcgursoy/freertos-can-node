@@ -30,6 +30,7 @@ scripts/buglog-verify.sh
 | [008](#008-a-can-transport-that-went-away-went-unnoticed) | 1 | A SocketCAN interface deleted under the running node went unnoticed: frames were still reported sent, nothing was logged, and the node exited 0 | run that deleted the node's interface during the review of phase 1; system test added with the fix |
 | [009](#009-the-stack-report-left-out-the-frame-of-the-task-function) | 0 | The stack depth was counted from the frame of `plat_task_enter()`, so a buffer in a task function's own body never appeared in the report | review of phase 1 (a buffer planted in a task's body); stack self-test added with the fix |
 | [010](#010-the-image-found-the-files-still-locked-by-the-bootloader-it-had-replaced) | 4 | The bootloader kept the flash and the retained cell locked up to its exec and left their release to the exec; when another process held a reference to the bootloader's memory map at that moment, the locks outlived the exec and the image it had started found both files "in use" | asan run of the system tests on CI (GitHub's ubuntu-24.04 runner); platform and system tests added with the fix |
+| [011](#011-a-tick-made-up-for-a-late-one-kept-the-count-a-tick-ahead-of-the-clock) | 0 | The locked tick made up a tick that was only late (pending on the thread of a task switched out) and was meant to give the one too many back, but decided that right after a raise, where a count one ahead looks on time: the tick count ran a tick ahead of the clock for long stretches, and tasks were released up to a tick before their tick was due | the node_timing bench of phase 6; unit test of the tick's decision added with the fix |
 
 ---
 
@@ -705,3 +706,162 @@ still covers a failed exec end to end: the lock is taken back and the hand-off i
 The patch takes the `flock(LOCK_UN)` out of `posix_retained_unlock()` and
 `posix_flash_unlock()`, so that the locks go only with the last reference to their
 descriptions, as in `1bd6024`. The bug is in commit `1bd6024`.
+
+---
+
+## 011 A tick made up for a late one kept the count a tick ahead of the clock
+
+**Found** 2026-11-22, in the verification of phase 6, by the node_timing bench
+([bench/node_timing.py](../bench/node_timing.py)). Its host-only trace stamps every release of
+a periodic task against the moment its tick was due (tick k at the base + (k − 1) periods, the
+base posix_tick.c records with `posix_trace_tick_base()`). On an idle machine it found sensor
+jobs released before their tick was due; docs/measurements.md at `326f7fe` gives the
+verifier's rehearsals: 2 % to 43 % of the sensor jobs of a 24 s run, and 95 of the 98 jobs of
+one quick download window, whose median start lateness was −0.84 ms. The same rehearsal on
+`326f7fe` for this entry (release build, 1-minute load 0.01 at its start; the lines are cut
+after the figures of the start after release):
+
+```
+$ python bench/node_timing.py --no-build --transport socketcan --seconds 24 --downloads 1 --control-seconds 12 --out <dir>
+socketcan idle     sensor start lateness p50 48.733 us max 1240.321 us (n 2299, 7 released before due), after release p50 0.568 us max 498.497 us; ...
+socketcan flood    sensor start lateness p50 27.996 us max 885.24 us (n 2299, 654 released before due), after release p50 0.221 us max 150.535 us; ...
+socketcan download sensor start lateness p50 29.304 us max 1064.023 us (n 2289, 366 released before due), after release p50 0.273 us max 206.632 us; ...
+```
+
+The three runs made up 2, 23 and 23 ticks (`tick.catch_ups` of the node's statistics) and
+dropped none. In a quick run (`--quick`) just before it, the UDP flood run had 153 of its 299
+sensor jobs released early, at a median start lateness of −866 µs, after a single tick made up.
+
+**Cause.** The port's tick thread raises a tick by sending SIGALRM to the thread of the task
+that is running, then calls `usleep()`, which posix_tick.c wraps. A tick sent to a thread whose
+task is being switched out is not lost: it stays pending on that thread, whose signals the port
+blocks while the task is switched out, until the task runs again. When that is more than a
+period later, the wrapper cannot tell the tick from a lost one. Right after each raise it
+compares the ticks the kernel has taken (the tick hook's count, `posix_tick_taken()`, see
+[003](#003-a-suspended-scheduler-made-the-tick-run-fast-and-then-stand-still)) with the ticks
+due; it finds two missing, the late one and the one just raised, and makes one up with a
+replacement 100 µs later. When the task runs again it takes the late tick as well, and the
+kernel holds one tick more than the clock: a task waiting for a tick is released up to a period
+before that tick was due.
+
+The wrapper was meant to give that tick back. On its next call it slept to
+`max(counted, expected)` periods from the base, a period longer when the count was ahead. But
+it read the count right after the port had raised a tick, and the tick just raised is almost
+never taken by then: the tick thread reads the count as soon as `pthread_kill()` returns,
+while the target thread has yet to be woken or interrupted to run the signal handler. A count
+one ahead whose last raise is still on its way reads the same as a count on time whose last
+raise was taken (`counted == expected`). The give-back worked only when the target thread
+happened to take the new tick before the tick thread read the count. Counters added to HEAD's
+wrapper in a scratch copy showed it on the laptop, in a 24 s node_timing rehearsal on UDP
+(release build):
+
+- In the idle run the wrapper slept to a boundary 24,002 times (the calls that made no tick up).
+  The count read right after the raise was one below the ticks due at 21,554 of them, the count
+  on time with the raise still on its way, and on the ticks due at 2,447.
+- The count read again at the following tick boundary (a period after the raise) was one tick
+  ahead at 2,439 boundaries, all in one stretch of 2,439 in a row (2.4 s). In the 2,439 calls
+  that followed those boundaries, the read right after the raise showed the count on the ticks
+  due 2,438 times (one ahead, with the raise still on its way) and above them once, the
+  give-back's condition; that ended the stretch.
+- The run made up 8 ticks, and node_timing counted 244 of its 2,299 sensor jobs released before
+  their tick was due.
+- Over the four runs of that rehearsal (idle, flood, download, control: 84,011 such calls), the
+  tick just raised had been taken before the read in at most 58: the 52 reads on the ticks due
+  that did not follow a boundary with the count ahead, the one read above them, and the reads
+  after the 5 boundaries at which the count was one behind.
+
+So the count stayed one ahead until one of those rare reads, or until a tick was lost and
+not made up. No test before phase 6 compared releases with the grid of the wall clock: the
+tick tests measure the long-run period and the count against the clock over seconds, which one
+tick too many moves by one tick.
+
+**Fix.** The give-back is now decided where the count is settled: at the boundary of the next
+tick, after the sleep and before the port raises that tick. By then the tick raised before has
+had a whole period to be taken. If the kernel already holds the tick about to be raised, the
+wrapper skips the raise and sleeps to the next boundary, where it asks again (the node's
+statistics count the skips as `tick.give_backs`). A tick made up for a late one is therefore
+given back at the first boundary after the late one is taken: the count is one ahead for less
+than a period, and a task released in that time is released less than a period early. (Two late
+ticks taken in the same period put it two ahead, and the second is given back at the boundary
+after.) A skip moves no base and is no dropped tick, so the trace's grid stays as it was. The
+decisions are now pure functions ([posix_tick_plan.c](../platform/posix/posix_tick_plan.c): no
+kernel, no clock read, no sleep) that `__wrap_usleep()` carries out, so that a unit test can
+play any order of events through them. Stock mode is unchanged: it returns to the port's own
+`usleep()` before the plan is asked.
+
+The catch-up stays as it was: a tick still missing a period after its raise is made up at once,
+100 µs apart, up to 6 (`POSIX_TICK_MAX_CATCH_UP_TICKS`), and a longer lag is given up and moves
+the base. Waiting before making a tick up would not tell a lost tick from a late one, because a
+late tick stays pending for as long as its task is switched out, and it would delay every
+release after a tick that was really lost. The read right after a raise keeps its own blind
+spot, the mirror of this bug's: a lost tick goes unseen while the raises after it are taken
+before the read, and is made up after the first raise that is not (the counters above: at most
+58 of 84,011 raises taken before the read). The unit test below pins that bound.
+
+**Regression test.** Two tests, of which the first does not depend on the host's timing:
+- `tests/platform/test_posix_tick_plan.c` plays a model of the tick thread and the kernel
+  through the plan. The model decides for each raise whether the kernel takes it before the
+  plan reads the count, after that read, late (pending on a switched-out thread for a given
+  time) or never (merged with a pending one), and the test judges every tick against the grid.
+  In the case of this bug, raise 100 is taken 1.1 to 6 periods late (in steps of 0.05, so that
+  it lands at every phase of a period) and every other raise just after the plan's read. The
+  test requires that only the late tick be taken before it was due, that the count be back on
+  the grid within a period and the tick thread's wake-up, and that one tick be made up and one
+  given back. Other cases: ticks on time, a lost tick, a tick late by less than a period, raises
+  taken before the read, two late ticks at once, a suspended scheduler, the tick thread stalled
+  within and beyond the limit, the task threads stalled beyond it, a lost tick among raises
+  taken before the read (one tick behind until the first raise taken after it, then made up),
+  and 300 random orders of events with fixed seeds (each raise lost, late by 0.2 to 6.2
+  periods, taken before or after the read, and a stall of the tick thread of up to 12 periods),
+  in which no more ticks may be early than were late, no more given back than made up, and the
+  count has to end on the grid. In every case the model fails a plan that stops the tick,
+  sleeps to no later boundary or moves its grid without a dropped tick. With HEAD's give-back
+  put back it fails: 101 ticks early, from the late one to the end of the modelled run. It
+  fails as well with a check at the boundary that never fires, one that fires on a count on
+  time, one that fires only on a count two ahead, a give-back read right after the raise that
+  takes `counted == expected` for ahead, and a give-back that moves the grid instead of
+  skipping the raise (that one stops the tick).
+- `plat_selftest tick-late 50` (CTest `platform_tick_late`, labelled timing) does the same on
+  the real port, 50 rounds. A task waits in a critical section until the tick is pending on its
+  thread, then wakes a higher-priority task from inside it, which runs for 3.5 ms while the
+  locked tick makes up the pending tick; when the first task leaves its critical section it
+  takes the late tick and watches the tick count against the grid for 6 ms. Two ticks reached
+  before they were due, in a row, fail the test; that does not depend on how promptly the host
+  runs the threads, since a raise the host delays is late, not early. Whether the late tick is
+  made up at all does: fewer than a quarter of the rounds with an early tick is status 75. Ten
+  runs each on the laptop (release build, idle): with HEAD's give-back put back, all 10 failed
+  (7 ticks early in a row in each of the 50 rounds; 321 to 345 early ticks a run; 6 to 11 ticks
+  made up, and 5 to 10 given back by the old give-back, which the patch counts too); with the
+  fix, all 10 passed (one early tick in each of the 50 rounds, the late one; the earliest of a
+  run 370 to 433 µs before it was due; 50 or 51 ticks made up and 50 given back per run).
+  It is also the one test of `__wrap_usleep()`'s own loop, which the unit test plays with a
+  model of its own: a posix_tick.c that no longer asks the plan at the boundary passes the unit
+  test, and failed this one in 10 of 10 runs (early ticks in a row in all 50 rounds of each).
+
+A node_timing rehearsal, `python bench/node_timing.py --no-build --seconds 24 --downloads 1
+--control-seconds 12 --out <dir>` (both transports), run on the release build of `326f7fe` and
+then on the fix, one after the other on the idle laptop (1-minute load 0.52 and 0.49 at their
+starts). Sensor jobs released before their tick was due, and the ticks the node made up, gave
+back and dropped in each run:
+
+| Transport | Condition | Before the fix: early | made up | With the fix: early | made up | given back | dropped |
+|---|---|---|---|---|---|---|---|
+| socketcan | idle | 0 of 2299 | 1 | 0 of 2299 | 6 | 2 | 0 |
+| socketcan | flood | 0 of 2299 | 2 | 0 of 2299 | 2 | 2 | 0 |
+| socketcan | download | 1268 of 2288 | 14 | 0 of 2329 | 6 | 6 | 0 |
+| udp | idle | 0 of 2299 | 7 | 0 of 2299 | 2 | 2 | 0 |
+| udp | flood | 109 of 2299 | 3 | 0 of 2299 | 4 | 3 | 0 |
+| udp | download | 145 of 2288 | 1 | 0 of 2328 | 11 | 6 | 8 |
+
+Before the fix, the socketcan download run's median sensor start lateness was −941 µs; with it,
+34 µs. No run before the fix dropped a tick. The run with the fix that did had one stretch in
+which the idle task was running, the trace recorded no switch for 8.4 ms and the tick count did
+not move: the host did not run the idle task's thread, the replacements raised meanwhile merged
+on it, and the lag beyond 6 ticks was given up, by the drop path this fix leaves as it was.
+Dropped ticks on an idle machine are a separate, open matter.
+
+**Evidence.** [failing output](buglog/011-made-up-tick-one-too-many/failing-output.txt),
+[patch that re-creates the bug](buglog/011-made-up-tick-one-too-many/reintroduce.patch). The
+patch puts HEAD's give-back into posix_tick_plan.c: the sleep after a raise goes to the boundary
+of `max(counted, expected) + 1`, and the check at the boundary is taken out. The verification
+runs both tests against it. The bug is in commits `7a347ab` to `972fb22`.
