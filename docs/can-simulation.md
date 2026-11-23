@@ -182,6 +182,7 @@ answered with `? err malformed request`.
 | `can.status` | state, error counters, fault, the counters of the model and of the transport (`transport_tx_failed` and `transport_rx_failed` among them), how late the host carried out the model's times (`pacing_lag_*`, `wakeup_lag_*`, `rx_lag_*`; see [What the host adds to the timing](#what-the-host-adds-to-the-timing)), and the ticks the tick code has given up so far (`ticks_dropped`) |
 | `can.fault none\|short\|dominant\|noack` | applies or removes a bus fault |
 | `can.inject tx\|rx <count>` | destroys the next `count` transmission attempts or received frames |
+| `can.trace [<from>]` | the records of the controller's bus-off trace from number `from` on, as many as fit into the reply, with `oldest=` and `newest=` (see [The bus-off trace](#the-bus-off-trace)) |
 | `sensor.status` | the sensor model's seed, whether its front end is off line, its read counters and every channel's mode (see [sensor-model.md](sensor-model.md)) |
 | `sensor.set <channel> <value>` | holds a channel of the sensor front end (`current`, `cell1`..`cell8`, `temp1`..`temp4`) at a value, which it reports as a valid reading |
 | `sensor.open <channel>` | lets the front end declare the channel invalid, as with an open sense wire |
@@ -192,9 +193,9 @@ answered with `? err malformed request`.
 `fcn_tools.simctl.SimControl` is the client the tests use. The node carries out every request
 datagram it receives and does not remember tokens, so a request repeated after a timeout can
 be carried out twice. The client therefore repeats a request only when that cannot change the
-outcome. After a timeout it resends `ping`, `can.status`, `can.fault` and every `sensor.*`
-command (each with a new token): they read a state or set one to a value, so a second delivery
-changes nothing. It resends any command when the kernel reports that nothing was listening
+outcome. After a timeout it resends `ping`, `can.status`, `can.fault`, `can.trace` and every
+`sensor.*` command (each with a new token): they read a state or set one to a value, so a
+second delivery changes nothing. It resends any command when the kernel reports that nothing was listening
 yet, which happens while the node is still starting. `can.inject` adds to the errors still to
 come, so it is sent once and waited for.
 
@@ -269,3 +270,38 @@ has it together with `rx_fifo_overruns`, so a test can count both from the same 
 receive-path test of
 [bug-log entry 007](bug-log.md#007-the-receive-task-took-fewer-frames-per-tick-than-a-full-1-mbits-bus-delivers)
 judges the receive FIFO's losses in its window by the ticks dropped from the window's start on.
+
+### The bus-off trace
+
+The lateness figures above are maxima and means over a run. To tell, step by step, what the
+model fixed from what the host added on a way into bus off and out again, the hardware thread
+also keeps a trace ([posix_can_trace.h](../platform/posix/posix_can_trace.h)), read with
+`can.trace` and `fcn_tools.simctl.SimControl.can_trace()`. Each record has two times on
+`CLOCK_MONOTONIC`: the model's (`model_ns`) and the start of the thread's pass that carried the
+step out (`pass_ns`), the error state and counters after the step, the model's count of
+destroyed transmission attempts, and the number of frames the node has transmitted
+(`frames`). The thread records:
+
+| Kind | When | `model_ns` |
+|---|---|---|
+| `state` | a change of the error state | the model's time of the change |
+| `counters` | a pass that ended with error counters other than those of the last record: the transmit error counter's way up, attempt by attempt as far as the passes resolve it, with the model's count of destroyed attempts | the pass's |
+| `restart` | the driver's request to recover, served: rule 12's count starts here | the pass's |
+| `first_tx` | the first frame transmitted after a recovery from bus off, with its start of frame, the time it entered its mailbox and its number among the node's frames (`frames`), by which an observer that heard every frame finds it without comparing clocks | its end of frame |
+| `fault`, `inject_tx`, `inject_rx` | `can.fault`, `can.inject` | the pass's |
+
+Nothing is recorded on a healthy bus, where the counters stay at 0, so the node's normal
+operation costs one comparison of the two counters per pass and one increment per transmitted
+frame. A record is a copy of 64 bytes into a ring of 256 that reads no clock (the pass's time is
+taken already), makes no system call and takes no lock; a way into bus off and out again adds
+a few dozen (at most one `counters` record per destroyed attempt). Adding one (`posix_can_trace_add()`) took 2.37 to 3.37 ns in the release build and 3.55 to
+3.60 ns under ASan, three runs each of a million records added in a loop by
+`test_posix_can_trace` on 2026-11-22 (pilot runs on a machine shared with other work, load
+average 2.5; the test prints the figure, `ctest -R platform_posix_can_trace -V`), next to a
+recovery of 1.4 to 11.3 ms and a hold-off of 100 ms. The application never sees the trace.
+
+tests/platform/test_posix_can.c checks a whole way against the real hardware thread: the
+counter on the rules attempt by attempt, error passive at 128 and bus off at 256 after 24
+attempts, the 416 bit times from error passive to bus off, the recovery 128 x 11 bit times after
+the served request to the nanosecond, and the first frame's times and number equal to those
+its outcome gave the driver. bench/bus_off.py is the trace's user.

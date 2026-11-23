@@ -16,8 +16,11 @@ pile up while the whole test process is held up.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import socket
 import struct
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -130,6 +133,33 @@ def socketcan_available(interface: str = "vcan0") -> bool:
         return state.read_text().strip() in ("up", "unknown")
     except OSError:
         return False
+
+
+def socketcan_lock_path(interface: str) -> Path:
+    """The lock file of a SocketCAN interface (socketcan_lock())."""
+    return Path(tempfile.gettempdir()) / f"fcn-test-{interface}.lock"
+
+
+@contextlib.contextmanager
+def socketcan_lock(interface: str, on_wait: Callable[[], None] | None = None) -> Iterator[None]:
+    """Hold the lock of a SocketCAN interface while the block runs. One interface is shared by
+    everything on the machine: the test harness (tests/conftest.py) and the benches
+    (fcn_tools.runner) take this lock file, so that two test runs, or a test run and a bench,
+    never use it at the same time; they still assume that nobody else transmits on it.
+    `on_wait` is called once if the lock is held by someone else, before waiting for it."""
+    with open(socketcan_lock_path(interface), "w") as lock:
+        if on_wait is None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        else:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                on_wait()
+                fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def receive_until(bus: can.BusABC, deadline: float) -> Iterator[can.Message]:

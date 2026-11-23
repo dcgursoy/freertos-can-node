@@ -45,7 +45,7 @@ target_compile_definitions(fcn_payload_watchdog PRIVATE PAYLOAD_KIND=2 _POSIX_C_
 # image has ended (boot_held.c, by -Wl,--wrap=fexecve), for tests/system/test_boot.py.
 add_executable(fcn_boot_held "${CMAKE_SOURCE_DIR}/platform/posix/boot_main.c" boot_held.c)
 target_compile_definitions(fcn_boot_held PRIVATE _GNU_SOURCE FCN_VERSION="${PROJECT_VERSION}")
-target_link_libraries(fcn_boot_held PRIVATE fcn_boot_host)
+target_link_libraries(fcn_boot_held PRIVATE fcn_boot_host fcn_build_id)
 target_link_options(fcn_boot_held PRIVATE -Wl,--wrap=fexecve)
 set_target_properties(fcn_boot_held PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 fcn_target_defaults(fcn_boot_held NO_COVERAGE)

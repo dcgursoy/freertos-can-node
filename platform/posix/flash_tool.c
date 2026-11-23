@@ -8,6 +8,8 @@
  *   fcn_flash stage   --flash-file F [--no-wait] [--flash-cut N[:SEED]] [--address A]
  *                     [--chunk N] IMAGE
  *   fcn_flash info    --flash-file F
+ *   fcn_flash --version   the version and the build id of the tree it was built from
+ *                         (build_id.h), so that a measurement can check the tool it ran
  *
  * IMAGE is an image file as `python -m fcn_tools.image pack` writes it: the 256-byte header and
  * the payload.
@@ -51,7 +53,12 @@
 #include <sys/stat.h>
 
 #include "boot_host.h"
+#include "build_id.h"
 #include "posix_flash.h"
+
+#ifndef FCN_VERSION
+#define FCN_VERSION "unknown"
+#endif
 
 #define EXIT_REFUSED  2
 #define DEFAULT_CHUNK 1024U
@@ -76,9 +83,10 @@ static void print_usage(const char *program)
                  "       %s stage   --flash-file F [--no-wait] [--flash-cut N[:SEED]]\n"
                  "                  [--address A] [--chunk N] IMAGE\n"
                  "       %s info    --flash-file F\n"
+                 "       %s --version (the version and the build id) or --help\n"
                  "exit status: 0 done, 1 usage or start-up error, 2 refused by lib/image or\n"
                  "lib/boot, 12 a power cut fired\n",
-                 program, program, program);
+                 program, program, program, program);
 }
 
 /* A number in C notation (decimal, or hexadecimal with 0x) of at most `max`. */
@@ -116,6 +124,11 @@ static int parse_options(int argc, char **argv, tool_options_t *options)
     if ((argc < 2) || (strcmp(argv[1], "--help") == 0)) {
         print_usage(argv[0]);
         return (argc < 2) ? 2 : 1;
+    }
+
+    if ((argc == 2) && (strcmp(argv[1], "--version") == 0)) {
+        (void)printf("fcn_flash %s build %s\n", FCN_VERSION, fcn_build_id);
+        return 1;
     }
 
     if (strcmp(argv[1], "factory") == 0) {

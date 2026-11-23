@@ -23,7 +23,7 @@ confirms it. The same connection reads the boot information and the DTCs and cle
 | The node's connection | [app/diag.c](../app/diag.c), THE DIAGNOSTIC TASK in [app/app.c](../app/app.c) | lib/isotp in front of lib/uds, joined to the CAN tasks; the node's parameters |
 | The node's backend | [app/diag_backend.c](../app/diag_backend.c), [app/flash_job.c](../app/flash_job.c) | the flash work as jobs of the flash task, the boot information, the DTC snapshot and the clear, the reset |
 | The tester | [tools/fcn_tools/diag.py](../tools/fcn_tools/diag.py), [tools/fcn_tools/flasher.py](../tools/fcn_tools/flasher.py) | the connection factory, and `python -m fcn_tools.flasher` with its JSON report |
-| The bench | [tools/fcn_tools/node.py](../tools/fcn_tools/node.py) (`Board`), [tests/system/diag_bench.py](../tests/system/diag_bench.py) | a node started again through fcn_boot after a requested reset; raw frames and raw requests for the system tests |
+| The bench | [tools/fcn_tools/node.py](../tools/fcn_tools/node.py) (`Board`), [tools/fcn_tools/tester.py](../tools/fcn_tools/tester.py) (the tests import it as [tests/system/diag_bench.py](../tests/system/diag_bench.py)) | a node started again through fcn_boot after a requested reset; raw frames and raw requests for the system tests and the benches of bench/ |
 
 The tester's two Python packages are independent implementations of both standards, and the
 tests use them as the oracle for the node's C code; where a case needs what they never send (a
@@ -354,7 +354,8 @@ CONFIRM record:
   `posted`, `failed`, `last_steps`, `last_status`.
 - Also: `can.driver.tx_done_reports` and `tx_quiet_enqueues`; in `confirm.flash_task`,
   `confirmed_by_routine`, `self_skipped`, `idle_passes`, and per job kind (`jobs`) `run`,
-  `last_status`, `last_steps`, `last_ns`, `max_ns`.
+  `last_status`, `last_steps`, `last_ns`, `max_ns` and (since phase 6) `total_ns`, the sum of
+  the kind's times, from which bench/isotp_throughput.py takes the mean time of a write job.
 
 ## The UDS server (lib/uds)
 
@@ -550,9 +551,14 @@ minimum of 1024 data bytes:
 - **The round trip per block.** A block of 1024 data bytes is a first frame and 146 consecutive
   frames, 147 frames of 108 to 132 bits plus 3 of intermission ([lib/can/can_bits.h](../lib/can/can_bits.h)):
   32.6 to 39.7 ms of bus time at 500 kbit/s. Each block also costs a round trip: the node's flow
-  controls, the write job (four page programs: 1.6 ms typical, 12 ms at the part's maximum), the
+  controls, the write job (four page programs: 1.6 ms typical, 12 ms at the part's maximum, on
+  the part; on the host each program's wait ends at the next tick, so the job takes longer, as
+  bench/isotp_throughput.py measures), the
   response and the tester's next request. Blocks of 2048 bytes would halve the round trips (128
-  instead of 256 for a 256 KiB image); phase 6 measures whether that pays.
+  instead of 256 for a 256 KiB image). Phase 6 does not rebuild the node to try it:
+  [bench/isotp_throughput.py](../bench/isotp_throughput.py) measures the blocks of 1 to 1024
+  bytes, cuts each into its parts, and projects from them what blocks of 2048 bytes would save
+  (a projection, labelled so in results/isotp_throughput.json).
 - **Whole pages.** 1024 bytes are four 256-byte pages, so every block but the last programs whole
   pages and nothing waits in the slot writer's page buffer between blocks.
 
@@ -635,8 +641,11 @@ tester's and include both hosts): erase 2.75 s (the node's log: 61 steps in 2,75
 (12,404 bytes/s; the median block 82.4 ms, the slowest 84.2 ms), check 3 ms, ecu_reset 0.7 ms,
 wait_for_trial 1.20 s, confirm 2.5 ms; over SocketCAN the erase and the transfer took the same
 within 0.1 %, and the median block was the same to 0.1 ms (the slowest 85.0 ms). The block time
-is the diagnostic task's budget of 2 events per tick at work (the floor is 79 ticks); phase 6
-measures the throughput properly.
+is the diagnostic task's budget of 2 events per tick at work (the floor is 79 ticks). Phase 6's
+benches measure it properly: [bench/isotp_throughput.py](../bench/isotp_throughput.py) the
+transfer rate by block size from the tester to the node and the node's longest response to the
+tester, [bench/updates.py](../bench/updates.py) 50
+updates end to end and the download of a 256 KiB image (docs/measurements.md).
 
 **The bench.** `fcn_tools.node.Board`, started through `tests/conftest.py`'s
 `start_board(*args, flash_file=, retained_file=, can=)`, starts the node through fcn_boot and,

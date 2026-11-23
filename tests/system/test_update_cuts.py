@@ -21,12 +21,13 @@ The campaign is small on purpose, 24 cuts (13 in staging, 3 in attempts, 4 in th
 4 in the confirm) that take about a minute in a functional run and half a minute in the timing
 run (the 3 cuts armed at run time, marked `timing`, see the confirm's test): lib/boot's unit
 tests cut every operation of every sequence at every position (tests/unit/test_boot_cuts.c),
-and tests/python/test_flash_decoder.py every operation of a staged update with three seeds;
-phase 6 runs the large campaign. A cut of a one-unit program (a commit field, an attempt) can leave none,
-some or all of its transitions done, as the seed says; the seeds of those cuts are chosen so that
-each outcome occurs, and the tests check that it does (with lib/flash's model on this geometry,
-measured on the units these tests cut: seed 7 leaves none, seeds 0, 1, 2, 8 and 9 some, seeds 3
-to 6 all).
+tests/python/test_flash_decoder.py every operation of a staged update with three seeds, and
+bench/power_loss.py runs the large campaign (phase 6: 1062 cuts of the real programs, every
+operation of each class several times). A cut of a one-unit program (a commit field, an attempt)
+can leave none, some or all of its transitions done, as the seed says; the seeds of those cuts
+are chosen so that each outcome occurs, and the tests check that it does (with lib/flash's model
+on this geometry, measured on the units these tests cut: seed 7 leaves none, seeds 0, 1, 2, 8
+and 9 some, seeds 3 to 6 all).
 """
 from __future__ import annotations
 

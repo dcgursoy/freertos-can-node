@@ -1,11 +1,11 @@
 --- a/platform/posix/posix_tick.c
 +++ b/platform/posix/posix_tick.c
-@@ -179,7 +179,7 @@
+@@ -180,7 +180,7 @@
      const uint64_t period_ns = (uint64_t)usec * 1000ULL;
      const uint64_t now_ns = posix_monotonic_ns();
      uint64_t expected = ((now_ns - start_ns) / period_ns) + 1ULL;
 -    const uint64_t counted = atomic_load(&s_ticks_taken);
 +    const uint64_t counted = (uint64_t)xTaskGetTickCount();
- 
-     if ((counted + 1ULL) < expected) {
-         const uint64_t lag = expected - counted;
+     static _Thread_local bool base_traced = false;
+
+     /* The host-only trace (posix_trace.h) learns when every tick is due: tick k at start_ns +

@@ -303,9 +303,10 @@ node, rather than the tester, stood still.
   `post_refused`, `snapshots`, `clears`, `clears_done`, `resets`, and per job kind `posted`,
   `failed`, `last_steps`, `last_status`); in `can.driver`, `tx_done_reports` and
   `tx_quiet_enqueues`; in `confirm.flash_task`, `confirmed_by_routine`, `self_skipped`,
-  `idle_passes`, and per job kind (`jobs`) `run`, `last_status`, `last_steps`, `last_ns` and
-  `max_ns`. A run that ends in a reset writes no statistics: a download run that the tester ends
-  with ECUReset has its observables in its log and in the tester's report;
+  `idle_passes`, and per job kind (`jobs`) `run`, `last_status`, `last_steps`, `last_ns`,
+  `max_ns` and (phase 6) `total_ns`, their sum. A run that ends in a reset writes no
+  statistics: a download run that the tester ends with ECUReset has its observables in its log
+  and in the tester's report;
 - `confirm` (phase 4): the confirm of a trial ([app/update.h](../app/update.h)): `state`
   (NOT_NEEDED, WAITING, CONFIRMING, CONFIRMED, FAILED), `confirm_after_s`, `periods_needed`,
   `periods` judged, `healthy_periods`, `window_restarts`, `requested_period`, the periods that
@@ -315,7 +316,27 @@ node, rather than the tester, stood still.
   result), and the flash task's own counts in `flash_task`: `flash`, `boot_init`, `described`
   and what the metadata said at start (`have_record`, `seq`, `active_slot`, `trial_slot`,
   `attempts_used`, `records_valid`), `confirms`, `confirm_status` and `confirm_ns`, how long the
-  confirm took with its waits for the flash.
+  confirm took with its waits for the flash;
+- `build_id` (phase 6): the build id of the tree the node was built from
+  ([platform/posix/build_id.h](../platform/posix/build_id.h)): the commit, and `-dirty-` with a
+  hash of the uncommitted changes for a tree that had them, as `--version` and a line of the log
+  at the start say it too. A bench (bench/README.md) refuses to write a result whose node, read
+  here or from `--version`, was not built from the tree its provenance names. It is host-only:
+  the application never reads it.
+- `trace` (phase 6): `false`, or for a node started with `--trace-file` the host-only trace of
+  the scheduler and the simulated hardware that bench/node_timing.py reads
+  ([platform/posix/posix_trace.h](../platform/posix/posix_trace.h)): its `capacity`, the
+  `events` recorded and `dropped` (beyond the capacity, `--trace-events`), `record_bytes`,
+  `file_version`, `event_cost_ns` (what one record cost when the trace was opened: the fastest
+  of the rounds timed, `cost_records` records in all), and the `number` and `name` of every task
+  it saw run. The trace records every task switch (with whether the task switched out had
+  blocked), every move of a task to the ready list, every block in `xTaskDelayUntil()` with its
+  wake tick (the kernel's trace macros, defined in config/posix/FreeRTOSConfig.h), every frame of
+  the node the CAN model completed with its end of frame and the time of its write, every sample
+  the sensor task read, and when every tick was due (posix_tick.c's base), all on
+  CLOCK_MONOTONIC. It is host-only, records nothing without the option, and changes nothing the
+  application does: the hooks read the kernel's state and write a buffer allocated and written
+  once before the scheduler starts.
 
 ## Schedulability
 
@@ -358,9 +379,14 @@ node and fails on any exit status other than 0; it also checks the table's prior
 the tasks that ran and its periods against the cycle times of the DBC.
 
 The execution-time budgets and critical-section lengths in the table are design figures for a
-Cortex-M3 class target until phase 6 measures execution times; each is derived in a comment in
-app/task_table.c. The table says so (`"wcet_basis": "design"`), and the report repeats it on its
-second line. Until then, "schedulable" means: schedulable as long as no job runs longer than its
+Cortex-M3 class target; each is derived in a comment in app/task_table.c. The table says so
+(`"wcet_basis": "design"`), and the report repeats it on its second line. Phase 6 does not
+replace them with measurements: it runs on the host and has no target. What it measures instead
+is the host's run time per task, from FreeRTOS's run-time statistics (`run_time_us`), and per
+job from the node's host-only trace ([bench/node_timing.py](../bench/node_timing.py),
+[docs/measurements.md](measurements.md)): x86-64 times of a host thread, which say nothing about
+a Cortex-M3. Phase 7 builds the node for a Cortex-M3 under QEMU, which is not cycle-accurate
+either. "Schedulable" therefore means: schedulable as long as no job runs longer than its
 budget.
 
 ### How the node's tasks are modelled

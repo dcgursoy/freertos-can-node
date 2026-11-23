@@ -89,6 +89,32 @@
 #define configRUN_TIME_COUNTER_TYPE                 uint64_t
 #define portALT_GET_RUN_TIME_COUNTER_VALUE(counter) ((counter) = plat_run_time_counter_us())
 
+/* ------------------------------------------------------------- the host's scheduling trace */
+/* A host-only trace for the measurements of phase 6 (platform/posix/posix_trace.h). It records
+ * only in a node started with --trace-file; otherwise each hook returns after one atomic load.
+ * The hooks read the kernel's state and change none of it. The macros expand only inside the
+ * kernel's tasks.c, where pxCurrentTCB, pxReadyTasksLists and xTickCount are visible: a task
+ * switched out that is in no ready list has blocked; one still in its ready list was preempted
+ * or yielded. */
+void posix_trace_switched_out(uint32_t task, bool blocked);
+void posix_trace_switched_in(uint32_t task, const char *name, uint64_t tick);
+void posix_trace_ready(uint32_t task, uint64_t tick);
+void posix_trace_delay_until(uint32_t task, uint64_t wake_tick);
+#define FCN_TRACE_HOOKS_DECLARED 1 /* posix_trace.h does not declare them again */
+
+#define traceTASK_SWITCHED_OUT()                                                                   \
+    posix_trace_switched_out(                                                                      \
+        (uint32_t)pxCurrentTCB->uxTCBNumber,                                                       \
+        listIS_CONTAINED_WITHIN(&(pxReadyTasksLists[pxCurrentTCB->uxPriority]),                    \
+                                &(pxCurrentTCB->xStateListItem)) == pdFALSE)
+#define traceTASK_SWITCHED_IN()                                                                    \
+    posix_trace_switched_in((uint32_t)pxCurrentTCB->uxTCBNumber, pxCurrentTCB->pcTaskName,         \
+                            (uint64_t)xTickCount)
+#define traceMOVED_TASK_TO_READY_STATE(pxTCB)                                                      \
+    posix_trace_ready((uint32_t)(pxTCB)->uxTCBNumber, (uint64_t)xTickCount)
+#define traceTASK_DELAY_UNTIL(xTimeToWake)                                                         \
+    posix_trace_delay_until((uint32_t)pxCurrentTCB->uxTCBNumber, (uint64_t)(xTimeToWake))
+
 /* ---------------------------------------------------------------------------- assert */
 #define configASSERT(x)                                                                            \
     do {                                                                                           \

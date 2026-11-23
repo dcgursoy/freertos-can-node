@@ -23,6 +23,7 @@
 
 #include "app.h"
 #include "app_tasks.h"
+#include "build_id.h"
 #include "can_backend.h"
 #include "plat_can.h"
 #include "posix_flash.h"
@@ -30,6 +31,7 @@
 #include "posix_retained.h"
 #include "posix_sensor.h"
 #include "posix_sim.h"
+#include "posix_trace.h"
 
 #ifndef FCN_VERSION
 #define FCN_VERSION "unknown"
@@ -58,7 +60,9 @@ typedef struct {
     posix_flash_cut_t flash_cut;
     uint32_t flash_hang; /* --flash-hang: the program or erase that hangs; 0: none */
     const char *can_spec;
-    const char *can_fault; /* --can-fault: the bus fault in force from the start; NULL: none */
+    const char *can_fault;  /* --can-fault: the bus fault in force from the start; NULL: none */
+    const char *trace_path; /* --trace-file: the host-only trace (posix_trace.h); NULL: none */
+    uint32_t trace_events;
     uint32_t bitrate;
     uint32_t sensor_seed;
     uint16_t sim_port;
@@ -72,7 +76,10 @@ static void print_usage(const char *program)
                  "  --bitrate N            bit rate of the modelled bus in bit/s (default %u);\n"
                  "                         0 switches the bus model's pacing off\n"
                  "  --sim-port N           serve simulation control (fault injection) on UDP\n"
-                 "                         port N of the loopback interface (default: off)\n"
+                 "                         port N of the loopback interface (default: off);\n"
+                 "                         its can.trace reads a host-only trace of the CAN\n"
+                 "                         controller's bus offs and recoveries, with the\n"
+                 "                         model's and the host's times (docs/can-simulation.md)\n"
                  "  --can-fault FAULT      a fault of the bus in force from the start, as\n"
                  "                         simulation control's can.fault applies one: none\n"
                  "                         (default), short, dominant or noack\n"
@@ -100,7 +107,20 @@ static void print_usage(const char *program)
                  "  --irq-mode MODE        signal (default) or poll\n"
                  "  --log-file PATH        write the log to PATH instead of stderr\n"
                  "  --log-level LEVEL      error, warn, info (default) or debug\n"
-                 "  --version              print the version and exit\n"
+                 "  --trace-file PATH      record a host-only trace of the scheduler (task\n"
+                 "                         switches, releases, xTaskDelayUntil), of the\n"
+                 "                         node's CAN frames and of the sensor reads, on\n"
+                 "                         CLOCK_MONOTONIC, and write it to PATH on an orderly\n"
+                 "                         stop (platform/posix/posix_trace.h, for\n"
+                 "                         bench/node_timing.py). It changes nothing the\n"
+                 "                         application does; the statistics say what one\n"
+                 "                         event cost (\"trace\")\n"
+                 "  --trace-events N       room for N events, 1 to %u (default %u), 32\n"
+                 "                         bytes each; events beyond it are counted, not\n"
+                 "                         recorded\n"
+                 "  --version              print the version and the build id (the commit, and a\n"
+                 "                         hash of uncommitted changes) and exit; the build id\n"
+                 "                         is in the statistics (\"build_id\") and the log too\n"
                  "  --help                 print this text and exit\n"
                  "exit status: 0 after an orderly stop; 1 on a usage or start-up error; %d when\n"
                  "the CAN transport went away while the node ran (the statistics are written);\n"
@@ -110,7 +130,8 @@ static void print_usage(const char *program)
                  (unsigned int)POSIX_SENSOR_DEFAULT_SEED, (unsigned int)POSIX_FLASH_CUT_MAX,
                  (unsigned int)POSIX_FLASH_CUT_MAX, (unsigned int)APP_HEALTH_PERIOD_MS,
                  (unsigned int)(UPDATE_CONFIRM_AFTER_S * (1000U / APP_HEALTH_PERIOD_MS)),
-                 (unsigned int)UPDATE_CONFIRM_AFTER_S, POSIX_EXIT_CAN_TRANSPORT_LOST,
+                 (unsigned int)UPDATE_CONFIRM_AFTER_S, (unsigned int)POSIX_TRACE_MAX_EVENTS,
+                 (unsigned int)POSIX_TRACE_DEFAULT_EVENTS, POSIX_EXIT_CAN_TRANSPORT_LOST,
                  POSIX_EXIT_SHUTDOWN_TIMEOUT);
 }
 
@@ -173,6 +194,8 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         OPT_FLASH_CUT,
         OPT_FLASH_HANG,
         OPT_CONFIRM_PERIODS,
+        OPT_TRACE_FILE,
+        OPT_TRACE_EVENTS,
         OPT_VERSION,
         OPT_HELP
     };
@@ -193,6 +216,8 @@ static int parse_options(int argc, char **argv, node_options_t *options)
         {"flash-cut", required_argument, NULL, OPT_FLASH_CUT},
         {"flash-hang", required_argument, NULL, OPT_FLASH_HANG},
         {"confirm-periods", required_argument, NULL, OPT_CONFIRM_PERIODS},
+        {"trace-file", required_argument, NULL, OPT_TRACE_FILE},
+        {"trace-events", required_argument, NULL, OPT_TRACE_EVENTS},
         {"version", no_argument, NULL, OPT_VERSION},
         {"help", no_argument, NULL, OPT_HELP},
         {NULL, 0, NULL, 0}};
@@ -314,8 +339,21 @@ static int parse_options(int argc, char **argv, node_options_t *options)
                 result = 2;
             }
             break;
+        case OPT_TRACE_FILE:
+            options->trace_path = optarg;
+            break;
+        case OPT_TRACE_EVENTS:
+            if (parse_number(optarg, POSIX_TRACE_MAX_EVENTS, &number) && (number != 0UL)) {
+                options->trace_events = (uint32_t)number;
+            } else {
+                (void)fprintf(stderr, "invalid --trace-events: %s (1 to %u)\n", optarg,
+                              (unsigned int)POSIX_TRACE_MAX_EVENTS);
+                result = 2;
+            }
+            break;
         case OPT_VERSION:
-            (void)printf("fcn_node %s (FreeRTOS %s)\n", FCN_VERSION, tskKERNEL_VERSION_NUMBER);
+            (void)printf("fcn_node %s (FreeRTOS %s) build %s\n", FCN_VERSION,
+                         tskKERNEL_VERSION_NUMBER, fcn_build_id);
             result = 1;
             break;
         case OPT_HELP:
@@ -774,7 +812,9 @@ static void write_update_stats(FILE *file, const node_stats_t *stats)
         (void)fprintf(file, "\"last_status\": \"%s\", ", boot_status_name(f->job_status[kind]));
         put_u64(file, "last_steps", f->job_steps[kind], ", ");
         put_u64(file, "last_ns", f->job_last_ns[kind], ", ");
-        put_u64(file, "max_ns", f->job_max_ns[kind], "}");
+        put_u64(file, "max_ns", f->job_max_ns[kind], ", ");
+        /* Phase 6: their sum, for the mean time of a job (bench/isotp_throughput.py). */
+        put_u64(file, "total_ns", f->job_total_ns[kind], "}");
     }
 
     (void)fprintf(file, "}}},\n");
@@ -1093,6 +1133,50 @@ static void write_supervision_stats(FILE *file, const node_stats_t *stats)
     (void)fprintf(file, "\n    ]}\n");
 }
 
+/*
+ * "trace" (phase 6): the host-only trace of --trace-file (posix_trace.h), or false. With a
+ * trace: its capacity, the events recorded and dropped, the size of a record, what one record
+ * cost when the trace was opened (event_cost_ns, the fastest of the rounds timed, cost_records
+ * records in all), and the number and name of every task the trace saw run, by which a reader
+ * of the trace file names its tasks. Task names are the kernel's, which need no escaping.
+ */
+static void write_trace_stats(FILE *file)
+{
+    posix_trace_info_t info;
+
+    posix_trace_get_info(&info);
+
+    if (!info.open) {
+        (void)fprintf(file, "  \"trace\": false,\n");
+        return;
+    }
+
+    (void)fprintf(file, "  \"trace\": {");
+    put_u64(file, "capacity", info.capacity, ", ");
+    put_u64(file, "events", info.recorded, ", ");
+    put_u64(file, "dropped", info.dropped, ", ");
+    put_u64(file, "record_bytes", sizeof(posix_trace_event_t), ", ");
+    put_u64(file, "file_version", POSIX_TRACE_FILE_VERSION, ", ");
+    (void)fprintf(file, "\"event_cost_ns\": %llu.%03llu, ",
+                  (unsigned long long)(info.cost_ps / 1000U),
+                  (unsigned long long)(info.cost_ps % 1000U));
+    put_u64(file, "cost_records", info.cost_runs, ",\n    \"tasks\": [");
+
+    bool first = true;
+
+    for (uint32_t task = 0U; task < POSIX_TRACE_MAX_TASKS; task++) {
+        const char *name = posix_trace_task_name(task);
+
+        if (name != NULL) {
+            (void)fprintf(file, "%s{\"number\": %u, \"name\": \"%s\"}", first ? "" : ", ",
+                          (unsigned int)task, name);
+            first = false;
+        }
+    }
+
+    (void)fprintf(file, "]},\n");
+}
+
 static bool write_stats(const char *path, const node_options_t *options, uint64_t elapsed_ns)
 {
     const node_stats_t *stats = app_final_stats();
@@ -1112,6 +1196,9 @@ static bool write_stats(const char *path, const node_options_t *options, uint64_
     /* Within one schema number, members are only ever added. */
     (void)fprintf(file, "{\n  \"schema\": \"fcn.node_stats/1\",\n");
     (void)fprintf(file, "  \"version\": \"%s\",\n", FCN_VERSION);
+    /* The tree the binary was built from (build_id.h), for a measurement to check it against
+     * the tree its result names. Its characters need no escaping. */
+    (void)fprintf(file, "  \"build_id\": \"%s\",\n", fcn_build_id);
     (void)fprintf(file, "  \"kernel\": \"%s\",\n", tskKERNEL_VERSION_NUMBER);
     (void)fprintf(file, "  \"stack_instrumented\": %s,\n", STACK_INSTRUMENTED);
     (void)fprintf(file, "  \"elapsed_ns\": %llu,\n", (unsigned long long)elapsed_ns);
@@ -1172,6 +1259,7 @@ static bool write_stats(const char *path, const node_options_t *options, uint64_
     }
 
     (void)fprintf(file, "\n  ],\n");
+    write_trace_stats(file);
     write_task_table(file);
     write_measurement_stats(file, stats);
     write_telemetry_stats(file, stats);
@@ -1263,8 +1351,14 @@ static bool check_configuration(const node_options_t *options, char *error, size
         return false;
     }
 
+    if ((options->trace_events != 0U) && (options->trace_path == NULL)) {
+        (void)snprintf(error, error_len, "--trace-events needs a trace (--trace-file)");
+        return false;
+    }
+
     return output_path_usable(options->platform.log_path, "--log-file", error, error_len) &&
-           output_path_usable(options->stats_path, "--stats-json", error, error_len);
+           output_path_usable(options->stats_path, "--stats-json", error, error_len) &&
+           output_path_usable(options->trace_path, "--trace-file", error, error_len);
 }
 
 /* "sensor.hang on" (posix_sensor.h): the sensor task's read waits as a driver waits for an
@@ -1358,8 +1452,29 @@ int main(int argc, char **argv)
 
     posix_flash_arm_hang(options.flash_hang);
 
+    /* The host-only trace before anything that it records starts: the sensor model, the CAN
+     * hardware thread, the tasks and the tick. */
+    if ((options.trace_path != NULL) &&
+        !posix_trace_open((options.trace_events != 0U) ? options.trace_events
+                                                       : POSIX_TRACE_DEFAULT_EVENTS,
+                          error, sizeof(error))) {
+        (void)fprintf(stderr, "fcn_node: %s\n", error);
+        posix_flash_close();
+        posix_retained_close();
+        return EXIT_FAILURE;
+    }
+
     posix_platform_init(&options.platform);
     LOG_INF("main", "fcn_node %s starting (FreeRTOS %s)", FCN_VERSION, tskKERNEL_VERSION_NUMBER);
+    LOG_INF("main", "build %s", fcn_build_id);
+
+    if (options.trace_path != NULL) {
+        posix_trace_info_t trace;
+
+        posix_trace_get_info(&trace);
+        LOG_INF("main", "host-only trace of up to %lu events, %lu ps per event (--trace-file)",
+                (unsigned long)trace.capacity, (unsigned long)trace.cost_ps);
+    }
 
     {
         posix_retained_info_t retained;
@@ -1410,6 +1525,7 @@ int main(int argc, char **argv)
         posix_platform_shutdown();
         posix_flash_close();
         posix_retained_close();
+        posix_trace_close();
         return EXIT_FAILURE;
     }
 
@@ -1435,15 +1551,30 @@ int main(int argc, char **argv)
     const uint64_t elapsed_ns = plat_time_ns() - start_ns;
 
     posix_can_stop();
+    /* Every context that records has ended: the tasks, the hardware thread; the tick thread
+     * ends with the platform below and records nothing after this. */
+    posix_trace_stop();
     posix_sim_close();
     LOG_INF("main", "scheduler stopped");
     posix_platform_shutdown();
     posix_flash_close();
     posix_retained_close();
 
+    bool trace_written = true;
+
+    if (options.trace_path != NULL) {
+        trace_written = posix_trace_write(options.trace_path, error, sizeof(error));
+
+        if (!trace_written) {
+            (void)fprintf(stderr, "fcn_node: %s\n", error);
+        }
+    }
+
     const int transport_error = posix_can_transport_error();
     const bool stats_written =
         (options.stats_path == NULL) || write_stats(options.stats_path, &options, elapsed_ns);
+
+    posix_trace_close();
 
     if (!stats_written) {
         (void)fprintf(stderr, "cannot write %s\n", options.stats_path);
@@ -1457,5 +1588,5 @@ int main(int argc, char **argv)
         return POSIX_EXIT_CAN_TRANSPORT_LOST;
     }
 
-    return stats_written ? EXIT_SUCCESS : EXIT_FAILURE;
+    return (stats_written && trace_written) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

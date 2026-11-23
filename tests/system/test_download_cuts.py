@@ -39,8 +39,9 @@ all of the unit's transitions done; the test checks which they leave here. Ten a
 "data" image; the last is the crash payload's download cut in COMMIT's commit field after its
 last transition, which leaves a complete trial that the bootloader then starts three times and
 rolls back. About half a minute in a functional run. lib/boot's unit tests cut every operation
-of every sequence at every position, test_update_cuts.py the staging of fcn_flash; phase 6 runs
-the large campaign.
+of every sequence at every position, test_update_cuts.py the staging of fcn_flash, and
+bench/power_loss.py (phase 6) runs the large campaign of 1062 cuts of the real programs, every
+operation of a staging, a download and a boot of a trial several times.
 """
 from __future__ import annotations
 

@@ -42,6 +42,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "posix_trace.h"
 #include "task.h"
 
 /* Name the port gives its tick thread (prvTimerTickHandler in port.c). */
@@ -180,6 +181,14 @@ int __wrap_usleep(useconds_t usec)
     const uint64_t now_ns = posix_monotonic_ns();
     uint64_t expected = ((now_ns - start_ns) / period_ns) + 1ULL;
     const uint64_t counted = atomic_load(&s_ticks_taken);
+    static _Thread_local bool base_traced = false;
+
+    /* The host-only trace (posix_trace.h) learns when every tick is due: tick k at start_ns +
+     * (k - 1) periods, from here until a drop moves the base. */
+    if (!base_traced) {
+        base_traced = true;
+        posix_trace_tick_base(start_ns, 1U, (uint32_t)period_ns);
+    }
 
     if ((counted + 1ULL) < expected) {
         const uint64_t lag = expected - counted;
@@ -192,6 +201,8 @@ int __wrap_usleep(useconds_t usec)
             start_ns += excess * period_ns;
             expected -= excess;
             (void)atomic_fetch_add(&s_dropped_ticks, excess);
+            /* From the tick after the ones counted, every tick is due on the new base. */
+            posix_trace_tick_base(start_ns, counted + 1ULL, (uint32_t)period_ns);
         } else {
             /* A tick was lost: return quickly so the port raises another one. */
             const struct timespec spacing = {0, CATCH_UP_SPACING_NS};

@@ -628,6 +628,212 @@ static void test_a_shorted_bus_ends_in_bus_off_and_recovery_waits_for_the_reques
     assert_nothing_was_lost_on_the_way_to_the_driver();
 }
 
+/* One record of the bus-off trace as can.trace gives it (posix_can_trace.h). */
+typedef struct {
+    unsigned long seq;
+    char kind[16];
+    unsigned long long model_ns;
+    unsigned long long pass_ns;
+    unsigned long long start_ns;
+    unsigned long long submit_ns;
+    unsigned long long attempts_failed;
+    unsigned int value;
+    unsigned int state;
+    unsigned int old_state;
+    unsigned int tec;
+    unsigned int rec;
+    unsigned long long frames;
+} trace_entry_t;
+
+#define TRACE_ENTRIES 128U
+
+/* Every record of the trace, read with as many can.trace requests as it takes; returns the
+ * number read. The numbers are checked to follow each other from 0 on. */
+static uint32_t read_trace(trace_entry_t *entries)
+{
+    uint32_t count = 0U;
+    unsigned long newest = 1UL;
+
+    while (count < newest) {
+        char command[32];
+        const char *reply;
+        const char *at;
+
+        (void)snprintf(command, sizeof(command), "can.trace %u", (unsigned int)count);
+        reply = sim(command);
+        newest = (unsigned long)sim_number(reply, "newest");
+        TEST_ASSERT_TRUE_MESSAGE(newest <= TRACE_ENTRIES, "more trace records than expected");
+        TEST_ASSERT_EQUAL_UINT64(0U, sim_number(reply, "oldest"));
+        at = strstr(reply, " r");
+
+        while ((at != NULL) && (count < newest)) {
+            trace_entry_t *entry = &entries[count];
+            int fields;
+
+            /* A record that does not convert fails the count of fields below. */
+            /* NOLINTBEGIN(cert-err34-c) */
+            fields =
+                sscanf(at, " r%lu=%15[^,],%llu,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u,%llu",
+                       &entry->seq, entry->kind, &entry->model_ns, &entry->pass_ns,
+                       &entry->start_ns, &entry->submit_ns, &entry->attempts_failed, &entry->value,
+                       &entry->state, &entry->old_state, &entry->tec, &entry->rec, &entry->frames);
+            /* NOLINTEND(cert-err34-c) */
+
+            TEST_ASSERT_EQUAL_INT_MESSAGE(13, fields, at);
+            TEST_ASSERT_EQUAL_UINT32(count, (uint32_t)entry->seq);
+            count++;
+            at = strstr(&at[2], " r");
+        }
+
+        TEST_ASSERT_TRUE_MESSAGE((count == newest) || (at == NULL), "a reply without records");
+    }
+
+    return count;
+}
+
+/* The transmit error counter after `attempts` attempts destroyed by a short from error active
+ * on: +16 each while error active (rule 3 and the bit error in the active flag, rule 4), +8 each
+ * from error passive on (rule 3); error passive at 8 attempts (128), bus off at 24 (256). */
+static unsigned int tec_after_shorted_attempts(unsigned long long attempts)
+{
+    return (attempts <= 8U) ? (unsigned int)(16U * attempts)
+                            : (unsigned int)(128U + (8U * (attempts - 8U)));
+}
+
+static void test_the_trace_records_the_way_into_bus_off_and_out_with_both_times(void)
+{
+    const can_frame_t first = make_frame(0x233U, 0U, 8U, 0x10U);
+    const can_frame_t after = make_frame(0x234U, 0U, 4U, 0x20U);
+    trace_entry_t trace[TRACE_ENTRIES];
+    plat_can_event_t event;
+    plat_can_event_t done;
+    can_frame_t heard;
+    const trace_entry_t *passive = NULL;
+    const trace_entry_t *bus_off = NULL;
+    const trace_entry_t *restart = NULL;
+    const trace_entry_t *recovery = NULL;
+    const trace_entry_t *first_tx = NULL;
+    uint64_t fault_ns;
+    uint32_t count;
+    unsigned int last_tec = 0U;
+
+    (void)memset(trace, 0, sizeof(trace));
+
+    /* A healthy bus leaves no record. */
+    TEST_ASSERT_TRUE(plat_can_tx(&first, 1U));
+    TEST_ASSERT_EQUAL_INT(PLAT_CAN_EVENT_TX_DONE, next_outcome().kind);
+    TEST_ASSERT_EQUAL_INT(1, peer_hears(&heard, (int)WAIT_MS));
+    TEST_ASSERT_NOT_NULL(strstr(sim("can.trace"), "oldest=0 newest=0"));
+
+    fault_ns = sim_number(sim("can.fault short"), "t_ns");
+    TEST_ASSERT_TRUE(plat_can_tx(&first, 2U));
+    TEST_ASSERT_EQUAL_UINT8(PLAT_CAN_ERROR_PASSIVE, next_state().state);
+    TEST_ASSERT_EQUAL_UINT8(PLAT_CAN_BUS_OFF, next_state().state);
+    plat_can_abort_tx();
+    TEST_ASSERT_EQUAL_INT(PLAT_CAN_EVENT_TX_ABORTED, next_outcome().kind);
+    (void)sim("can.fault none");
+    plat_can_request_restart();
+    event = next_state();
+    TEST_ASSERT_EQUAL_UINT8(PLAT_CAN_ERROR_ACTIVE, event.state);
+    TEST_ASSERT_TRUE(plat_can_tx(&after, 3U));
+    done = next_outcome();
+    TEST_ASSERT_EQUAL_INT(PLAT_CAN_EVENT_TX_DONE, done.kind);
+    TEST_ASSERT_EQUAL_INT(1, peer_hears(&heard, (int)WAIT_MS));
+    assert_frames_equal(&after, &heard);
+
+    count = read_trace(trace);
+    TEST_ASSERT_EQUAL_STRING("fault", trace[0].kind);
+    TEST_ASSERT_EQUAL_UINT(1U, trace[0].value); /* CAN_BUS_FAULT_SHORT */
+    TEST_ASSERT_EQUAL_UINT64(fault_ns, trace[0].pass_ns);
+    TEST_ASSERT_EQUAL_UINT64(0U, trace[0].attempts_failed);
+
+    for (uint32_t i = 1U; i < count; i++) {
+        const trace_entry_t *entry = &trace[i];
+
+        /* Every time of a step lies at or before the pass that carried it out. */
+        TEST_ASSERT_TRUE(entry->model_ns <= entry->pass_ns);
+        TEST_ASSERT_TRUE(entry->pass_ns >= trace[i - 1U].pass_ns);
+
+        if (bus_off == NULL) {
+            /* On the way up the counter follows the rules attempt by attempt, wherever the
+             * passes of the thread happen to look at it. */
+            TEST_ASSERT_TRUE(entry->tec > last_tec);
+            last_tec = entry->tec;
+
+            if (strcmp(entry->kind, "counters") == 0) {
+                TEST_ASSERT_EQUAL_UINT(tec_after_shorted_attempts(entry->attempts_failed),
+                                       entry->tec);
+            }
+        }
+
+        if (strcmp(entry->kind, "state") == 0) {
+            if ((entry->old_state == 0U) && (entry->state == 1U)) {
+                passive = entry;
+            } else if ((entry->old_state == 1U) && (entry->state == 2U)) {
+                bus_off = entry;
+            } else if ((entry->old_state == 2U) && (entry->state == 0U)) {
+                recovery = entry;
+            } else {
+                TEST_FAIL_MESSAGE("a state change the test did not cause");
+            }
+        } else if (strcmp(entry->kind, "restart") == 0) {
+            restart = entry;
+        } else if (strcmp(entry->kind, "first_tx") == 0) {
+            first_tx = entry;
+        } else {
+            TEST_ASSERT_TRUE_MESSAGE((strcmp(entry->kind, "counters") == 0) ||
+                                         (strcmp(entry->kind, "fault") == 0),
+                                     entry->kind);
+        }
+    }
+
+    TEST_ASSERT_NOT_NULL(passive);
+    TEST_ASSERT_NOT_NULL(bus_off);
+    TEST_ASSERT_NOT_NULL(restart);
+    TEST_ASSERT_NOT_NULL(recovery);
+    TEST_ASSERT_NOT_NULL(first_tx);
+    TEST_ASSERT_EQUAL_UINT(128U, passive->tec);
+    TEST_ASSERT_EQUAL_UINT(256U, bus_off->tec);
+    TEST_ASSERT_EQUAL_UINT64(24U, bus_off->attempts_failed);
+    TEST_ASSERT_TRUE(passive->model_ns >= fault_ns);
+
+    /* From error passive to bus off: 16 attempts of 15 bits (a bit error on the start-of-frame
+     * bit, then the error frame), each after the intermission and the suspend of an
+     * error-passive transmitter, 26 bit times apart. Exact, unless a late pass of the thread
+     * moved a start (late_resyncs). */
+    if (sim_number(sim("can.status"), "late_resyncs") == 0U) {
+        TEST_ASSERT_EQUAL_UINT64(can_bits_to_ns(16U * 26U, BITRATE),
+                                 bus_off->model_ns - passive->model_ns);
+    } else {
+        TEST_ASSERT_TRUE(bus_off->model_ns - passive->model_ns >= can_bits_to_ns(416U, BITRATE));
+    }
+
+    /* The request was served while bus off, and the recovery came 128 x 11 bit times after it,
+     * to the nanosecond: the model counts from the pass that served the request. */
+    TEST_ASSERT_EQUAL_UINT(2U, restart->state);
+    TEST_ASSERT_EQUAL_UINT64(restart->pass_ns, restart->model_ns);
+    TEST_ASSERT_TRUE(restart->model_ns >= bus_off->model_ns);
+    TEST_ASSERT_EQUAL_UINT64(can_bits_to_ns(128U * 11U, BITRATE),
+                             recovery->model_ns - restart->model_ns);
+    TEST_ASSERT_EQUAL_UINT64(event.eof_ns, recovery->model_ns);
+    TEST_ASSERT_EQUAL_UINT(0U, recovery->tec);
+    TEST_ASSERT_EQUAL_UINT(0U, recovery->rec);
+
+    /* The first frame after the recovery, with the times its outcome gave the driver, and its
+     * number among the frames transmitted: the second (the first went out before the short,
+     * the one loaded under it was destroyed and aborted). Every record before it counts one. */
+    TEST_ASSERT_EQUAL_UINT(after.id, first_tx->value);
+    TEST_ASSERT_EQUAL_UINT64(2U, first_tx->frames);
+    TEST_ASSERT_EQUAL_UINT64(1U, trace[0].frames);
+    TEST_ASSERT_EQUAL_UINT64(1U, recovery->frames);
+    TEST_ASSERT_EQUAL_UINT64(done.eof_ns, first_tx->model_ns);
+    TEST_ASSERT_EQUAL_UINT64(done.start_ns, first_tx->start_ns);
+    TEST_ASSERT_EQUAL_UINT64(done.submit_ns, first_tx->submit_ns);
+    TEST_ASSERT_TRUE(first_tx->submit_ns >= recovery->model_ns);
+    TEST_ASSERT_TRUE(first_tx == &trace[count - 1U]);
+    assert_nothing_was_lost_on_the_way_to_the_driver();
+}
+
 /* A receive error counter at 127 makes the error state follow every single frame: a destroyed
  * one takes the node to error passive (128), a good one back to error active (127). */
 static void change_state_once(uint32_t change)
@@ -945,6 +1151,7 @@ int main(void)
     RUN_TEST(test_a_receive_fifo_that_is_not_drained_overruns_and_keeps_the_oldest_frames);
     RUN_TEST(test_a_frame_nobody_acknowledges_stays_until_the_driver_aborts_it);
     RUN_TEST(test_a_shorted_bus_ends_in_bus_off_and_recovery_waits_for_the_request);
+    RUN_TEST(test_the_trace_records_the_way_into_bus_off_and_out_with_both_times);
     RUN_TEST(test_a_driver_that_falls_behind_loses_no_outcome_and_learns_the_last_state);
     RUN_TEST(test_a_frame_loaded_right_after_an_abort_is_not_aborted);
     RUN_TEST(test_an_abort_takes_back_the_frames_loaded_before_it_and_no_other);

@@ -19,15 +19,16 @@ import itertools
 import re
 import socket
 import time
+from dataclasses import dataclass
 
 # Commands that may reach the node more than once without changing the outcome: they only
-# read (ping, can.status, sensor.status, flash.status) or set a state to a value (can.fault and
-# the other sensor commands: a channel held, opened or cleared twice, or the front end taken off
-# line or made to hang twice, ends as it would after once). Any other command is sent once and
-# waited for: can.inject above all (it adds to the errors still to come), and flash.cut, which
-# counts its operations from the moment it is served, so that a second delivery after an
-# operation would move the cut.
-REPEATABLE = frozenset({"ping", "can.status", "can.fault",
+# read (ping, can.status, can.trace, sensor.status, flash.status) or set a state to a value
+# (can.fault and the other sensor commands: a channel held, opened or cleared twice, or the
+# front end taken off line or made to hang twice, ends as it would after once). Any other
+# command is sent once and waited for: can.inject above all (it adds to the errors still to
+# come), and flash.cut, which counts its operations from the moment it is served, so that a
+# second delivery after an operation would move the cut.
+REPEATABLE = frozenset({"ping", "can.status", "can.fault", "can.trace",
                         "sensor.status", "sensor.set", "sensor.open", "sensor.offline",
                         "sensor.hang", "sensor.clear", "flash.status"})
 
@@ -52,6 +53,58 @@ REFUSED_PAUSE_S = 0.01
 
 class SimError(RuntimeError):
     """The node answered a command with an error, or did not answer."""
+
+
+# ------------------------------------------------------------------ the bus-off trace
+
+#: The kinds of record of can.trace (posix_can_trace_kind_name() in posix_can_trace.c).
+TRACE_KINDS = ("state", "counters", "restart", "first_tx", "fault", "inject_tx", "inject_rx")
+
+#: The key of a record in the reply of can.trace: "r<number>".
+TRACE_KEY = re.compile(r"r([0-9]+)")
+
+#: The error states in the numbering of the trace (can_fc_state_t).
+TRACE_STATES = ("active", "passive", "busoff")
+
+
+@dataclass(frozen=True)
+class TraceRecord:
+    """One record of the controller's bus-off trace (platform/posix/posix_can_trace.h, which
+    says what each field means for each kind). Times are CLOCK_MONOTONIC nanoseconds, the clock
+    of the model, of the node's log and of time.monotonic_ns()."""
+    seq: int
+    kind: str
+    model_ns: int
+    pass_ns: int
+    start_ns: int
+    submit_ns: int
+    attempts_failed: int
+    value: int
+    state: int
+    old_state: int
+    tec: int
+    rec: int
+    frames: int
+
+
+@dataclass(frozen=True)
+class TraceRead:
+    """What SimControl.can_trace() read: the records in order, how many the ring had already
+    overwritten, and the number the next record will get."""
+    records: list[TraceRecord]
+    lost: int
+    newest: int
+
+
+def parse_trace_record(key: str, value: str) -> TraceRecord:
+    """The record of one "r<seq>=<kind>,<model_ns>,...,<frames>" pair of a can.trace reply, its
+    fields in the order of TraceRecord. ValueError for anything else."""
+    found = TRACE_KEY.fullmatch(key)
+    fields = value.split(",")
+    if found is None or len(fields) != 12 or fields[0] not in TRACE_KINDS:
+        raise ValueError(f"not a trace record: {key}={value}")
+    numbers = [int(field) for field in fields[1:]]
+    return TraceRecord(int(found.group(1)), fields[0], *numbers)
 
 
 class SimControl:
@@ -148,6 +201,32 @@ class SimControl:
         """Destroy the next `count` transmission attempts ("tx") or received frames ("rx").
         Not repeated on a timeout: the count adds to what is left (see REPEATABLE)."""
         return self.request(f"can.inject {kind} {count}")
+
+    def can_trace(self, start: int = 0) -> TraceRead:
+        """The records of the controller's bus-off trace from number `start` on, up to the
+        newest at the time of the last request (platform/posix/posix_can_trace.h), read with as
+        many can.trace requests as they take. Records the ring no longer keeps are counted in
+        TraceRead.lost, not returned."""
+        records: list[TraceRecord] = []
+        lost = 0
+        at = start
+        while True:
+            reply = self.request(f"can.trace {at}")
+            oldest, newest = int(reply["oldest"]), int(reply["newest"])
+            if at < oldest:
+                lost += oldest - at
+                at = oldest
+            got = sorted((parse_trace_record(key, value) for key, value in reply.items()
+                          if TRACE_KEY.fullmatch(key)), key=lambda record: record.seq)
+            for record in got:
+                if record.seq != at:
+                    raise SimError(f"can.trace from {at} answered with record {record.seq}")
+                records.append(record)
+                at += 1
+            if at >= newest:
+                return TraceRead(records=records, lost=lost, newest=newest)
+            if not got:
+                raise SimError(f"can.trace {at} returned no record below newest={newest}")
 
     # --------------------------------------------------------------- sensor front-end model
     #

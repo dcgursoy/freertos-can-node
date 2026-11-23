@@ -170,9 +170,9 @@ def test_a_late_answer_to_a_command_that_must_not_run_twice_is_still_taken(fake_
 
 
 def test_repeatable_commands_are_the_ones_that_read_or_set_a_state():
-    assert REPEATABLE == {"ping", "can.status", "can.fault", "sensor.status", "sensor.set",
-                          "sensor.open", "sensor.offline", "sensor.hang", "sensor.clear",
-                          "flash.status"}
+    assert REPEATABLE == {"ping", "can.status", "can.fault", "can.trace", "sensor.status",
+                          "sensor.set", "sensor.open", "sensor.offline", "sensor.hang",
+                          "sensor.clear", "flash.status"}
     assert "flash.cut" not in REPEATABLE      # it counts from the moment it is served
 
 

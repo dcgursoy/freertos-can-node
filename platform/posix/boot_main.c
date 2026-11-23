@@ -56,9 +56,10 @@
  * (plat_retained.h, THE REMAINING WINDOW).
  *
  * THE LOG. Lines in lib/log's format, stamped with CLOCK_MONOTONIC like the node's, appended to
- * --log-file (default stderr): the start (reset cause, cell, flash), the metadata as found, the
- * decision, the state change, the jump. Errors also go to stderr. The test harness gives the
- * bootloader a log of its own: the node truncates its --log-file when it starts.
+ * --log-file (default stderr): the start (reset cause, cell, the build id of build_id.h, which
+ * --version prints as well, and the flash), the metadata as found, the decision, the state
+ * change, the jump. Errors also go to stderr. The test harness gives the bootloader a log of
+ * its own: the node truncates its --log-file when it starts.
  *
  * TIMING. Flash operations wait the modelled times with clock_nanosleep (posix_flash.c). A
  * select that boots the confirmed image reads only (no waits); a trial costs one program of
@@ -78,6 +79,7 @@
 #include <unistd.h>
 
 #include "boot_host.h"
+#include "build_id.h"
 #include "posix_flash.h"
 #include "posix_retained.h"
 
@@ -119,7 +121,9 @@ static void print_usage(const char *program)
         "                         bootloader (1 to %u), torn as SEED says (default 0)\n"
         "  --log-file PATH        append the log to PATH (default: stderr)\n"
         "  --log-level LEVEL      error, warn, info (default) or debug\n"
-        "  --version, --help\n"
+        "  --version              print the version and the build id (the commit, and a\n"
+        "                         hash of uncommitted changes) and exit; also in the log\n"
+        "  --help                 print this text and exit\n"
         "The options after -- go to the image, followed by --flash-file and --retained-file.\n"
         "exit status (when no image is started): 0 --help or --version; 1 usage or start-up\n"
         "error; 12 a power cut fired; %d nothing bootable; %d flash error; %d the image could\n"
@@ -219,7 +223,7 @@ static int parse_options(int argc, char **argv, boot_options_t *options)
             }
             break;
         case OPT_VERSION:
-            (void)printf("fcn_boot %s\n", FCN_VERSION);
+            (void)printf("fcn_boot %s build %s\n", FCN_VERSION, fcn_build_id);
             result = 1;
             break;
         case OPT_HELP:
@@ -639,6 +643,7 @@ int main(int argc, char **argv)
             "fcn_boot %s starting: reset cause %s (retained cell: %s, %lu resets since power-on)",
             FCN_VERSION, posix_reset_reason_name(retained.cause), retained.verdict,
             (unsigned long)retained.resets);
+    LOG_INF(TAG, "build %s", fcn_build_id);
 
     /* The bootloader waits the modelled times by sleeping (no wait function), and a cut ends it
      * as a loss of supply without a kernel (no power-loss function): posix_flash.h. */

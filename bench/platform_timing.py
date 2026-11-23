@@ -24,8 +24,14 @@ content of the uncommitted changes, not only whether there are any. FCN_SELFTEST
 another binary to measure; nothing is built then, and the same check applies, so a binary
 built from a different set of uncommitted changes is refused as well.
 
+As every bench of phase 6 does (fcn_tools.results' load check), it refuses to measure when the
+1-minute load average at its start is above --max-load (default 1.0), exit status 3, unless
+--allow-loaded makes it measure and mark the result "loaded": true; --out DIR writes the result
+and the figure into DIR instead of results/. Every other refusal exits 1, as before phase 6.
+
     python bench/platform_timing.py                 # 10 s per run, about a minute in total
     python bench/platform_timing.py --seconds 60    # longer runs, about 4.5 minutes
+    python bench/platform_timing.py --seconds 1 --out /tmp/pt   # a test of the bench
     python bench/platform_timing.py --replot        # redraw the figure from the last run
 """
 from __future__ import annotations
@@ -42,6 +48,9 @@ from pathlib import Path
 import numpy as np
 
 from fcn_tools import paths, plotstyle, results
+# The build id of the tree a result names (the same rule as cmake/FcnBuildId.cmake) and the
+# check of the self-test's ids against it live in fcn_tools.results, shared with every bench.
+from fcn_tools.results import build_id_mismatch, tree_build_id  # noqa: F401
 
 IRQ_PERIOD_US = 250  # about the frame rate of a saturated 500 kbit/s CAN bus
 STORM_SECONDS_MAX = 5
@@ -191,40 +200,6 @@ def plot(raw: dict, data: dict, path: Path) -> None:
     plotstyle.save(fig, path)
 
 
-# The changes that make up a dirty build id; must match cmake/FcnBuildId.cmake exactly.
-DIFF_FOR_BUILD_ID = ["diff", "HEAD", "--binary", "--no-color", "--no-ext-diff", "--no-textconv",
-                     "--no-renames", "--ignore-submodules", "--", ".", ":(exclude)results"]
-
-
-def changes_hash() -> str:
-    """First 12 hex digits of the git blob hash of the tree's uncommitted changes, computed as
-    cmake/FcnBuildId.cmake computes it; "unknown" if git fails."""
-    git = ["git", "-C", str(paths.REPO_ROOT), "--no-optional-locks"]
-    try:
-        diff = subprocess.run([*git, *DIFF_FOR_BUILD_ID], capture_output=True, check=True)
-        blob = subprocess.run([*git, "hash-object", "--stdin"], input=diff.stdout,
-                              capture_output=True, check=True)
-    except (OSError, subprocess.CalledProcessError):
-        return "unknown"
-    digest = blob.stdout.decode().strip()
-    return digest[:12] if digest else "unknown"
-
-
-def tree_build_id(provenance: dict) -> str:
-    """The build id that a binary built from the tree in `provenance` carries.
-
-    Same rule as cmake/FcnBuildId.cmake: the commit; if tracked files other than results/
-    differ from it, "-dirty-" and the hash of the changes as they are now (changes_hash);
-    "unknown" without git."""
-    commit = provenance["git_commit"]
-    if commit == "unknown":
-        return "unknown"
-    if not provenance["git_modified_files"]:
-        return commit
-    digest = changes_hash()
-    return "unknown" if digest == "unknown" else f"{commit}-dirty-{digest}"
-
-
 def selftest_binary() -> tuple[Path, str]:
     """Build the release preset unless FCN_SELFTEST names a binary; return it and its origin."""
     if os.environ.get("FCN_SELFTEST"):
@@ -243,25 +218,23 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build_id_mismatch(build_ids: set[str], provenance: dict) -> str | None:
-    """Why the binary does not belong to the tree in `provenance`, or None if it does."""
-    expected = tree_build_id(provenance)
-    if expected == "unknown":
-        return "the tree's build id is unknown (no git?), so the binary cannot be tied to it"
-    if build_ids != {expected}:
-        return (f"the self-test reports build id {', '.join(sorted(build_ids))}, but the tree is "
-                f"{expected}: the binary was not built from the tree the result would name")
-    return None
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--seconds", type=int, default=10, help="duration of each of the 4 runs")
     parser.add_argument("--replot", action="store_true",
                         help="only redraw the plot from the samples of the last run")
+    parser.add_argument("--out", type=Path, default=None, metavar="DIR",
+                        help="write platform_timing.json and .png into DIR (default: results/)")
+    parser.add_argument("--max-load", type=float, default=results.DEFAULT_LOAD_LIMIT,
+                        metavar="L", help="refuse to measure when the 1-minute load average at "
+                        f"the start is above L (default {results.DEFAULT_LOAD_LIMIT})")
+    parser.add_argument("--allow-loaded", action="store_true",
+                        help="measure even above --max-load; the result then says "
+                             "\"loaded\": true")
     args = parser.parse_args()
 
-    json_path = paths.results_dir() / "platform_timing.json"
+    out_dir = paths.results_dir() if args.out is None else args.out
+    json_path = out_dir / "platform_timing.json"
     png_path = json_path.with_suffix(".png")
     # The raw samples are kept next to the build, not in the repository; --replot redraws the
     # figure from them without measuring again.
@@ -274,6 +247,14 @@ def main() -> int:
         plot(dict(np.load(raw_path)), json.loads(json_path.read_text()), png_path)
         print(f"redrew {png_path}")
         return 0
+
+    try:
+        load = results.check_load(args.max_load, args.allow_loaded)
+    except ValueError as error:     # a limit that is no positive number
+        parser.error(str(error))
+    except results.HostLoaded as error:
+        print(error, file=sys.stderr)
+        return results.EXIT_HOST_LOADED
 
     binary, origin = selftest_binary()
     if not binary.exists():
@@ -297,7 +278,7 @@ def main() -> int:
                       "build_id": next(iter(build_ids)), "origin": origin}
 
     previous = json_path.read_bytes() if json_path.exists() else None
-    results.write_result("platform_timing", data)
+    results.write_result("platform_timing", data, out_dir=out_dir, load=load)
     mismatch = build_id_mismatch(build_ids, json.loads(json_path.read_text())["provenance"])
     if mismatch is not None:
         # The tree changed in the moment between the check and the write: put back what was

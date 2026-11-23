@@ -67,6 +67,7 @@
 
 #include "plat_sensor.h"
 #include "posix_sim.h"
+#include "posix_trace.h"
 
 /* Channels, in the order of the status reply: the current, the cells, the temperatures. */
 #define CH_CURRENT 0U
@@ -299,6 +300,10 @@ bool plat_sensor_read_current(int32_t *current_ma, bool *invalid)
 {
     uint64_t n;
     const bool answered = take_reading(GROUP_CURRENT, &n);
+
+    /* One current reading per sample: its number is the sample's (posix_trace.h; nothing is
+     * recorded unless the node runs with --trace-file). */
+    posix_trace_sensor(n);
 
     if (answered) {
         const int32_t model = profile_current_ma(n) + noise(CH_CURRENT, n, CURRENT_NOISE_MA);

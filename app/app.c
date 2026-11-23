@@ -1351,6 +1351,7 @@ static void run_posted_job(void)
             s_flash_stats.job_status[kind] = result.status;
             s_flash_stats.job_steps[kind] = result.steps;
             s_flash_stats.job_last_ns[kind] = took_ns;
+            s_flash_stats.job_total_ns[kind] += took_ns;
 
             if (took_ns > s_flash_stats.job_max_ns[kind]) {
                 s_flash_stats.job_max_ns[kind] = took_ns;

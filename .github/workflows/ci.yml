@@ -102,10 +102,11 @@ jobs:
         # steps above, where one that misses its timing tolerance (exit status 75) is repeated
         # once by its own CTest command; any other failure counts at once. The benchmark builds
         # the release preset itself and refuses a binary whose build id (commit plus a hash of
-        # the uncommitted changes) is not the checked-out tree's.
+        # the uncommitted changes) is not the checked-out tree's. A runner that has just built
+        # and tested is not idle: --allow-loaded measures anyway and marks the result loaded.
         continue-on-error: true
         run: |
-          "$FCN_VENV/bin/python" bench/platform_timing.py --seconds 5
+          "$FCN_VENV/bin/python" bench/platform_timing.py --seconds 5 --allow-loaded
           mkdir -p build/runner-results
           cp results/platform_timing.json results/platform_timing.png build/runner-results/
 

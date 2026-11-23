@@ -1130,7 +1130,8 @@ delay no task with a deadline or an alive indication to give.
   `flash_task` with flash, boot_init, described, have_record, seq, active_slot, trial_slot,
   attempts_used, records_valid, confirms, confirm_status and confirm_ns, and since phase 5
   confirmed_by_routine, self_skipped, idle_passes and, per job of the diagnostic task
-  (`jobs`: erase, write, exit, check, confirm), run, last_status, last_steps, last_ns and max_ns.
+  (`jobs`: erase, write, exit, check, confirm), run, last_status, last_steps, last_ns and max_ns,
+  and since phase 6 total_ns, their sum.
 - `flash`: the operation counts of the host's flash (above).
 - `tasks` and `task_table` include `flash`; `telemetry.messages` includes `BMS_BootInfo`.
 
@@ -1237,9 +1238,12 @@ The bootloader's own statuses are `BOOT_NOTHING_BOOTABLE` (40), `BOOT_FLASH_ERRO
 node, because the asan node does not fit a slot.
 
 [tests/system/update_bench.py](../tests/system/update_bench.py) is the bench the update tests
-share: the flash tool's commands, `info()` (which reads every flash twice, by `fcn_flash info`
-and by fcn_tools.flash, and fails on any difference), `expected_boot()` (what select must start
-for the metadata just read, written from the state machine above), `check_invariants()` (exactly
+share, since phase 6 a name for [fcn_tools.bench](../tools/fcn_tools/bench.py) and
+[fcn_tools.update_model](../tools/fcn_tools/update_model.py), which the measurements of bench/
+use outside pytest: the flash tool's commands, `info()` (which reads every flash twice, by
+`fcn_flash info` and by fcn_tools.flash, and fails on any difference), `expected_boot()` (what
+select must start for the metadata just read, written from the state machine above, and reading
+nothing of the code under test), `check_invariants()` (exactly
 one CONFIRMED slot, holding its recorded image intact; at most one TRIAL with 0 to 3 attempts
 used; every slot whose state names an image holding it intact), the bit flip of the bench, and
 the checks of BMS_NodeInfo, BMS_BootInfo and the hand-off against what was expected. The functional
@@ -1283,8 +1287,12 @@ That is 24 cuts: 21 in the functional runs of `scripts/test-system.sh`, where th
 times of the file's test cases in the JUnit reports of one run of `scripts/test-system.sh -k
 "test_update.py or test_update_cuts.py or test_boot.py or test_flash_file.py"`). It is small on
 purpose: lib/boot's unit campaign cuts every operation of every sequence at every position,
-test_flash_decoder.py every operation of a staged update with three seeds, and phase 6 runs the
-large campaign of at least 1000 trials. A cut of a one-unit program (a commit field, an attempt)
+test_flash_decoder.py every operation of a staged update with three seeds, and phase 6's
+[bench/power_loss.py](../bench/power_loss.py) runs the large campaign: 1062 cuts of the real
+programs (fcn_flash, fcn_boot and the node serving a download), every flash operation of a
+staging, a download and a trial's boot cut several times, each followed by the restart through
+fcn_boot, checked against the same reference, and the next update
+([docs/measurements.md](measurements.md#power_loss-the-power-loss-campaign)). A cut of a one-unit program (a commit field, an attempt)
 leaves none, some or all of its transitions done, as the seed says; the seeds of those cuts are
 chosen so that each outcome occurs (with lib/flash's model on this geometry, seed 7 leaves none,
 0 some and 4 all of a unit's transitions), and the tests check that it does.

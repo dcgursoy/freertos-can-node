@@ -5,10 +5,15 @@
  *
  * Priorities and periods are the ones the tasks are created with (app_tasks.h, can_io.h). The
  * execution-time budgets are DESIGN figures for a Cortex-M3 class target, not measurements:
- * on the POSIX port an execution time says nothing about a microcontroller, and phase 6
- * measures them on the target. The table says so ("wcet_basis": "design"). Each budget is the
- * sum of what its job does, as written next to it, rounded up; what the analysis then proves
- * is that the task set meets its deadlines as long as no job takes longer than its budget.
+ * on the POSIX port an execution time says nothing about a microcontroller. Phase 6 runs on
+ * the host and has no target, so it does not measure them: it measures the host's run time per
+ * task (FreeRTOS's run-time statistics, and per job from the node's host-only trace,
+ * bench/node_timing.py, docs/measurements.md), x86-64 times that say nothing about a Cortex-M3.
+ * Phase 7 builds the node for a Cortex-M3 under QEMU, which is not cycle-accurate either. The
+ * budgets therefore stay design figures, and the table says so ("wcet_basis": "design"). Each
+ * budget is the sum of what its job does, as written next to it, rounded up; what the analysis
+ * then proves is that the task set meets its deadlines as long as no job takes longer than its
+ * budget.
  *
  * HOW EACH TASK IS MODELLED (the modelling rules that come with tools/fcn_tools/sched.py: an
  * interrupt is a task above every task, a task released by another inherits its period and

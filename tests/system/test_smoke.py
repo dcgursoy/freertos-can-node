@@ -10,6 +10,7 @@ import time
 
 import pytest
 
+from fcn_tools import paths, results
 from fcn_tools.bus import ID_STATUS, open_bus, status_queue_counts, wait_for_id
 from fcn_tools.node import EXIT_OK
 from fcn_tools.simctl import SimError
@@ -34,6 +35,27 @@ def test_version_names_the_node_and_the_kernel(node_binary):
     assert out.returncode == 0
     assert out.stdout.startswith("fcn_node ")
     assert "FreeRTOS V11.3.3" in out.stdout
+    assert results.BUILD_ID.match(out.stdout.split()[-1]), out.stdout
+
+
+def test_the_node_the_bootloader_and_the_flash_tool_report_one_build_id(node_binary):
+    """platform/posix/build_id.h: the three programs of one build carry the same id, and the
+    node's log names it at the start."""
+    ids = {program.name: results.binary_build_id(program)
+           for program in (node_binary, paths.boot_binary(), paths.flash_tool_binary())}
+    assert len(set(ids.values())) == 1, ids
+    for program in (paths.boot_binary(), paths.flash_tool_binary()):
+        out = subprocess.run([str(program), "--version"], capture_output=True, text=True,
+                             timeout=10)
+        assert out.returncode == 0 and out.stdout.startswith(f"{program.name} "), out.stdout
+
+
+def test_the_programs_carry_the_build_id_of_the_tree(node_binary):
+    """What a bench checks before it writes a result (fcn_tools.results.require_tree_build()):
+    the binaries under test were built from this tree. scripts/test-system.sh builds before it
+    tests; a tree edited after the build fails here (build again)."""
+    expected = results.tree_build_id(results.provenance())
+    assert results.binary_build_id(node_binary) == expected
 
 
 def test_help_lists_every_option(node_binary):
@@ -41,7 +63,7 @@ def test_help_lists_every_option(node_binary):
     assert out.returncode == 0
     for option in ("--can", "--bitrate", "--sim-port", "--sensor-seed", "--duration-s",
                    "--stats-json", "--tick-mode", "--irq-mode", "--log-file", "--log-level",
-                   "--version"):
+                   "--trace-file", "--trace-events", "--version"):
         assert option in out.stdout
 
 
@@ -79,6 +101,9 @@ def test_runs_for_the_requested_time_and_reports_statistics(start_node):
     # 2000, plus the few ticks of ending the scheduler. One health period more would be 2100.
     assert 2000 <= stats["tick"]["count"] <= 2050
     assert stats["log_lines_dropped"] == 0
+    # The build id, as --version and the log say it (platform/posix/build_id.h).
+    assert stats["build_id"] == results.binary_build_id(node.binary)
+    assert f" build {stats['build_id']}" in node.log()
 
     tasks = {task["name"]: task for task in stats["tasks"]}
     assert set(tasks) == {"can_rx", "sensor", "process", "can_tx", "diag", "health", "flash",

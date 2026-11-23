@@ -36,12 +36,10 @@ FCN_REQUIRE_SOCKETCAN is set (CI sets it), in which case a missing interface is 
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import os
 import re
 import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -287,15 +285,11 @@ def _transport(kind: str, ports: PortBlock) -> Iterator[str]:
             pytest.fail(message, pytrace=False)
         pytest.skip(message)
 
-    # One interface is shared by everything on the machine. A lock file keeps two test runs
-    # from using it at the same time; the tests still assume nobody else transmits on it.
-    lock_path = Path(tempfile.gettempdir()) / f"fcn-test-{SOCKETCAN_INTERFACE}.lock"
-    with open(lock_path, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            yield f"socketcan:{SOCKETCAN_INTERFACE}"
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+    # One interface is shared by everything on the machine. A lock file keeps two test runs,
+    # or a test run and a bench, from using it at the same time; the tests still assume nobody
+    # else transmits on it.
+    with bus_module.socketcan_lock(SOCKETCAN_INTERFACE):
+        yield f"socketcan:{SOCKETCAN_INTERFACE}"
 
 
 @pytest.fixture(params=TRANSPORTS)

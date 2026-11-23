@@ -12,11 +12,14 @@
 # built from another. "Dirty" itself is decided exactly as tools/fcn_tools/results.py decides
 # it for the provenance of a result: `git status --porcelain --untracked-files=no
 # --ignore-submodules`, without results/ (which every measurement rewrites).
-# bench/platform_timing.py computes the same id for the tree it records (tree_build_id) and
-# refuses to write a result measured with a binary that carries another one. Untracked files
-# are not part of the id: the build compiles only files that tracked CMakeLists.txt files name,
-# so a new source file in the build means a modified tracked file. Without git, or outside a
-# repository, the id is "unknown".
+# tools/fcn_tools/results.py computes the same id for the tree a result records
+# (tree_build_id(); tests/python/test_results.py runs this script against it), and every bench
+# (bench/) refuses to write a result measured with a binary that carries another one. The host
+# programs report the id (platform/posix/build_id.h): the node in its statistics, --version and
+# log, fcn_boot in --version and its log, fcn_flash in --version, plat_selftest in its reports.
+# Untracked files are not part of the id: the build compiles only files that tracked
+# CMakeLists.txt files name, so a new source file in the build means a modified tracked file.
+# Without git, or outside a repository, the id is "unknown".
 #
 # The file is only rewritten when the id changed, so an unchanged tree does not relink.
 

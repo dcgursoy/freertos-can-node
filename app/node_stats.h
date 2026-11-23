@@ -131,9 +131,10 @@ typedef struct {
     uint32_t jobs[FLASH_JOB_KINDS];            /**< jobs run */
     boot_status_t job_status[FLASH_JOB_KINDS]; /**< the result of the last one of the kind */
     uint32_t job_steps[FLASH_JOB_KINDS];       /**< its lib/boot calls */
-    uint64_t job_last_ns[FLASH_JOB_KINDS]; /**< how long it took, waits for the flash included */
-    uint64_t job_max_ns[FLASH_JOB_KINDS];  /**< the longest of the kind */
-    bool confirmed_by_routine;             /**< the trial was confirmed by the routine */
+    uint64_t job_last_ns[FLASH_JOB_KINDS];  /**< how long it took, waits for the flash included */
+    uint64_t job_max_ns[FLASH_JOB_KINDS];   /**< the longest of the kind */
+    uint64_t job_total_ns[FLASH_JOB_KINDS]; /**< all of the kind together: a mean for phase 6 */
+    bool confirmed_by_routine;              /**< the trial was confirmed by the routine */
     uint32_t self_skipped; /**< self-confirms that found the trial confirmed by the routine */
     uint32_t idle_passes;  /**< waits that ended without a job or a request */
 } node_flash_task_stats_t;

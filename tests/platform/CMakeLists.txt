@@ -3,22 +3,12 @@
 # host that does not run them well. Such a test exits with status 75 and only that status is
 # repeated, once, by run_selftest.sh; any other failure counts at once.
 
-# The build id (the commit and, for a tree with uncommitted changes, a hash of those changes)
-# is written into a C file on every build, not when CMake configures, so a binary built after
-# a commit or an edit carries it (cmake/FcnBuildId.cmake).
-set(_fcn_build_id_c "${CMAKE_CURRENT_BINARY_DIR}/fcn_build_id.c")
-add_custom_target(fcn_build_id
-    COMMAND "${CMAKE_COMMAND}" "-DSOURCE_DIR=${CMAKE_SOURCE_DIR}" "-DOUTPUT=${_fcn_build_id_c}"
-            -P "${CMAKE_SOURCE_DIR}/cmake/FcnBuildId.cmake"
-    BYPRODUCTS "${_fcn_build_id_c}"
-    COMMENT "Build id of the source tree"
-    VERBATIM)
-
-add_executable(plat_selftest plat_selftest.c "${_fcn_build_id_c}")
-add_dependencies(plat_selftest fcn_build_id)
+# plat_selftest reports the build id of the tree it was built from in every JSON report
+# (fcn_build_id, platform/posix/build_id.h), as the node and the bootloader do.
+add_executable(plat_selftest plat_selftest.c)
 target_include_directories(plat_selftest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(plat_selftest PRIVATE _POSIX_C_SOURCE=200809L)
-target_link_libraries(plat_selftest PRIVATE fcn_platform_posix)
+target_link_libraries(plat_selftest PRIVATE fcn_platform_posix fcn_build_id)
 fcn_target_defaults(plat_selftest NO_COVERAGE)
 
 set(_fcn_sanitizer_env
@@ -82,8 +72,10 @@ endfunction()
 #                      from a thread of their own while the test reads (run under TSan too),
 #                      and the hang of "sensor.hang" with a reader thread of its own
 #   test_posix_retained the retained-RAM cell: starts and resets played by the test
+#   test_posix_can_trace the ring and the text of the CAN controller's bus-off trace, and the
+#                      cost of a record (printed, not judged)
 find_package(Threads REQUIRED)
-foreach(_test IN ITEMS can_backend posix_sim posix_sensor posix_retained)
+foreach(_test IN ITEMS can_backend posix_sim posix_sensor posix_retained posix_can_trace)
     add_executable(test_${_test} test_${_test}.c)
     target_compile_definitions(test_${_test} PRIVATE _POSIX_C_SOURCE=200809L)
     target_link_libraries(test_${_test} PRIVATE fcn_host_io unity Threads::Threads)

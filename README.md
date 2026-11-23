@@ -7,9 +7,10 @@ measurements on CAN and takes fail-safe A/B firmware updates over the same bus. 
 as a Linux process on the FreeRTOS POSIX port, and its CAN controller, flash and sensors are
 simulated around it, so that all of it builds, runs and is tested on a laptop and in CI.
 
-> **Work in progress: phases 0 to 5 of 8 are done.** This page is a placeholder until the
-> last phase. The sections below describe only what exists today and quote no results; the
-> final README will take every number from `results/*.json`.
+> **Work in progress: phases 0 to 5 of 8 are done, and phase 6's benches are built; their
+> results come next.** This page is a placeholder until the last phase. The sections below
+> describe only what exists today and quote no results; the final README will take every number
+> from `results/*.json`.
 
 ## Where the project stands
 
@@ -21,7 +22,7 @@ simulated around it, so that all of it builds, runs and is tested on a laptop an
 | 3 | Fault handling: trouble codes, the fault frame, watchdogs, reset cause | done |
 | 4 | Simulated NOR flash, bootloader, A/B update logic | done |
 | 5 | ISO-TP, UDS download, end-to-end update | done |
-| 6 | Measurements and plots | next |
+| 6 | Measurements and plots | benches done, results next |
 | 7 | Cortex-M3 build in QEMU with a real bootloader jump | |
 | 8 | Final README and documentation | |
 
@@ -110,7 +111,8 @@ end, judges and filters the readings, and publishes them on CAN in seven cyclic 
 of them protected end to end; a tester can switch the protected telemetry off and on with a
 protected command. [docs/architecture.md](docs/architecture.md) describes the tasks and how
 they work together, [docs/can-protocol.md](docs/can-protocol.md) the messages and the protection.
-No timing of the application has been measured yet; that is phase 6.
+No timing of the application is quoted yet: phase 6's benches measure it
+([docs/measurements.md](docs/measurements.md)), and their results come with the final runs.
 
 - **Messages in a DBC** ([dbc/fcn.dbc](dbc/fcn.dbc)). Every frame the node sends or accepts,
   with cycle times, value tables with "signal not available" codes, and the Data IDs of the
@@ -157,8 +159,9 @@ No timing of the application has been measured yet; that is phase 6.
   Response-time analysis for fixed priorities, in exact arithmetic, with priority-inheritance
   blocking, release jitter and non-preemptive sections, and the utilisation bounds only where
   their assumptions hold. The node writes its task table into its statistics and a system test checks it; the
-  execution-time budgets in it are design figures until phase 6 measures them
-  ([docs/architecture.md](docs/architecture.md#schedulability)).
+  execution-time budgets in it are design figures for a Cortex-M3 class target and stay so:
+  phase 6 runs on the host and measures the host's run time per task instead, which says
+  nothing about a Cortex-M3 ([docs/architecture.md](docs/architecture.md#schedulability)).
 - **Telemetry on the bus, decoded** ([tools/fcn_tools/decode.py](tools/fcn_tools/decode.py)).
   Frames decoded with cantools from the DBC and every protected one checked end to end;
   `python -m fcn_tools.monitor udp:29500` prints them live.
@@ -343,6 +346,70 @@ measured for a target).
   every kind of flash operation of a download, each followed by a start through the bootloader
   that must be what the state machine says and a download that must succeed.
 
+## What phase 6 adds
+
+The measurements of the brief, as benches: one script per measurement in [bench/](bench), each
+of which writes `results/<name>.json` (the data, with the command, the commit, the host, the load
+average and the build id of every binary it ran) and `results/<name>.png`.
+[docs/measurements.md](docs/measurements.md) says for each one what it measures, exactly how,
+under which conditions, why its trial counts are enough, and what its figures do and do not say
+about a microcontroller. Their results come with the final runs on a committed tree; this page
+quotes none yet. Every figure is host timing of the FreeRTOS POSIX port, and every result says
+so.
+
+- **node_timing** ([bench/node_timing.py](bench/node_timing.py)). The release jitter of the
+  periodic tasks against their tick's due time, the latency from a sample to the frame that
+  carries it (at the end of frame and at an observer of the bus), the periods of the cyclic
+  frames, the CPU load per task and the stack high-water marks, on an idle bus, under a flood at
+  half the bus and during a download, on both transports. A host-only trace of the scheduler
+  (`fcn_node --trace-file`, through the kernel's own trace macros; its cost per event is measured
+  and stated) gives every release, start and end; an observer in a process of its own keeps every
+  frame with the kernel's receive time, put on the node's clock across the steps of WSL2's wall
+  clock. The sample a frame carries is found by its E2E counter and checked against the node's
+  counters.
+- **bus_load** ([bench/bus_load.py](bench/bus_load.py)). Every frame on the bus with its exact
+  stuffed length: the load per identifier and in all, the tester's and the node's frames apart
+  during a download, against the DBC's nominal load; the captured node frames must equal the
+  controller's count.
+- **bus_off** ([bench/bus_off.py](bench/bus_off.py)). The way into bus off, counter by counter,
+  and the recovery against ISO 11898-1's 1408 bit times, at three bit rates, with every interval
+  labelled as the standard's, the model's, the node's recovery policy's or the host's; a host-only
+  trace of the controller model gives the model's time and the host's of every step.
+- **isotp_throughput** ([bench/isotp_throughput.py](bench/isotp_throughput.py)). The TransferData
+  rate for blocks of 1 to 1024 bytes, each block cut into the turns of both sides on one clock
+  and held against the diagnostic task's budget of events per tick; the node's longest response;
+  and a projection, labelled as one, of what 2048-byte blocks would save.
+- **updates** ([bench/updates.py](bench/updates.py)). 50 updates over SocketCAN and 10 over UDP
+  end to end with the flasher, step by step, each from the image the one before confirmed, every
+  failure kept and counted; and 10 downloads of an image whose payload is 256 KiB.
+- **power_loss** ([bench/power_loss.py](bench/power_loss.py)). A campaign of 1062 power cuts on
+  the real programs (fcn_flash, fcn_boot and the node serving a download), every flash operation
+  of a staging, a download and a trial's boot cut several times, each followed by the restart
+  through the bootloader, checked against the reference state machine, and the next update;
+  any trial replays from its seed.
+- **platform_timing** ([bench/platform_timing.py](bench/platform_timing.py)), from phase 0, is
+  run again in the final runs, now with the load check of the other benches.
+- **What the node gained for it.** On the host, documented in the node's usage text,
+  [docs/architecture.md](docs/architecture.md) and [docs/can-simulation.md](docs/can-simulation.md):
+  its build id (`--version`, the log, the
+  statistics' `build_id`), the scheduler trace (`--trace-file`) and the controller trace
+  (`can.trace` on the simulation control port). Behind the existing statistics, the sum of each
+  flash job kind's times (`total_ns`, for a mean): one 64-bit addition per job. The
+  application's behaviour does not change; when off, the scheduler trace costs one atomic load
+  per hook and the controller trace a comparison per pass of the hardware thread, and the cost
+  of a record when on is measured.
+- **What every bench shares** ([bench/README.md](bench/README.md)). Each builds the release
+  preset and refuses to write a result whose binaries, or whose node runs, do not carry the build
+  id of the tree the result names; refuses a loaded host unless told otherwise (and then marks the
+  result); gives every distribution with its count and only the percentiles the count supports,
+  and keeps the samples of its main figures (a histogram above 5000); redraws its plot from the
+  JSON; and has a `--quick` mode that a system test runs, checking structure and counts only,
+  never a time. `python bench/run_all.py` makes the final runs one bench at a time on an idle
+  machine.
+- **Tests.** Unit tests of every analysis on constructed data with known answers, a functional
+  system test per bench, and tests of the shared runner (cleanup on every signal) and of the
+  build-id checks.
+
 ## Build and test
 
 Ubuntu 24.04 (natively, or under WSL2):
@@ -392,6 +459,11 @@ randomisation off on kernels that randomise mmap with more than 28 bits (WSL2 am
 belong to the runner: it checks the executable bits in the git index, creates and verifies the
 SocketCAN interface `vcan0`, and runs the timing benchmark for the record.
 
+The benches of phase 6 are not part of `scripts/check.sh`: a measurement needs an idle machine
+and, for a result to quote, a committed tree. [bench/README.md](bench/README.md) has their
+commands and `python bench/run_all.py` makes all of them; the system tests run each bench's
+`--quick` mode, which checks the bench, not the figures.
+
 ## Repository layout
 
 ```
@@ -412,13 +484,16 @@ tests/           unit/ (Unity), platform/ (tests of the host layer), python/ (py
                  system/ (pytest, the node as a process), tools/ (C helpers the tests call)
 tools/           Python package: node and bus control, UDP bus for python-can, decoding and
                  E2E checks, the schedulability check, the image format and the flash file,
-                 the UDS tester and the flasher, result files; the codec generator
-bench/           measurement scripts; they write results/
-results/         measured data (JSON with provenance) and plots; host timing only
+                 the UDS tester and the flasher, result files and what the benches share
+                 (the runner, the bus observer, the analyses); the codec generator
+bench/           the benches (one script per measurement, bench/README.md) and run_all.py, the
+                 final runs; they write results/
+results/         measured data (JSON with provenance and the build ids) and plots; host timing
+                 only
 scripts/         one script per build, test and analysis step
 docs/            the application, the CAN protocol, the simulated CAN bus, the sensor model,
-                 fault handling, the update, diagnostics (ISO-TP and UDS), bug log, MISRA
-                 deviations, notes on WSL
+                 fault handling, the update, diagnostics (ISO-TP and UDS), the measurements,
+                 bug log, MISRA deviations, notes on WSL
 third_party/     FreeRTOS-Kernel and Unity, pinned submodules
 ```
 

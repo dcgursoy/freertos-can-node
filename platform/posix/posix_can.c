@@ -67,6 +67,10 @@
  * is a failure like any other: the socket stays bound and works again once the interface is
  * up, and so does the node. No bus fault is ever derived from a transport failure: the
  * bus faults belong to simulation control and the tests.
+ *
+ * Trace. The thread also records each step of a way into bus off and out of it again with the
+ * model's time and the time of its own pass (posix_can_trace.h, read with can.trace), so that a
+ * bench can tell the model's times from the host's. Nothing is recorded on a healthy bus.
  */
 #include "posix_platform.h"
 
@@ -76,6 +80,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/prctl.h>
@@ -85,7 +90,9 @@
 #include "can/can_ctrl.h"
 #include "can_backend.h"
 #include "plat_can.h"
+#include "posix_can_trace.h"
 #include "posix_sim.h"
+#include "posix_trace.h"
 #include "ring/spsc_ring.h"
 
 #define CAN_IRQ_LINE 0U
@@ -156,6 +163,14 @@ static bool s_next_request_held;
  * may be written. */
 static uint64_t s_failures_unreported;
 static uint64_t s_next_report_ns;
+
+/* Hardware thread only: the error counters of the last trace record, whether the next
+ * transmitted frame is the first after a recovery from bus off, and the frames transmitted
+ * since the start (posix_can_trace.h). */
+static uint16_t s_trace_tec;
+static uint16_t s_trace_rec;
+static bool s_trace_after_recovery;
+static uint64_t s_trace_frames;
 
 static uint8_t s_tx_storage[TX_RING_ENTRIES * sizeof(tx_request_t)];
 static uint8_t s_rx_storage[RX_RING_ENTRIES * sizeof(plat_can_rx_t)];
@@ -348,6 +363,56 @@ static void publish_status(void)
     atomic_store(&s_rec, can_ctrl_rec(&s_ctrl));
 }
 
+/* Add a trace record of a step made in this pass at `model_ns` (posix_can_trace.h), with the
+ * model's state and counters as they are now. */
+static void trace_step(posix_can_trace_kind_t kind, uint64_t model_ns, uint32_t value)
+{
+    posix_can_trace_record_t record;
+
+    (void)memset(&record, 0, sizeof(record));
+    record.kind = (uint8_t)kind;
+    record.model_ns = model_ns;
+    record.pass_ns = s_pass_ns;
+    record.attempts_failed = can_ctrl_stats(&s_ctrl)->tx_attempts_failed;
+    record.frames = s_trace_frames;
+    record.value = value;
+    record.state = (uint8_t)can_ctrl_state(&s_ctrl);
+    record.old_state = record.state;
+    record.tec = can_ctrl_tec(&s_ctrl);
+    record.rec = can_ctrl_rec(&s_ctrl);
+    posix_can_trace_add(&record);
+    s_trace_tec = record.tec;
+    s_trace_rec = record.rec;
+}
+
+/* Add a trace record of a model action carried out in this pass: a state change, or the first
+ * frame transmitted after a recovery, with the time and the counters the action carries. */
+static void trace_action(posix_can_trace_kind_t kind, const can_ctrl_action_t *action)
+{
+    posix_can_trace_record_t record;
+
+    (void)memset(&record, 0, sizeof(record));
+    record.kind = (uint8_t)kind;
+    record.model_ns = action->time_ns;
+    record.pass_ns = s_pass_ns;
+    record.attempts_failed = can_ctrl_stats(&s_ctrl)->tx_attempts_failed;
+    record.frames = s_trace_frames;
+    record.state = (uint8_t)action->state;
+    record.old_state = (uint8_t)action->old_state;
+    record.tec = action->tec;
+    record.rec = action->rec;
+
+    if (kind == POSIX_CAN_TRACE_FIRST_TX) {
+        record.start_ns = action->start_ns;
+        record.submit_ns = action->submit_ns;
+        record.value = action->frame.id;
+    }
+
+    posix_can_trace_add(&record);
+    s_trace_tec = record.tec;
+    s_trace_rec = record.rec;
+}
+
 /* Take every action the model has due and carry it out. */
 static void run_model(uint64_t now_ns)
 {
@@ -367,7 +432,17 @@ static void run_model(uint64_t now_ns)
                 transport_failed("send", now_ns);
             }
 
+            /* The host-only trace (posix_trace.h; nothing unless the node runs with
+             * --trace-file): the frame, its modelled end of frame and the time of the write. */
+            posix_trace_tx(&action.frame, action.time_ns);
             lag_record(&s_pacing, lateness(action.time_ns));
+            s_trace_frames++;
+
+            if (s_trace_after_recovery) {
+                trace_action(POSIX_CAN_TRACE_FIRST_TX, &action);
+                s_trace_after_recovery = false;
+            }
+
             event.kind = PLAT_CAN_EVENT_TX_DONE;
             event.handle = action.handle;
             event.submit_ns = action.submit_ns;
@@ -393,6 +468,12 @@ static void run_model(uint64_t now_ns)
         }
 
         case CAN_CTRL_ACTION_STATE_CHANGED:
+            trace_action(POSIX_CAN_TRACE_STATE, &action);
+
+            if (action.old_state == CAN_FC_BUS_OFF) {
+                s_trace_after_recovery = true;
+            }
+
             /* With the counters and the time of the change itself, if the event can be
              * queued now. If not, the end of this function catches up. */
             if (!tell_state((uint8_t)action.state, action.tec, action.rec, action.time_ns)) {
@@ -417,6 +498,11 @@ static void run_model(uint64_t now_ns)
     (void)tell_state((uint8_t)can_ctrl_state(&s_ctrl), can_ctrl_tec(&s_ctrl), can_ctrl_rec(&s_ctrl),
                      now_ns);
     publish_status();
+
+    /* The counters' way between the state changes, as far as the passes resolve it. */
+    if ((can_ctrl_tec(&s_ctrl) != s_trace_tec) || (can_ctrl_rec(&s_ctrl) != s_trace_rec)) {
+        trace_step(POSIX_CAN_TRACE_COUNTERS, now_ns, 0U);
+    }
 }
 
 /* The oldest transmit request not yet loaded, or NULL if there is none. It stays the oldest
@@ -480,7 +566,9 @@ static void serve_driver(uint32_t commands, uint64_t now_ns)
     }
 
     if ((commands & COMMAND_RESTART) != 0U) {
+        /* The count of rule 12 starts now (the model's request time is this pass's). */
         can_ctrl_request_restart(&s_ctrl, now_ns);
+        trace_step(POSIX_CAN_TRACE_RESTART, now_ns, 0U);
     }
 
     /* Move transmit requests into the controller's mailboxes. The driver never queues more
@@ -650,8 +738,32 @@ bool posix_can_set_start_fault(const char *name)
     return known;
 }
 
-/* Commands under "can.": status | fault <none|short|dominant|noack> | inject <tx|rx> <count>.
- * Runs in the hardware thread, within a pass of its loop. */
+/* "can.trace [<from>]": the trace records from number `from` on (default 0) that fit into the
+ * reply (posix_can_trace_format()). */
+static bool sim_can_trace(const char *args, char *reply, size_t reply_len)
+{
+    unsigned long from = 0UL;
+    char *end = NULL;
+
+    if (args[0] != '\0') {
+        if ((args[0] < '0') || (args[0] > '9')) {
+            (void)snprintf(reply, reply_len, "usage: can.trace [<from>]");
+            return false;
+        }
+
+        from = strtoul(args, &end, 10);
+
+        if ((*end != '\0') || (from > (unsigned long)UINT32_MAX)) {
+            (void)snprintf(reply, reply_len, "usage: can.trace [<from>]");
+            return false;
+        }
+    }
+
+    return posix_can_trace_format((uint32_t)from, reply, reply_len);
+}
+
+/* Commands under "can.": status | fault <none|short|dominant|noack> | inject <tx|rx> <count> |
+ * trace [<from>]. Runs in the hardware thread, within a pass of its loop. */
 static bool sim_can_handler(const char *verb, const char *args, char *reply, size_t reply_len)
 {
     const uint64_t now_ns = s_pass_ns;
@@ -709,6 +821,7 @@ static bool sim_can_handler(const char *verb, const char *args, char *reply, siz
 
         if (fault_from_name(args, &fault)) {
             can_ctrl_set_fault(&s_ctrl, fault, now_ns);
+            trace_step(POSIX_CAN_TRACE_FAULT, now_ns, (uint32_t)fault);
             (void)snprintf(reply, reply_len, "fault=%s t_ns=%llu", fault_name(fault),
                            (unsigned long long)now_ns);
             return true;
@@ -726,12 +839,14 @@ static bool sim_can_handler(const char *verb, const char *args, char *reply, siz
         if ((sscanf(args, "%7s %u", what, &count) == 2) && (count > 0U)) {
             if (strcmp(what, "tx") == 0) {
                 can_ctrl_inject_tx_errors(&s_ctrl, count);
+                trace_step(POSIX_CAN_TRACE_INJECT_TX, now_ns, (uint32_t)count);
                 (void)snprintf(reply, reply_len, "tx_errors=%u", count);
                 return true;
             }
 
             if (strcmp(what, "rx") == 0) {
                 can_ctrl_inject_rx_errors(&s_ctrl, count);
+                trace_step(POSIX_CAN_TRACE_INJECT_RX, now_ns, (uint32_t)count);
                 (void)snprintf(reply, reply_len, "rx_errors=%u", count);
                 return true;
             }
@@ -739,6 +854,10 @@ static bool sim_can_handler(const char *verb, const char *args, char *reply, siz
 
         (void)snprintf(reply, reply_len, "usage: can.inject <tx|rx> <count>");
         return false;
+    }
+
+    if (strcmp(verb, "trace") == 0) {
+        return sim_can_trace(args, reply, reply_len);
     }
 
     (void)snprintf(reply, reply_len, "unknown command 'can.%s'", verb);
@@ -883,9 +1002,15 @@ bool posix_can_start(const char *backend_spec, uint32_t bitrate, char *error, si
     s_pass_ns = s_started_ns;
     s_due_ns = CAN_CTRL_NO_WAKEUP;
     can_ctrl_init(&s_ctrl, &config, s_started_ns);
+    posix_can_trace_reset();
+    s_trace_tec = 0U;
+    s_trace_rec = 0U;
+    s_trace_after_recovery = false;
+    s_trace_frames = 0U;
 
     if (s_start_fault != CAN_BUS_FAULT_NONE) {
         can_ctrl_set_fault(&s_ctrl, s_start_fault, s_started_ns);
+        trace_step(POSIX_CAN_TRACE_FAULT, s_started_ns, (uint32_t)s_start_fault);
     }
 
     s_told_state = (uint8_t)can_ctrl_state(&s_ctrl);
