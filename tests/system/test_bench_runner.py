@@ -6,10 +6,11 @@ itself)."""
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
-from fcn_tools import bench, bus, results, runner
+from fcn_tools import bench, bus, paths, results, runner
 from fcn_tools.node import EXIT_OK
 
 TRANSPORTS = ["udp", pytest.param("socketcan", marks=pytest.mark.socketcan)]
@@ -53,7 +54,10 @@ def test_a_session_runs_a_board_through_the_bootloader(tmp_path, images):
     assert session.problems == []
 
 
-def test_the_benches_accept_the_binaries_of_this_tree():
+def test_the_benches_accept_the_binaries_of_this_tree(monkeypatch):
+    # In-process, where the program running is pytest: stand for a bench of this checkout, the
+    # script require_tree_build() checks (results.script_mismatch()).
+    monkeypatch.setattr(sys, "argv", [str(paths.REPO_ROOT / "bench" / "node_timing.py")])
     binaries = runner.prepare_binaries(build=False)
     assert results.require_tree_build(binaries.as_dict()) == results.tree_build_id(
         results.provenance())

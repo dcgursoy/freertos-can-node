@@ -1,8 +1,8 @@
 """bench/updates.py runs: its --quick mode (one update over the UDP bus, one download of a small
 data payload) into a temporary directory writes a result of the documented schema whose counts
 agree with each other, with the flasher's report, with the node's log and statistics and with
-the flash. Structure and counts only: no figure of the host's clock is judged here
-(bench/README.md)."""
+the flash, and whose node's restart is the difference of the two runs' log stamps. Structure
+and counts only: no figure of the host's clock is judged here (bench/README.md)."""
 from __future__ import annotations
 
 import json
@@ -63,6 +63,16 @@ def test_a_quick_run_writes_a_consistent_result(tmp_path):
     assert [run_["status"] for run_ in update["runs"]] == [10, 0]
     erase = update["node_download"]["erase"]
     assert (erase["address"], erase["bytes"]) == (0x102000, update["image_bytes"])
+    # The node's restart from its own log stamps, both lines found, the trial's after the
+    # reset's: the summary's reset_to_trial is that, and wait_for_trial the flasher's step.
+    restart = update["node_restart"]
+    assert restart["us"] == restart["trial_start_us"] - restart["reset_us"] > 0
+    summary = data["summary"]["updates_udp"]
+    assert summary["reset_to_trial"]["n"] == 1 and summary["reset_to_trial"]["unit"] == "ms"
+    assert summary["reset_to_trial"]["max"] == pytest.approx(restart["us"] / 1000, abs=1e-3)
+    assert summary["reset_to_trial_refused"]["value"] == 0
+    assert summary["wait_for_trial"]["max"] == pytest.approx(update["steps"]["wait_for_trial"],
+                                                             abs=1e-3)
     trial = update["node_trial"]
     assert trial["handoff"]["slot"] == "B" and trial["handoff"]["image_version"] == "3.1.0"
     assert trial["confirm_state"] == "CONFIRMED"

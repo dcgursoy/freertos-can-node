@@ -3,11 +3,14 @@ first failure, with constructed loads and constructed bench runs."""
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
-from fcn_tools import paths
+from fcn_tools import paths, results
 
 
 def _load_run_all():
@@ -120,3 +123,44 @@ def test_a_dirty_tree_is_refused(monkeypatch, capsys):
 def test_list_prints_the_plan_and_runs_nothing(capsys):
     assert run_all.main(["--list"]) == 0
     assert "platform_timing" in capsys.readouterr().out
+
+
+def _run_copy(script: Path, *args: str) -> subprocess.CompletedProcess:
+    """`script` (a copy of run_all.py) run as the final runs run it, with fcn_tools of this
+    checkout, whatever the virtual environment's editable install points at."""
+    env = dict(os.environ, PYTHONPATH=str(paths.REPO_ROOT / "tools"))
+    return subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True,
+                          timeout=60, cwd=script.parent, env=env, check=False)
+
+
+def _copy(tmp_path: Path, where: str, change: bytes = b"") -> Path:
+    """run_all.py copied into another checkout (a directory with a CMakePresets.json) or into no
+    checkout, with `change` appended."""
+    source = (paths.REPO_ROOT / "bench" / "run_all.py").read_bytes() + change
+    if where == "another checkout":
+        directory = tmp_path / "other" / "bench"
+        directory.mkdir(parents=True)
+        (tmp_path / "other" / "CMakePresets.json").write_text("{}\n")
+    else:
+        directory = tmp_path
+    copy = directory / "run_all.py"
+    copy.write_bytes(source)
+    return copy
+
+
+@pytest.mark.parametrize("where, change", [
+    ("another checkout", b"# another checkout's change\n"),
+    ("no checkout", b""),
+], ids=["another checkout", "no checkout"])
+def test_a_run_all_that_is_not_this_checkout_s_runs_nothing(tmp_path, where, change):
+    # --list, which starts no bench even if the refusal were missing.
+    done = _run_copy(_copy(tmp_path, where, change), "--list")
+    assert done.returncode == results.EXIT_BUILD_MISMATCH, done.stdout + done.stderr
+    assert done.stdout == "" and done.stderr.startswith("no bench run: the bench script ")
+
+
+def test_a_run_all_with_this_checkout_s_bytes_elsewhere_is_its_own(tmp_path):
+    # The same tree through another mount (/mnt/c/... for /home/dev/fcn) is not refused.
+    done = _run_copy(_copy(tmp_path, "another checkout"), "--list")
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.splitlines()[-1].startswith("platform_timing")

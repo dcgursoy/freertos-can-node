@@ -15,7 +15,12 @@ sentence (`HOST_TIMING_NOTE`, [tools/fcn_tools/results.py](../tools/fcn_tools/re
 
 > Measured on the FreeRTOS POSIX port, where every task is a thread of a Linux process. Times,
 > jitter and latencies are those of the host's scheduler and are not what the same code shows on
-> a microcontroller; counts, orderings and sizes of protocol data are independent of the host.
+> a microcontroller. The contents, orderings and sizes of protocol data, and the frames and bytes
+> an exchange takes, do not depend on the host. What happens in a stretch of time does: the jobs
+> and frames of a run of fixed length, ticks dropped, jobs released early; and a stall of the
+> host past the node's 500 ms watchdog or a 1 s protocol timer fails what the node would have
+> passed. Such a failure is never hidden (the bench counts and keeps it, or writes no result),
+> and no stall makes a check pass, so a count of 0 failures holds whatever the host did.
 
 and a sentence of the bench's own where its figures say more or less than that.
 
@@ -40,10 +45,10 @@ and repeated in the same way.
 **The binaries it measured.** Each host program carries the build id of the tree it was built
 from ([platform/posix/build_id.h](../platform/posix/build_id.h), written by
 [cmake/FcnBuildId.cmake](../cmake/FcnBuildId.cmake) at every build). The id is the commit; a
-tree with uncommitted changes to tracked files (other than results/) adds `-dirty-` and the
-first 12 hex digits of the git hash of those changes. The node reports it in `--version`, in a
-log line at its start and in its statistics (`build_id`); fcn_boot in `--version` and its log;
-fcn_flash in `--version`; plat_selftest in every report.
+tree with uncommitted changes to tracked files (other than results/), the submodules' included,
+adds `-dirty-` and the first 12 hex digits of the git hash of those changes. The node reports
+it in `--version`, in a log line at its start and in its statistics (`build_id`); fcn_boot in
+`--version` and its log; fcn_flash in `--version`; plat_selftest in every report.
 
 A bench builds the release preset first, unless it is told which binaries to use (`--no-build`,
 or `FCN_NODE`, `FCN_BOOT` and `FCN_FLASH_TOOL`). It then refuses to measure (exit status 4) when
@@ -52,13 +57,28 @@ by the same rule, and when a node that ran (also one started through fcn_boot fr
 image) reports another one in its statistics. `write_result()` checks again just before and just
 after it writes the result, against the provenance it writes, and refuses a binary whose SHA-256
 changed while the bench ran. A result therefore names exactly the commit, or the dirty tree, its
-binaries were built from. The id covers tracked files only, as the build compiles only files
-that tracked CMakeLists.txt name; the final runs are made on a committed tree
-([bench/run_all.py](../bench/run_all.py) refuses a dirty one), so every final result names a
-commit. The verification of phase 6 planted each case and saw the refusal, with nothing
-written: binaries built from another tree (exit 4 within a second, before measuring, for every
-bench; platform_timing exit 1), a tracked file edited after the build (exit 4), and a tracked
-file edited while a bench ran (exit 4 when it came to write).
+binaries were built from. The id covers the tracked files and the submodules: the FreeRTOS
+kernel, whose POSIX port the node runs on, and Unity are submodules (third_party/), and one
+checked out at another commit than the tree records, or with a tracked file changed in it, makes
+the tree dirty, its own diff part of the hash. No untracked file counts, in the tree or in a
+submodule, as the build compiles only files that tracked CMakeLists.txt name. The final runs are
+made on a committed tree ([bench/run_all.py](../bench/run_all.py) refuses a dirty one), so every
+final result names a commit. The verification of phase 6 planted each case and saw the refusal,
+with nothing written: binaries built from another tree (exit 4 within a second, before
+measuring, for every bench; platform_timing exit 1), a tracked file edited after the build (exit
+4), and a tracked file edited while a bench ran (exit 4 when it came to write).
+
+**The script that computed it.** The commit a result names is that of the checkout `fcn_tools`
+is imported from, and the bench script computes the figures (isotp_throughput.py and updates.py
+keep their analysis functions in it). So a bench also refuses to measure (exit status 4)
+unless its own script is the file at the same path in that checkout, byte for byte
+(`fcn_tools.results.script_mismatch()`, in `require_tree_build()` and `write_result()`). A
+script of another checkout (to which the virtual environment's editable install gives this
+checkout's `fcn_tools`) or of no checkout is refused, so the script the result's `command`
+names, in the checkout whose commit the result names, is the one that computed it.
+platform_timing refuses it when it comes to write (exit 1), and bench/run_all.py before it
+starts anything. The bytes are compared, not the paths: under WSL the same tree is reached
+through two mounts (/home/dev/fcn and /mnt/c/...).
 
 **The host.** Timing benches assume an otherwise idle machine. The 1-minute load average is
 read when the bench starts, before its build and before it measures, and is recorded in
@@ -116,9 +136,10 @@ the tests judge by the same rules. The diagnostic tester (`fcn_tools.tester`) is
 carrying raw requests, and the flasher is udsoncan 1.26.1 over it.
 
 **Exit statuses.** 0 a result was written; 1 an error (the bench says what; nothing written); 2 a
-usage error; 3 a loaded host; 4 a binary that is not the tree's build; 5 (power_loss and updates
-only) a result was written that holds a failed trial or update, which must be looked at; 128 + N
-the bench was ended by signal N. bench/run_all.py stops at the first status other than 0.
+usage error; 3 a loaded host; 4 a binary that is not the tree's build, or a bench script that
+is not the tree's; 5 (power_loss and updates only) a result was written that holds a failed
+trial or update, which must be looked at; 128 + N the bench was ended by signal N.
+bench/run_all.py stops at the first status other than 0.
 
 ## The clocks of a run
 
@@ -238,7 +259,8 @@ participant of the UDP bus, keeps every frame with its kernel receive time on CL
 **The intervals, exactly.**
 
 - *Release jitter* (sensor, health). For each job:
-  - its arrival is the due time of the tick its `xTaskDelayUntil()` waited for;
+  - its arrival is the due time of the tick its `xTaskDelayUntil()` waited for, on the base in
+    force for that tick (see *Ticks given up* below);
   - its release is the moment the kernel made it ready (the tick handler, in the thread the
     tick's signal interrupted);
   - its start is its first switch-in after that;
@@ -284,6 +306,34 @@ participant of the UDP bus, keeps every frame with its kernel receive time on CL
   decision, see above); release and start lateness are the figures for the timing against the
   clock, the tick's error included. The period deviation, between consecutive starts, is not
   shifted by it, but for the two intervals on either side of a job released early.
+- *Ticks given up* (`release.<task>.after_drop`). When the kernel takes no tick for several
+  periods (the host did not run the task threads, or a task kept a critical section), the tick
+  thread makes the missing ticks up one at a time, 100 µs apart, as long as the count trails the
+  ticks due by at most `POSIX_TICK_MAX_CATCH_UP_TICKS` (6,
+  [posix_tick_plan.h](../platform/posix/posix_tick_plan.h)). A longer lag it gives up, all of it
+  but the tick just raised (at least 6 ticks, counted in `runs[].tick_dropped`): it moves the
+  base later by as many periods, and from the tick after the ones the kernel had taken every
+  tick is due on the moved base. Each job is measured on the base in force for its own tick. On
+  the grid before the drop every later job would carry the whole shift, which means nothing for
+  any of them but the first. On the shifted grid, though, a job's lateness keeps at most the part
+  of such a stall that was caught up, a lag of at most `POSIX_TICK_MAX_CATCH_UP_TICKS` ticks; the
+  ticks given up show in the period deviation (between the starts of the jobs on either side of
+  the stall) and in `after_drop`. That list holds, per periodic task and over the runs of a
+  condition, every job whose tick is due on a later base than the tick of the job before it (for
+  the task's first job, than the trace's first base): the first job after one drop or more. For
+  each it gives the run (`run`), the base's first tick
+  (`first_tick`), the drops since the job before (`drops`, 1 unless a second drop came before
+  the task's next job) and the ticks they gave up (`dropped_ticks`), the tick the job waited for
+  (`wake_tick`), whether it is in the analysis window and so in the distributions (`in_window`:
+  the list covers the whole run, as `tick_dropped` does), and its release and start lateness on
+  its own base, as the distributions hold them (`release_lateness_us`, `start_lateness_us`), and
+  on the base of the job before (`release_lateness_on_the_base_before_us`,
+  `start_lateness_on_the_base_before_us`), larger by exactly `dropped_ticks` periods. The
+  summary counts the jobs of the list in the window (`sensor_first_jobs_after_a_drop`,
+  `health_first_jobs_after_a_drop`). The processing job that such a sensor job's sample released
+  is measured from the same arrival, on the moved base. A drop after a task's last job in the
+  trace has no entry, so the `dropped_ticks` of a run's entries add up to its `tick_dropped` or
+  less.
 - *The tick count against the grid* (`tick_lead`, per condition, over the whole of each run, its
   start included). Every SWITCH and READY event of the trace carries the kernel's tick count,
   and each count is taken at its first sight
@@ -399,8 +449,11 @@ which put the start of the window into the node's start-up, 392 sensor jobs wher
 - The three downloads give about 7,000 sensor jobs (6,988 per transport in the final run) and
   about 700 health jobs (699 and 698; p99 only).
 
-**What it says about a microcontroller.** The orderings and counts carry over: which frame
-carries which sample, the jobs, the gaps. The times do not.
+**What it says about a microcontroller.** The orderings carry over: which frame carries which
+sample. The times do not, and neither do the counts of a run: its jobs and frames, the
+publishes missing on the bus, the ticks dropped and the jobs released early are what the host
+let the node do in the run's duration (a host that makes the node give up ticks leaves its
+10 ms jobs short of 100 a second).
 
 - Every time here is that of a Linux thread under the host's scheduler. A job "runs" in
   FreeRTOS's view while the host may have taken its thread away, and the tick and the simulated
@@ -619,8 +672,9 @@ the last BMS_Fault it sent.
    of it, it keeps the model's time of the step and the start of the thread's pass that carried
    it out, the state, the error counters, the model's count of destroyed attempts and the number
    of frames the node has transmitted; for the first frame after a recovery its start of frame,
-   when it entered its mailbox, and its end of frame. The model's times are exact and do not
-   depend on the host; the pass times are the host's. Adding a record copies 64 bytes into a ring
+   when it entered its mailbox, and its end of frame. The model's times follow exactly from its
+   rules and the times they start from, and a start is sometimes a host time (below, error
+   passive to bus off); the pass times are the host's. Adding a record copies 64 bytes into a ring
    of 256 with no clock read, no system call and no lock; on a healthy bus nothing is recorded
    ([docs/can-simulation.md](can-simulation.md) gives its measured cost).
 2. *The node's log*, stamped with the node's clock when each line is made, to the microsecond:
@@ -640,21 +694,22 @@ the last BMS_Fault it sent.
 5. *The node's statistics* after an orderly stop.
 
 **The intervals, and who fixes each.** The result labels every figure with its part: "model"
-(the controller model, by the rules and the frames' lengths: the same on any host), "policy" (the
-node's recovery policy, on the FreeRTOS tick), "host" (when the host ran a thread), "mixed" (a
-sum of them).
+(the controller model by ISO 11898-1's rules alone: the same on any host and whatever frames the
+node sends), "policy" (the node's recovery policy, on the FreeRTOS tick), "host" (when the host
+ran a thread), "mixed" (a sum of them, among them the node's schedule: which frames it sends
+when).
 
 | Interval | From → to | Part |
 |---|---|---|
 | fault to bus off | the pass that applied the fault → bus off (model) | mixed: the wait for a frame to send, then 24 (short) or 32 (tx_errors) destroyed attempts |
-| error passive to bus off | model times | model: under a short exactly 16 attempts 26 bit times apart, 416 bit times, unless a late pass of the thread moved a start (`late_resyncs`, counted) |
+| error passive to bus off | model times | mixed: 16 destroyed attempts of an error-passive transmitter (model): under a short 26 bit times apart whatever the frames, 416 bit times; under tx_errors each half the frame attempted (rounded down) plus 25 bit times, so the frames in the node's mailboxes (its schedule) set the length; and a start at a host time (below). Under a short the trials that no host time entered are "model" (`passive_to_bus_off_bits`) and the others "mixed" (`passive_to_bus_off_bits_not_exact`, their count and values); under tx_errors the figure is "mixed" (`passive_to_bus_off_bits`), with the trials that no host time entered apart (`passive_to_bus_off_bits_exact`) |
 | bus off to driver | bus off (model) → the transmit task's log line | host |
 | hold-off | the transmit task's two log lines | policy: 100 ms of app/can_io.c in whole ticks, plus the host's wake-up of the task |
 | request to count | the request's log line → the pass that served it | host |
 | recovery sequence | that pass → error active (model) | model: 128 × 11 bit times exactly, 2.816 ms at 500 kbit/s, 11.264 ms at 125 kbit/s, 1.408 ms at 1 Mbit/s; a trial that differs by a nanosecond is refused |
 | report lags | model time → the pass that carried it out | host |
 | active to first submit | error active (model) → the first frame's mailbox | host |
-| first frame on the bus | mailbox → its end of frame | model |
+| first frame on the bus | mailbox → its end of frame | mixed: arbitration and the length (model) of whichever frame the node sent first (its schedule; its length is `first_frame_bits`), and a start a late pass moved (host) |
 | removal to error active, removal to first frame | `can.fault none` (short) or the bus off (tx_errors) → model times | mixed |
 | removal to frame heard | removal → the observer's thread | mixed, including the observer's wake-up |
 | bus silence heard | the last frame before → the first after, by kernel times | mixed |
@@ -670,12 +725,27 @@ of the hardware thread, so the host figures include passes the bench caused; the
 are untouched by them. The hold-off is measured between two log stamps of the transmit task; the
 policy's timer starts a few microseconds before the first of them.
 
+Error passive to bus off is a chain of the model's times, but two kinds of start in it are host
+times ([lib/can/can_ctrl.c](../lib/can/can_ctrl.c)). A pass of the hardware thread more than a
+frame length late starts the frame that was due at its own time, which `late_resyncs` counts,
+over the whole trial: the count does not say where. A frame loaded into an idle bus starts when
+it entered its mailbox, at the driver's time; between two destroyed attempts the mailboxes are
+empty only after the transmit queue recalled them (a frame gone stale in a mailbox,
+[lib/can/can_txq.h](../lib/can/can_txq.h)), and nothing counts such a start. The trace does not
+record when each attempt started, nor which frame it was. So a trial counts as one that no host
+time entered (`runs[].trials.<fault>.passive_to_bus_off_exact`) when `late_resyncs` is 0 over
+the trial and the interval is a whole number of bit times to the nanosecond (a bit is 8000, 2000
+or 1000 ns at the three bit rates). A frame loaded at a host time that falls on the bit grid by
+chance passes both tests (at 1 Mbit/s about one such start in 1000 would): under a short it then
+shows as more than 416 bit times and the trial is refused, under tx_errors it counts as exact.
+
 **What makes a run fail, and what is repeated.** No result is written when a trial has more or
 less than one bus off; a transmit error counter off ISO 11898-1's rules at any sample; error
 passive other than at 128 or bus off other than at 256, after other than 24 or 32 destroyed
-attempts; a recovery other than 1408 bit times exactly, or with counters other than 0; the
-driver's log lines out of order with the trace; an observer that did not hear the frame the trace
-names; or any fault active other than the two of the bus. Per bit rate, no result unless the
+attempts; under a short, error passive to bus off other than 416 bit times in a trial that no
+host time entered; a recovery other than 1408 bit times exactly, or with counters other than 0;
+the driver's log lines out of order with the trace; an observer that did not hear the frame the
+trace names; or any fault active other than the two of the bus. Per bit rate, no result unless the
 controller's bus-off events, the queue's bus-off count and its recovery requests equal the bus
 offs the bench caused; the hold-off is back to 100 ms at the end; no event frame was dropped or
 expired; the queue's accounting holds; both DTCs end with status 0x2E and one "active" and one
@@ -695,11 +765,16 @@ the DTC bits, depend on when the host ran the node's tasks: they are counts in t
 failures.
 
 **Trial counts.** 100 trials of each fault at each bit rate, 600 in all, plus three persisting
-shorts. The model's figures are constants: one trial shows the value, and 100 show that it does
-not vary (the minimum equals the maximum). For the host and mixed figures, n = 100 per fault and
-bit rate gives p50 and p90; p99 would need 500 trials (about 4.5 hours). Every trial's values are
-kept in the JSON (`runs[].trials`). Almost all of a trial's time is the stable time the policy
-needs before the next trial can start with the initial hold-off.
+shorts. The model's figures (the recovery sequence, the destroyed attempts to bus off, the TEC
+at error passive and at bus off, and error passive to bus off under a short in the trials that
+no host time entered) are constants, and no result is written when one differs in a trial: one
+trial shows the value, and the others show that it does not vary (the minimum equals the
+maximum). The figures that depend on the frames the node sends, error passive to bus off under
+tx_errors and the first frame on the bus, vary from trial to trial and are "mixed". For the host
+and mixed figures, n = 100 per fault and bit rate gives p50 and p90; p99 would need 500 trials
+(about 4.5 hours). Every trial's values are kept in the JSON (`runs[].trials`). Almost all of a
+trial's time is the stable time the policy needs before the next trial can start with the
+initial hold-off.
 
 **What it says about a microcontroller.** The way into bus off (24 or 32 attempts, TEC 128 and
 256) and the 1408 bit times of the recovery are ISO 11898-1's; a controller that follows the
@@ -926,10 +1001,30 @@ then stops the board in order, reads the trial run's statistics, reads the flash
 next update begins from the image this one confirmed.
 
 **The times.** Each step's time is the flasher's: `time.monotonic()` around the step in the
-flasher's process, so it includes the bus and both hosts. The total is the sum of the steps; the
-flasher's wall time adds its Python start-up; the time from the board's start to its first status
-frame is the bench's, from before it starts fcn_boot to when its own listener has read the frame,
-so it includes fcn_boot's start, the node's start-up and the bench's own wake-up.
+flasher's process, so it includes the bus and both hosts. The total is the sum of the steps: the
+transfer and the erase make most of it, and between the check and read_version there are the
+flasher's ecu_reset and wait_for_trial. wait_for_trial is the flasher's poll for the trial
+([fcn_tools.flasher](../tools/fcn_tools/flasher.py), `_wait_for_trial()`): its first `22 FD 00`
+50 ms after the ECUReset's answer, each request waiting the node's P2server of 50 ms, the next
+50 ms after one that did not find the trial, and, after a request that went unanswered, the
+wait for an answer still due (50 ms when none is). It is therefore the node's restart rounded up
+to that poll, normally the first interval and one request, and not the restart itself. The
+flasher's wall time adds its Python start-up; the time from the board's start to its first
+status frame is the bench's, from before it starts fcn_boot to when its own listener has read
+the frame, so it includes fcn_boot's start, the node's start-up and the bench's own wake-up.
+
+**The node's restart** (`reset_to_trial`) is the node's own time, from its log: from the
+download run's line `ECUReset: resetting (requested by the tester)`, written just before
+`plat_reset()`, to the trial run's line `started by the bootloader: slot <slot> as a trial, ...`,
+written at its start-up before the scheduler. Both are lib/log's stamps of the node's
+CLOCK_MONOTONIC, in microseconds, and both runs are on the same host, so the two are subtracted as
+they are. The interval holds the old run's end, the Board starting fcn_boot again (as a reset
+into the bootloader would), fcn_boot itself (it validates the trial, counts its attempt in the
+flash, copies the payload into a memory file checking its digest, and execs it) and the trial's
+start-up up to its hand-off; it ends before the trial's tasks run, so its first status frame and
+its first answer come later. A successful update whose logs lack either line, or have the
+trial's before the reset's, is left out of the figure and counted
+(`summary.updates_<transport>.reset_to_trial_refused`).
 
 **When an update succeeds.** The flasher exits 0 with result `confirmed`; the download's run
 ended by the requested reset (status 10) and the trial's run in order (status 0); the download
@@ -967,12 +1062,17 @@ medians and the 90th percentiles of each step, 10 updates over UDP and 10 downlo
 only. The success count is out of 50 and 10, as the brief asks; it is no failure rate to quote
 to a part per thousand.
 
-**What it says about a microcontroller.** The steps, their order, the counts (bytes, blocks,
-steps, slots, versions) and every success are the node's own and would be the same on a target.
+**What it says about a microcontroller.** The steps, their order and the counts (bytes, blocks,
+steps, slots, versions) are the node's own and would be the same on a target. So is every
+success: a stall of the host past the node's watchdog (500 ms) or the ISO-TP timeout (1 s) can
+fail an update, and the bench counts it and keeps its record, but nothing the host does makes
+one succeed, so the updates counted as succeeded hold whatever the host did.
 The times are host times: the transfer is set by the diagnostic task's budget of 2 events per 1 ms
 tick, which a target with the same tick keeps; the erase by the modelled flash (45 ms per 4 KiB
-sector, each wait ending at a tick); the reset and the start of the trial are fcn_boot as a host
-process (memfd and exec, not a jump); and the tester's Python adds its turnaround to every
+sector, each wait ending at a tick); the node's restart (`reset_to_trial`) is the end of a host
+process, fcn_boot as a host process started again by the Board (memfd and exec, not a jump) and
+the trial's start-up on the host; wait_for_trial is the tester's poll for the trial, a choice of
+the flasher's and no time of the node's; and the tester's Python adds its turnaround to every
 request.
 
 **Results.** The final run is [results/updates.json](../results/updates.json), drawn in
@@ -1108,11 +1208,16 @@ exhaustive: lib/boot's unit campaign cuts every operation of every sequence at e
 hand-off, the node's flash task under the scheduler, the download over the bus, and an update after
 every cut.
 
-**What it does and does not say about a microcontroller.** Every outcome is decided by the flash
-model and the programs, not the host's timing, so the counts hold for this code under lib/flash's
-tear model. That model has no weak or unstable bits, no ECC, no erase suspend and no
-pre-programming; it tears a program in the order of its units; and its flash is a file
-([docs/update.md](update.md), the NOR model). The times per trial are host times of parallel
+**What it does and does not say about a microcontroller.** What a cut leaves and the state the
+board comes back in are decided by the flash model and the programs, not the host's timing, so
+those counts hold for this code under lib/flash's tear model. That model has no weak or unstable
+bits, no ECC, no erase suspend and no pre-programming; it tears a program in the order of its
+units; and its flash is a file ([docs/update.md](update.md), the NOR model). Whether a trial
+passes, the host can change in one direction only: a stall past the node's watchdog or a
+protocol timer fails it (above), and nothing the host does makes a check pass, so a campaign
+without failures holds whatever the host did, while a failure has to be replayed to tell the
+host from the node. How often a start finds the files still locked by the run before it
+(`lock_retries`) depends on the host's timing too. The times per trial are host times of parallel
 processes and say nothing about a target.
 
 **Results.** The final run is [results/power_loss.json](../results/power_loss.json), drawn in
@@ -1213,6 +1318,14 @@ timing.
 - **Host stacks are not target stacks** (node_timing), **the recovery sequence is the model's**
   (bus_off), **the 2048-byte block is a projection** (isotp_throughput), and **the power-loss
   counts hold under lib/flash's tear model** (power_loss).
+- **A failure can be the host's; a success is the node's.** A stall of the host past the node's
+  watchdog (500 ms) or a protocol timer (ISO-TP, 1 s) resets the node or ends an exchange, and
+  the update or trial fails: updates and power_loss count and keep it (exit status 5), the other
+  benches then write no result. No stall makes a check pass, so a count of 0 failures, and every
+  update counted as succeeded, holds whatever the host did. The counts of what happens in a
+  stretch of time are the host's in the same way as its times: the jobs and frames of a run of
+  fixed length, the ticks node_timing reports dropped and the jobs it reports released early,
+  and power_loss's `lock_retries`.
 - **The load check is blind to Windows.** The load average counts only the processes of the WSL
   VM; the final runs are made with the laptop otherwise idle.
 - **The wall clock steps under WSL2**, which costs a few frames per run of the observers' timing

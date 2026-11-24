@@ -29,7 +29,11 @@ IMAGE is an image file (python -m fcn_tools.image pack). The programming sequenc
                                                                   bootloader starts the trial
   wait_for_trial        22 FD 00 until it names the target slot   the trial, attempt 1
                         as a trial (an answer from the image
-                        before the reset does not)
+                        before the reset does not): the first
+                        TRIAL_POLL_S after the ECUReset's
+                        answer, each waiting TRIAL_POLL_TIMEOUT_S,
+                        the next TRIAL_POLL_S after one that did
+                        not find it (_wait_for_trial())
   read_version          22 F1 89                                  the image's version
   extended_session_trial 10 03
   confirm               31 01 F0 00                               71 01 F0 00 00 00; or 7F 31 22
@@ -39,8 +43,9 @@ IMAGE is an image file (python -m fcn_tools.image pack). The programming sequenc
   boot_info_confirmed   22 FD 00                                  confirm state CONFIRMED
 
 --no-reset stops after the check (the trial is committed, the node keeps running the old image);
---no-confirm after read_version. The timeouts are fcn_tools.diag's: each request waits as long
-as the node answers responsePending, up to a bound from the flash part's maximum times.
+--no-confirm after read_version. The timeouts are fcn_tools.diag's, but for wait_for_trial's
+requests: each request waits as long as the node answers responsePending, up to a bound from
+the flash part's maximum times.
 
 THE REPORT (schema fcn.flash_report/1, JSON, to --report or stdout): the bus, the image (its
 path, size, version, SHA-256 of the file), the target slot and address, maxNumberOfBlockLength
@@ -93,9 +98,12 @@ SLOT_ADDRESSES = {"A": 0x002000, "B": 0x102000}
 #: The data in a TransferData block: maxNumberOfBlockLength counts the SID and the counter.
 BLOCK_OVERHEAD = 2
 
-#: How long wait_for_trial waits by default, and how often it asks.
+#: wait_for_trial (_wait_for_trial()): how long it waits for the trial by default; the time from
+#: the ECUReset's answer to its first request, and from a request that did not find the trial to
+#: the next; and how long each of its requests waits for the answer, the node's P2server.
 TRIAL_WAIT_S = 30.0
-TRIAL_POLL_S = 0.2
+TRIAL_POLL_S = 0.050
+TRIAL_POLL_TIMEOUT_S = diag.P2_SERVER_S
 
 
 class StepFailed(Exception):
@@ -218,18 +226,54 @@ def _routine_record(response: Any) -> list[int]:
 
 def _wait_for_trial(client: udsoncan.client.Client, slot: str, wait_s: float) -> diag.BootInfo:
     """Ask for the boot information until it names `slot` as a trial: the node has been reset
-    and its bootloader started the trial. Answers of the image before the reset, and no answer
-    while the node starts, mean "not yet"."""
+    and its bootloader started the trial. Answers of the image before the reset, a negative
+    response, and no answer while the node restarts mean "not yet".
+
+    THE POLL. The first request goes TRIAL_POLL_S (50 ms) after the ECUReset's answer: one sent
+    at once reaches no node (the node that answered is in its reset, the trial not started yet)
+    and could only wait out its timeout, while the restart through fcn_boot takes a few ms on
+    the host (bench/updates.py's reset_to_trial, from the node's own log), so the first request
+    normally finds the trial. Each request waits TRIAL_POLL_TIMEOUT_S, the node's P2server
+    (50 ms), within which a node that runs answers 22 FD 00 (it needs no responsePending): a
+    request still unanswered then reached no node, or one the host held up, and is not a
+    failure; the next goes TRIAL_POLL_S after any that did not find the trial. So the step
+    takes the restart rounded up to the poll, at most one period of 100 ms beyond it, and one
+    request, plus, after a request that went unanswered, the wait for the answers still due
+    (below: TRIAL_POLL_TIMEOUT_S when none is); up to `wait_s`. (A first request at once with
+    P2client, 1 s, would wait out that second every time.)
+
+    A LATE ANSWER. A request the trial received is answered even after its timeout, in the
+    order of the requests (app/diag.h, RESPONSES). udsoncan drops what came in before each
+    request (Client.send_request() empties the connection's receive queue), so an answer at
+    most a period late is dropped; a later one is taken by the next request as its own. That is
+    no wrong answer: every request here is the same 22 FD 00, udsoncan takes only 62 FD 00 for
+    it, and the slot and the mode it names come from the hand-off, the same for the whole run of
+    an image. But the answer to the request that took it is then still due, and arriving after
+    this step it would be the answer read_version gets for 22 F1 89, which udsoncan refuses as
+    an unexpected response: a failed update. So once the trial has answered, the answers still
+    due are taken here first, at most one per request that went unanswered, each awaited for
+    TRIAL_POLL_TIMEOUT_S, as the trial sends each right after the one before. Only a hold-up
+    of the host longer than that just then lets one through, and read_version then fails with
+    "unexpected response" in the report: never a wrong version taken."""
     deadline = time.monotonic() + wait_s
     last: diag.BootInfo | None = None
-    while time.monotonic() < deadline:
-        try:
-            last = _timed(client, diag.P2_CLIENT_S, lambda: diag.read_boot_info(client))
-            if last.slot == slot and last.mode == "trial":
-                return last
-        except (TimeoutException, NegativeResponseException):
-            pass
+    unanswered = 0
+    while True:
         time.sleep(TRIAL_POLL_S)
+        if time.monotonic() >= deadline:
+            break
+        try:
+            last = _timed(client, TRIAL_POLL_TIMEOUT_S, lambda: diag.read_boot_info(client))
+        except TimeoutException:
+            unanswered += 1
+            continue
+        except NegativeResponseException:
+            continue
+        if last.slot == slot and last.mode == "trial":
+            for _ in range(unanswered):
+                if client.conn.wait_frame(timeout=TRIAL_POLL_TIMEOUT_S) is None:
+                    break
+            return last
     raise StepFailed(f"no trial in slot {slot} within {wait_s} s (last boot information: "
                      f"{last.as_dict() if last else None})")
 

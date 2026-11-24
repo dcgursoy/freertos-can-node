@@ -15,7 +15,7 @@ measures, exactly how, and what the figure does and does not say about a target.
 From the repository root, with the project's virtual environment (scripts/setup-python.sh):
 
 ```sh
-export PYTHONPATH=$PWD/tools        # or the editable install of scripts/setup-python.sh
+export PYTHONPATH=$PWD/tools        # fcn_tools of this checkout (see "Which checkout" below)
 "$FCN_VENV/bin/python" bench/<name>.py --help
 "$FCN_VENV/bin/python" bench/<name>.py                     # the final measurement, into results/
 "$FCN_VENV/bin/python" bench/<name>.py --quick --out /tmp/b # a test of the bench, seconds
@@ -37,15 +37,27 @@ Every bench of phase 6 has the options of `fcn_tools.results.add_bench_arguments
 and its own options for the parameters that shape its numbers (durations, trial counts, seeds,
 bit rates, transports), each recorded in the result's `config`.
 
+**Which checkout.** A result names the commit of the checkout `fcn_tools` is imported from, and
+the bench script computes its figures (isotp_throughput.py and updates.py keep their analysis
+functions in it). A bench therefore refuses to measure (exit status 4) unless its own script is
+the file at the same path in that checkout, byte for byte (`fcn_tools.results.script_mismatch()`;
+the bytes are compared, not the paths, because WSL reaches one tree through more than one
+mount). The editable install of scripts/setup-python.sh points the virtual environment at the
+one checkout it was made from: a bench of another checkout, run without `PYTHONPATH` set to its
+own `tools/`, imports that checkout's fcn_tools and is refused, where it would otherwise have
+written into that checkout's results/ under its commit. run_all.py refuses the same for itself.
+
 **Which binaries.** A bench builds the release preset first (`scripts/build.sh release`) unless
 it is told which binaries to use: `--no-build` (the release build as it is), or the environment
 variables `FCN_NODE`, `FCN_BOOT` and `FCN_FLASH_TOOL` (fcn_tools/paths.py). Whatever it runs, it
 writes a result only if every binary carries the build id of the tree the result names: the
 commit, and for a tree with uncommitted changes a hash of those changes
 (platform/posix/build_id.h; the node reports it in `--version`, in its log and in its statistics
-as `"build_id"`, fcn_boot in `--version` and its log, fcn_flash in `--version`).
-`fcn_tools.results.require_tree_build()` checks that before the bench measures, and
-`write_result()` again when it writes.
+as `"build_id"`, fcn_boot in `--version` and its log, fcn_flash in `--version`). The submodules
+count (third_party/): a kernel checked out at another commit than the tree records, or with a
+tracked file edited, is a change; an untracked file is none, in the tree or in a submodule.
+`fcn_tools.results.require_tree_build()` checks the binaries and the script before the bench
+measures, and `write_result()` again when it writes.
 
 **An idle machine.** Timing benches assume that nothing else runs. The 1-minute load average is
 taken when the bench starts (before its build) and recorded with the one at the end in the
@@ -56,15 +68,17 @@ quoted.
 
 **Exit status.** 0 a result was written; 1 an error (the bench says what); 2 a usage error (a
 `--quick` run without `--out` among them); 3 the host was loaded (`EXIT_HOST_LOADED`); 4 a binary
-is not the tree's build (`EXIT_BUILD_MISMATCH`); 128 + N ended by signal N (Ctrl-C: 130). No
-result file is written or changed unless the status is 0, with one exception: power_loss.py and
-updates.py write their result and then exit with 5 (`EXIT_FINDINGS`) when a trial failed a check
-or an update or a download did not succeed, because a failure is a finding that the result must
-keep (power_loss's `failures`, updates' records), and run_all.py stops there until someone has
-looked at it. (platform_timing.py, from before phase 6, has `--seconds`, `--replot`, `--out`,
+is not the tree's build, or the bench script is not the tree's (`EXIT_BUILD_MISMATCH`); 128 + N
+ended by signal N (Ctrl-C: 130). No result file is written or changed unless the status is 0,
+with one exception: power_loss.py and updates.py write their result and then exit with 5
+(`EXIT_FINDINGS`) when a trial failed a check or an update or a download did not succeed,
+because a failure is a finding that the result must keep (power_loss's `failures`, updates'
+records), and run_all.py stops there until someone has looked at it. (platform_timing.py, from
+before phase 6, has `--seconds`, `--replot`, `--out`,
 `--max-load` and `--allow-loaded` with exit status 3 for a loaded host, but no `--quick` and no
 `--no-build`: it builds unless `FCN_SELFTEST` names a self-test, checks the self-test's build id
-the same way, and exits 1 for every other refusal.)
+and its own script the same way, after it has measured, and exits 1 for those and every other
+refusal.)
 
 ## What a result holds
 
@@ -201,18 +215,20 @@ provenance names a commit and no other work shares the host:
 
 1. Commit everything; nothing else runs (`uptime` shows a load average below 1.0, `ps` no
    leftover node, test run or busy loop); `scripts/vcan-up.sh` has made vcan0.
-2. `python bench/run_all.py` (`--list` shows the plan). It refuses a tree with uncommitted
-   changes, builds the release preset once, and runs the benches one at a time in the order
-   below, each once the load average is at or below 1.0 again (the previous bench's load takes a
-   minute or two to decay; it waits at most 15 minutes), stopping at the first bench that fails
-   or reports a finding (exit status 5: look at the result before going on; `--from NAME`
-   resumes at a bench).
+2. `python bench/run_all.py` (`--list` shows the plan). It refuses to run from another checkout
+   than the one fcn_tools is imported from (exit status 4) and a tree with uncommitted changes,
+   the submodules' included, builds the release preset once, and runs the benches one at a time
+   in the order below, each once the load average is at or below 1.0 again (the previous
+   bench's load takes a minute or two to decay; it waits at most 15 minutes), stopping at the
+   first bench that fails or reports a finding (exit status 5: look at the result before going
+   on; `--from NAME` resumes at a bench).
 3. Commit results/ with a message naming the commit the results were measured on.
 
 The order (run_all.py's `PLAN`): the benches whose figures are host timing first, when the
 machine has been idle longest, the longest of them later, and last the power-loss campaign, which
-runs parallel workers and decides nothing from the host's clock; platform_timing.py, the
-measurement of the host mechanisms the others rest on, closes the run:
+runs parallel workers and whose checks read no clock of the host's (a host stall can still fail
+a trial, as the rehearsal above showed); platform_timing.py, the measurement of the host
+mechanisms the others rest on, closes the run:
 
 1. node_timing (latency, jitter, CPU load, stack high-water marks)
 2. bus_load

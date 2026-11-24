@@ -1,9 +1,11 @@
 """The analysis of bench/node_timing.py that holds the node's tick against the grid of its trace,
 on slices of real traces (traces/, read by trace_slices) and on constructed ones: a job released
 more than a tick early, with the tick count two ahead, is counted and kept as the node made it;
-a run whose tick count stays ahead of the grid for longer than LEAD_LIMIT_PERIODS, which a node
-that gives its made-up ticks back cannot do, is refused; a condition adds up its runs' jobs
-released early and pools the tick count's figures over its runs."""
+the first job after ticks were given up (the grid moved) is listed with its lateness on the grid
+of the job before as well; a run whose tick count stays ahead of the grid for longer than
+LEAD_LIMIT_PERIODS, which a node that gives its made-up ticks back cannot do, is refused; a
+condition adds up its runs' jobs released early and pools the tick count's figures and the
+first jobs after a drop over its runs."""
 from __future__ import annotations
 
 import importlib.util
@@ -15,7 +17,8 @@ import pytest
 import trace_slices
 from fcn_tools import paths, runner
 from fcn_tools import trace as trace_module
-from fcn_tools.trace import EVENT_DTYPE, READY, TICK_BASE, TickLead, Trace
+from fcn_tools.trace import (DELAY_UNTIL, EVENT_DTYPE, FLAG_BLOCKED, READY, SWITCH, TICK_BASE,
+                             TickLead, Trace)
 
 
 def _load(name: str):
@@ -36,8 +39,8 @@ STATS = {"task_table": {"tasks": [{"name": "sensor", "period_us": 10_000},
                                   {"name": "health", "period_us": 100_000}]}}
 
 
-def run_of(found: Trace):
-    return bench.Run(condition="flood", transport="socketcan", name="flood", stats=STATS,
+def run_of(found: Trace, name: str = "flood"):
+    return bench.Run(condition="flood", transport="socketcan", name=name, stats=STATS,
                      trace=found, frames=np.zeros(0), sidecar={}, extra={})
 
 
@@ -107,6 +110,116 @@ def test_a_job_released_less_than_a_tick_early_is_early_but_not_beyond():
     assert entry["jobs"] > 0 and entry["early"] == entry["jobs"]
     assert entry["beyond_a_tick"] == 0
     assert all(-MS < late < 0 for late in entry["release_lateness"].tolist())
+
+
+# ---------------------------------------------------------------- the first jobs after a drop
+
+
+def test_the_first_job_after_a_drop_is_listed_with_its_lateness_on_the_base_before():
+    # traces/dropped-ticks.txt: posix_tick.c gave up 6 ticks and moved the base 6 ms later from
+    # tick 9636 on. The sensor job that waited for tick 9631 is on the first base, 31.1 us late.
+    # The next one waited for tick 9641, due 6 ms later on the moved base than on the first, and
+    # was released 2163.6 us after the one and 8163.6 us after the other (started 0.8 us after
+    # its release). The distributions hold its lateness on the moved base, the one in force for
+    # its tick; after_drop lists the job with both. The period between the two starts is 18.1 ms.
+    found = trace_slices.load("dropped-ticks.txt")
+    grid = trace_module.tick_grid(found)
+    entry, jobs, _ = bench.periodic_release(run_of(found, "download-3"), "sensor", grid,
+                                            trace_module.running_intervals(found), None)
+    assert jobs.wake_tick.tolist() == [9631, 9641]
+    assert entry["release_lateness"].tolist() == [31_083, 2_163_612]
+    assert entry["start_lateness"].tolist() == [50_149, 2_164_448]
+    assert entry["period"].tolist() == [8_114_299]
+    assert entry["after_drop"] == [{
+        "run": "download-3", "first_tick": 9636, "drops": 1, "dropped_ticks": 6,
+        "wake_tick": 9641, "in_window": True,
+        "release_lateness": 2_163_612, "release_lateness_on_the_base_before": 8_163_612,
+        "start_lateness": 2_164_448, "start_lateness_on_the_base_before": 8_164_448}]
+    # Out of the window it is still listed, marked so, and in no distribution.
+    entry, _, _ = bench.periodic_release(run_of(found, "download-3"), "sensor", grid,
+                                         trace_module.running_intervals(found), (0, 1))
+    assert entry["jobs"] == 0 and [job["in_window"] for job in entry["after_drop"]] == [False]
+
+
+def one_task_trace(bases: list[tuple[int, int]], jobs: list[tuple[int, int, int]]) -> Trace:
+    """A sensor task (4) and the idle task (8), tick k due at k ms on the first base: the
+    TICK_BASE events `bases` (time in ns, first tick), and after the task's first stretch, which
+    waits for the first job's tick, jobs (release in ns, the tick it waited for, the tick it
+    then waits for): each released at its tick, started 50 us and blocked 100 us later."""
+    rows = [(TICK_BASE, time, first, MS, 0, 0, 0) for time, first in bases]
+    rows += [(SWITCH, 500_000, 0, 0, 4, 8, 0), (DELAY_UNTIL, 600_000, jobs[0][1], 0, 4, 0, 0),
+             (SWITCH, 700_000, 0, 0, 8, 4, FLAG_BLOCKED)]
+    for release, wake, then in jobs:
+        rows += [(READY, release, wake, 0, 4, 0, 0), (SWITCH, release + 50_000, wake, 0, 4, 8, 0),
+                 (DELAY_UNTIL, release + 90_000, then, 0, 4, 0, 0),
+                 (SWITCH, release + 100_000, wake, 0, 8, 4, FLAG_BLOCKED)]
+    events = np.zeros(len(rows), dtype=EVENT_DTYPE)
+    for column, field in enumerate(("kind", "time_ns", "value", "arg", "task", "other", "flags")):
+        events[field] = [row[column] for row in rows]
+    return Trace(events=events, names={4: "sensor", 8: "IDLE"})
+
+
+def test_a_drop_before_the_first_job_and_two_drops_between_two_jobs():
+    # Tick k due at k ms on the first base. 6 ticks given up from tick 3 on (the base 6 ms
+    # later), 6 more from tick 10 on and 7 more from tick 12 on (12 and 19 ms later than the
+    # first). The task's first job waited for tick 5, due at 11 ms on its base and at 5 ms on
+    # the first (the base it is held against, as it has no job before): released at 11.2 ms.
+    # The next waited for tick 15, due at 34 ms on its base and at 21 ms on the base of the job
+    # before; released at 34.1 ms, it is listed once, for the two drops since that job (13
+    # ticks). The third, on the same base as the second, is not listed. In a window from 20 ms,
+    # the first is out of it.
+    found = one_task_trace([(MS, 1), (7 * MS, 3), (13 * MS, 10), (20 * MS, 12)],
+                           [(11_200_000, 5, 15), (34_100_000, 15, 25), (44_050_000, 25, 35)])
+    grid = trace_module.tick_grid(found)
+    entry, jobs, arrival = bench.periodic_release(run_of(found), "sensor", grid,
+                                                  trace_module.running_intervals(found),
+                                                  (20 * MS, 50 * MS))
+    assert jobs.wake_tick.tolist() == [5, 15, 25]
+    assert arrival.tolist() == [11 * MS, 34 * MS, 44 * MS]
+    assert entry["release_lateness"].tolist() == [100_000, 50_000]
+    assert entry["after_drop"] == [
+        {"run": "flood", "first_tick": 3, "drops": 1, "dropped_ticks": 6, "wake_tick": 5,
+         "in_window": False, "release_lateness": 200_000,
+         "release_lateness_on_the_base_before": 6_200_000, "start_lateness": 250_000,
+         "start_lateness_on_the_base_before": 6_250_000},
+        {"run": "flood", "first_tick": 12, "drops": 2, "dropped_ticks": 13, "wake_tick": 15,
+         "in_window": True, "release_lateness": 100_000,
+         "release_lateness_on_the_base_before": 13_100_000, "start_lateness": 150_000,
+         "start_lateness_on_the_base_before": 13_150_000}]
+
+
+def test_a_run_without_a_drop_lists_no_job():
+    found = trace_slices.load("two-ahead.txt")
+    entry, _, _ = bench.periodic_release(run_of(found), "sensor", trace_module.tick_grid(found),
+                                         trace_module.running_intervals(found), None)
+    assert entry["after_drop"] == []
+
+
+def test_a_condition_lists_its_runs_first_jobs_after_a_drop_in_us_and_counts_those_in_the_window():
+    # The slice's job (download-3) and the constructed trace's two (one out of its window).
+    parts = []
+    for name, found, window in (
+            ("download-3", trace_slices.load("dropped-ticks.txt"), None),
+            ("download-1", one_task_trace([(MS, 1), (7 * MS, 3), (13 * MS, 10), (20 * MS, 12)],
+                                          [(11_200_000, 5, 15), (34_100_000, 15, 25)]),
+             (20 * MS, 50 * MS))):
+        entry, _, _ = bench.periodic_release(run_of(found, name), "sensor",
+                                             trace_module.tick_grid(found),
+                                             trace_module.running_intervals(found), window)
+        parts.append(entry)
+    listed = bench.after_drop_data(parts)
+    assert [(job["run"], job["wake_tick"], job["in_window"]) for job in listed] == [
+        ("download-3", 9641, True), ("download-1", 5, False), ("download-1", 15, True)]
+    assert listed[0] == {
+        "run": "download-3", "first_tick": 9636, "drops": 1, "dropped_ticks": 6,
+        "wake_tick": 9641, "in_window": True, "release_lateness_us": 2163.612,
+        "release_lateness_on_the_base_before_us": 8163.612, "start_lateness_us": 2164.448,
+        "start_lateness_on_the_base_before_us": 8164.448}
+    assert (listed[2]["release_lateness_us"], listed[2]["release_lateness_on_the_base_before_us"]) \
+        == (100.0, 13100.0)
+    condition = {"release": {"sensor": {"after_drop": listed}, "health": {"after_drop": []}}}
+    assert bench.after_drop_count(condition, "sensor") == {"value": 2, "unit": "jobs"}
+    assert bench.after_drop_count(condition, "health") == {"value": 0, "unit": "jobs"}
 
 
 # --------------------------------------------------------------------- the count against the grid

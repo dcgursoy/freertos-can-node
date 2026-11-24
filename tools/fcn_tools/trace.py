@@ -13,9 +13,11 @@ run-time statistics take their time, so the running times of this module and the
 run_time_us count the same intervals.
 
 THE TICK. TICK_BASE events say when each tick was due: tick k at base + (k - 1) * period, for k
-from the event's first tick on, until a later base (posix_tick.c moves it when it gives ticks
-up). TickGrid.due_ns() is that function. tick_lead() holds the kernel's tick count, which every
-SWITCH and READY event carries, against it.
+from the event's first tick on, until a later base (posix_tick.c moves it later by the ticks it
+gives up). TickGrid.due_ns() is that function, and gives a tick's due time on another base when
+asked (the one in force before a drop); TickGrid.ticks_given_up() counts the ticks given up
+between two bases. tick_lead() holds the kernel's tick count, which every SWITCH and READY event
+carries, against it.
 
 JOBS. A task's job begins when the kernel makes it ready from the blocked state (a READY event
 while the task was blocked: released), starts at its first switch-in after that, and ends when it
@@ -119,13 +121,33 @@ class TickGrid:
     bases_ns: np.ndarray
     period_ns: int
 
-    def due_ns(self, ticks) -> np.ndarray:
-        """The time each tick of `ticks` (tick counts, 1 or more) was due, in ns."""
+    def base_index(self, ticks) -> np.ndarray:
+        """The base in force for each tick of `ticks` (tick counts, 1 or more), as an index into
+        first_ticks and bases_ns: the last base whose first tick is at or before it (of two
+        with the same first tick, the later one)."""
         ticks = np.asarray(ticks, dtype=np.int64)
         index = np.searchsorted(self.first_ticks, ticks, side="right") - 1
         if np.any(index < 0):
             raise TraceError("a tick before the first base of the trace")
+        return index
+
+    def due_ns(self, ticks, base=None) -> np.ndarray:
+        """The time each tick of `ticks` (tick counts, 1 or more) was due, in ns: on the base in
+        force for it, or with `base` (indices into bases_ns, as base_index() gives them) on
+        those bases instead."""
+        ticks = np.asarray(ticks, dtype=np.int64)
+        index = self.base_index(ticks) if base is None else np.asarray(base, dtype=np.int64)
         return self.bases_ns[index] + (ticks - 1) * self.period_ns
+
+    def ticks_given_up(self, base, since) -> np.ndarray:
+        """The ticks given up from base `since` to base `base` (indices into bases_ns): the
+        periods by which the one is later than the other. TraceError for a base moved by part
+        of a period, which posix_tick.c never does (it moves the base by the ticks it gives
+        up)."""
+        moved = self.bases_ns[np.asarray(base)] - self.bases_ns[np.asarray(since)]
+        if np.any(moved % self.period_ns != 0):
+            raise TraceError("a base of the trace moved by part of a tick period")
+        return moved // self.period_ns
 
 
 def tick_grid(trace: Trace) -> TickGrid:

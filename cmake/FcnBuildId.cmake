@@ -6,20 +6,29 @@
 # The id is the commit. When tracked files differ from it, "-dirty-" and the first 12 hex
 # digits of the git blob hash of the tree's changes follow: the output of
 #   git diff HEAD --binary --no-color --no-ext-diff --no-textconv --no-renames
-#            --ignore-submodules -- . ':(exclude)results'
+#            --submodule=diff --ignore-submodules=untracked -- . ':(exclude)results'
 # piped into `git hash-object --stdin`. Two different sets of uncommitted changes therefore
 # give two different ids, and a binary built from one dirty tree is told apart from a binary
 # built from another. "Dirty" itself is decided exactly as tools/fcn_tools/results.py decides
 # it for the provenance of a result: `git status --porcelain --untracked-files=no
-# --ignore-submodules`, without results/ (which every measurement rewrites).
+# --ignore-submodules=untracked`, without results/ (which every measurement rewrites).
 # tools/fcn_tools/results.py computes the same id for the tree a result records
 # (tree_build_id(); tests/python/test_results.py runs this script against it), and every bench
 # (bench/) refuses to write a result measured with a binary that carries another one. The host
 # programs report the id (platform/posix/build_id.h): the node in its statistics, --version and
 # log, fcn_boot in --version and its log, fcn_flash in --version, plat_selftest in its reports.
-# Untracked files are not part of the id: the build compiles only files that tracked
-# CMakeLists.txt files name, so a new source file in the build means a modified tracked file.
-# Without git, or outside a repository, the id is "unknown".
+# The submodules count (third_party/: the FreeRTOS kernel, whose POSIX port the node runs on,
+# and Unity): one checked out at another commit than the tree records, or with a tracked file
+# changed in it, makes the tree dirty, and --submodule=diff puts the submodule's own diff, from
+# the recorded commit to its work tree, into the hash. In that diff a changed binary file is
+# named with its abbreviated blob hash instead of given whole (git passes --binary on to no
+# submodule); the build compiles no binary file.
+# Untracked files are not part of the id, in the tree or in a submodule: the build compiles only
+# files that tracked CMakeLists.txt files name, so a new source file in the build means a
+# modified tracked file. Without git, or outside a repository, the id is "unknown". A clean
+# tree, submodules included, has the commit alone as its id. Looking into the submodules costs
+# every build a scan of their files: several seconds on the 9p mount of a Windows drive under
+# WSL, a few milliseconds on a Linux file system.
 #
 # The file is only rewritten when the id changed, so an unchanged tree does not relink.
 
@@ -35,7 +44,8 @@ if(_git)
                     OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
     if(_rc EQUAL 0 AND _commit MATCHES "^[0-9a-f]+$")
         execute_process(COMMAND "${_git}" -C "${SOURCE_DIR}" --no-optional-locks status
-                                --porcelain --untracked-files=no --ignore-submodules
+                                --porcelain --untracked-files=no
+                                --ignore-submodules=untracked
                         OUTPUT_VARIABLE _status RESULT_VARIABLE _rc ERROR_QUIET)
         set(_id "${_commit}")
         set(_dirty FALSE)
@@ -58,7 +68,8 @@ if(_git)
             # The two commands run as a pipe; RESULTS_VARIABLE holds the status of each.
             execute_process(COMMAND "${_git}" -C "${SOURCE_DIR}" --no-optional-locks diff HEAD
                                     --binary --no-color --no-ext-diff --no-textconv
-                                    --no-renames --ignore-submodules -- . ":(exclude)results"
+                                    --no-renames --submodule=diff
+                                    --ignore-submodules=untracked -- . ":(exclude)results"
                             COMMAND "${_git}" -C "${SOURCE_DIR}" hash-object --stdin
                             OUTPUT_VARIABLE _hash RESULTS_VARIABLE _rcs
                             OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)

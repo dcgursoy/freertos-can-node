@@ -402,7 +402,8 @@ the FreeRTOS POSIX port and which do not depend on the host.
   of a record when on is measured.
 - **What every bench shares** ([bench/README.md](bench/README.md)). Each builds the release
   preset and refuses to write a result whose binaries, or whose node runs, do not carry the build
-  id of the tree the result names; refuses a loaded host unless told otherwise (and then marks the
+  id of the tree the result names (its submodules included), or whose own script is not that
+  tree's; refuses a loaded host unless told otherwise (and then marks the
   result); gives every distribution with its count and only the percentiles the count supports,
   and keeps the samples of its main figures (a histogram above 5000); redraws its plot from the
   JSON; and has a `--quick` mode that a system test runs, checking structure and counts only,

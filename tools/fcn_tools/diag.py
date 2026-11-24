@@ -16,8 +16,10 @@ identifiers and timing:
                 one (app/diag.h); N_Bs and N_Cr of the tester 1000 ms, the standard's
   UDS timing    P2client P2_CLIENT_S, P2*client P2_STAR_CLIENT_S, never the server's own
                 figures (use_server_timing off): the node's P2server is 50 ms, which a tester on
-                a host cannot keep to; its P2*server is 5 s, and it sends responsePending every
-                2 s during a long operation (lib/uds/uds.h), so P2*client is P2*server and a
+                a host cannot keep to (fcn_tools.flasher's wait for the trial uses it only as
+                the time after which a poll counts as "not yet", and asks again; an answer that
+                comes later is taken there); its P2*server is 5 s, and it sends responsePending
+                every 2 s during a long operation (lib/uds/uds.h), so P2*client is P2*server and a
                 second for the hosts, which allows every operation however long it is; the
                 request timeout of an operation is computed from the flash part's MAXIMUM times
                 (erase_timeout_s(), check_timeout_s()), so that an operation that the node keeps

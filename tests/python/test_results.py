@@ -1,6 +1,7 @@
 """The skeleton every result file uses (tools/fcn_tools/results.py): the summary statistics, the
-build id of the tree and of the binaries, the load check, the command line of a bench and
-write_result() itself. Every input is constructed, with a known answer."""
+build id of the tree and of the binaries, the check of the bench script, the load check, the
+command line of a bench and write_result() itself. Every input is constructed, with a known
+answer."""
 from __future__ import annotations
 
 import argparse
@@ -9,6 +10,7 @@ import math
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +18,14 @@ import pytest
 
 from fcn_tools import paths, results
 from fcn_tools.results import distribution, percentiles
+
+
+@pytest.fixture(autouse=True)
+def _a_bench_of_this_checkout(monkeypatch):
+    """The checks run in-process here, where the program running is pytest: each test stands
+    for a bench of this checkout, the script that script_mismatch() checks and provenance()
+    names (sys.argv[0]). The tests of the check itself plant other scripts."""
+    monkeypatch.setattr(sys, "argv", [str(paths.REPO_ROOT / "bench" / "platform_timing.py")])
 
 
 # ---------------------------------------------------------------------------- percentiles()
@@ -167,13 +177,39 @@ def test_a_figure_is_a_finite_number():
 # ------------------------------------------------------------------------------ the build id
 
 
+#: Who makes the commits of the temporary repositories; a submodule is added from a local path.
+_GIT_CONFIG = ("-c", "user.name=t", "-c", "user.email=t@localhost", "-c",
+               "protocol.file.allow=always")
+
+needs_cmake_and_git = pytest.mark.skipif(
+    shutil.which("cmake") is None or shutil.which("git") is None, reason="needs cmake and git")
+
+
 def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
-                          text=True).stdout
+    return subprocess.run(["git", "-C", str(repo), *_GIT_CONFIG, *args], check=True,
+                          capture_output=True, text=True).stdout
 
 
-@pytest.mark.skipif(shutil.which("cmake") is None or shutil.which("git") is None,
-                    reason="needs cmake and git")
+def _id_from_cmake(repo: Path) -> str:
+    """The build id cmake/FcnBuildId.cmake writes for `repo`, as every build of the binaries
+    does."""
+    out = repo.parent / "fcn_build_id.c"
+    subprocess.run(["cmake", f"-DSOURCE_DIR={repo}", f"-DOUTPUT={out}", "-P",
+                    str(paths.REPO_ROOT / "cmake" / "FcnBuildId.cmake")],
+                   check=True, capture_output=True)
+    return re.search(r'fcn_build_id\[\] = "([^"]*)"', out.read_text()).group(1)
+
+
+def _id_from_python(repo: Path) -> str:
+    """tree_build_id() of the provenance provenance() records for `repo`: its commit and the
+    files of its status (STATUS_FOR_BUILD_ID, the call provenance() makes)."""
+    porcelain = _git(repo, *results.STATUS_FOR_BUILD_ID)
+    provenance = {"git_commit": _git(repo, "rev-parse", "HEAD").strip(),
+                  "git_modified_files": results._modified_files(porcelain)}
+    return results.tree_build_id(provenance, repo=repo)
+
+
+@needs_cmake_and_git
 def test_the_tree_build_id_is_the_one_cmake_writes_into_the_binaries(tmp_path):
     """tree_build_id() and cmake/FcnBuildId.cmake, the two implementations of the rule, agree on
     a clean tree, on two different sets of changes, on changes under results/ only (not dirty)
@@ -185,21 +221,14 @@ def test_the_tree_build_id_is_the_one_cmake_writes_into_the_binaries(tmp_path):
     (repo / "results").mkdir()
     (repo / "results" / "r.json").write_text("{}\n")
     _git(repo, "add", "-A")
-    _git(repo, "-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-qm", "first")
+    _git(repo, "commit", "-qm", "first")
     head = _git(repo, "rev-parse", "HEAD").strip()
 
     def from_cmake() -> str:
-        out = tmp_path / "fcn_build_id.c"
-        subprocess.run(["cmake", f"-DSOURCE_DIR={repo}", f"-DOUTPUT={out}", "-P",
-                        str(paths.REPO_ROOT / "cmake" / "FcnBuildId.cmake")],
-                       check=True, capture_output=True)
-        return re.search(r'fcn_build_id\[\] = "([^"]*)"', out.read_text()).group(1)
+        return _id_from_cmake(repo)
 
     def from_python() -> str:
-        porcelain = _git(repo, "status", "--porcelain", "--untracked-files=no",
-                         "--ignore-submodules")
-        provenance = {"git_commit": head, "git_modified_files": results._modified_files(porcelain)}
-        return results.tree_build_id(provenance, repo=repo)
+        return _id_from_python(repo)
 
     assert from_cmake() == from_python() == head
     (repo / "a.c").write_text("int a = 1;\n")
@@ -213,6 +242,52 @@ def test_the_tree_build_id_is_the_one_cmake_writes_into_the_binaries(tmp_path):
     (repo / "new.c").write_text("int b;\n")
     assert from_cmake() == from_python() == head
     assert results.BUILD_ID.match(first) and results.BUILD_ID.match(head)
+
+
+@needs_cmake_and_git
+def test_the_build_id_counts_the_submodules(tmp_path):
+    """The kernel the node runs on is a submodule (third_party/FreeRTOS-Kernel). A tracked file
+    changed in a submodule, or a submodule checked out at another commit than the tree records,
+    makes the tree dirty in both implementations, each such tree with an id of its own; an
+    untracked file in a submodule is not part of the id, as in the tree itself."""
+    kernel = tmp_path / "kernel"
+    kernel.mkdir()
+    _git(kernel, "init", "-q")
+    (kernel / "port.c").write_text("int tick;\n")
+    _git(kernel, "add", "-A")
+    _git(kernel, "commit", "-qm", "V1")
+    (kernel / "port.c").write_text("int tick = 1;\n")
+    _git(kernel, "commit", "-qam", "V2")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "a.c").write_text("int a;\n")
+    _git(repo, "submodule", "--quiet", "add", str(kernel), "third_party/kernel")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "first")
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    sub = repo / "third_party" / "kernel"
+
+    assert _id_from_cmake(repo) == _id_from_python(repo) == head
+    (sub / "stray.txt").write_text("not built\n")
+    assert _id_from_cmake(repo) == _id_from_python(repo) == head
+
+    (sub / "port.c").write_text("int tick = 2;\n")             # an edit inside the kernel
+    edited = _id_from_cmake(repo)
+    assert edited == _id_from_python(repo)
+    assert re.fullmatch(rf"{head}-dirty-[0-9a-f]{{12}}", edited)
+    (sub / "port.c").write_text("int tick = 3;\n")             # another edit, another id
+    other = _id_from_cmake(repo)
+    assert other == _id_from_python(repo) and other not in (head, edited)
+
+    _git(sub, "checkout", "-q", "--", "port.c")
+    assert _id_from_cmake(repo) == _id_from_python(repo) == head
+    _git(sub, "checkout", "-q", "HEAD~1")                      # the kernel at another commit
+    moved = _id_from_cmake(repo)
+    assert moved == _id_from_python(repo)
+    assert re.fullmatch(rf"{head}-dirty-[0-9a-f]{{12}}", moved) and moved not in (edited, other)
+    _git(sub, "checkout", "-q", "-")
+    assert _id_from_cmake(repo) == _id_from_python(repo) == head
 
 
 def test_a_clean_tree_is_its_commit_and_without_git_it_is_unknown():
@@ -288,6 +363,73 @@ def test_require_tree_build_asks_each_binary(tmp_path):
     assert results.require_tree_build({"fcn_node": good}, None, clean) == commit
     with pytest.raises(results.BuildIdMismatch, match=re.escape(f"fcn_boot ({bad}) is build")):
         results.require_tree_build({"fcn_node": good, "fcn_boot": bad}, None, clean)
+
+
+# ------------------------------------------------------------------------------- the script
+
+RUN_ALL = paths.REPO_ROOT / "bench" / "run_all.py"
+
+
+def _checkout(root: Path) -> Path:
+    """A directory that is a checkout of this project to the walk up from a script: it has a
+    CMakePresets.json, and a bench/ directory."""
+    (root / "bench").mkdir(parents=True)
+    (root / "CMakePresets.json").write_text("{}\n")
+    return root
+
+
+def test_a_bench_of_this_checkout_is_its_own():
+    assert results.script_mismatch(RUN_ALL) is None
+    assert results.script_mismatch() is None                  # sys.argv[0], the fixture's
+
+
+def test_the_same_bytes_at_the_same_path_elsewhere_are_this_checkout_s_script(tmp_path):
+    # As /home/dev/fcn and /mnt/c/... are one tree under WSL: the bytes decide, not the path.
+    copy = _checkout(tmp_path / "mount") / "bench" / "run_all.py"
+    copy.write_bytes(RUN_ALL.read_bytes())
+    assert results.script_mismatch(copy) is None
+
+
+def test_a_changed_script_of_another_checkout_is_refused(tmp_path):
+    other = _checkout(tmp_path / "other")
+    copy = other / "bench" / "run_all.py"
+    copy.write_bytes(RUN_ALL.read_bytes() + b"# another checkout's change\n")
+    message = results.script_mismatch(copy)
+    assert message is not None
+    assert f"{copy} is not {RUN_ALL}" in message and f"PYTHONPATH={other / 'tools'}" in message
+
+
+def test_a_script_this_checkout_does_not_have_is_refused(tmp_path):
+    new = _checkout(tmp_path / "other") / "bench" / "not_in_this_checkout.py"
+    new.write_text("print('figures')\n")
+    assert f"{new} is not {paths.REPO_ROOT / 'bench' / new.name}" in results.script_mismatch(new)
+
+
+def test_a_script_in_no_checkout_is_refused(tmp_path):
+    loose = tmp_path / "run_all.py"
+    loose.write_bytes(RUN_ALL.read_bytes())
+    assert not any((parent / "CMakePresets.json").exists() for parent in loose.parents)
+    assert "lies in no checkout" in results.script_mismatch(loose)
+
+
+def test_every_check_of_a_bench_refuses_a_script_of_another_checkout(tmp_path, monkeypatch):
+    """require_tree_build() before the bench measures, write_result() when it writes (nothing
+    is written) and build_id_mismatch() for platform_timing.py, although every binary and
+    every reported id is the tree's."""
+    copy = _checkout(tmp_path / "other") / "bench" / "platform_timing.py"
+    copy.write_text("# another checkout's analysis\n")
+    monkeypatch.setattr(sys, "argv", [str(copy), "--seconds", "10"])
+    clean = results.provenance()
+    tree = results.tree_build_id(clean)
+    node = _program(tmp_path, "fcn_node", f"fcn_node 0.1.0 (FreeRTOS V11.3.3) build {tree}")
+    refused = re.escape(f"{copy} is not")
+    with pytest.raises(results.BuildIdMismatch, match=refused):
+        results.require_tree_build({"fcn_node": node}, {"node statistics": tree}, clean)
+    with pytest.raises(results.BuildIdMismatch, match=refused):
+        results.write_result("probe", {}, out_dir=tmp_path / "out", binaries={"fcn_node": node},
+                             reported_build_ids={"node statistics": tree})
+    assert not (tmp_path / "out" / "probe.json").exists()
+    assert f"{copy} is not" in results.build_id_mismatch({tree}, clean)
 
 
 # ------------------------------------------------------------------------------- the load
@@ -391,20 +533,23 @@ def test_a_summary_without_units_writes_nothing(tmp_path):
 
 
 def _tree_id() -> str:
+    """The tree's build id. Each call runs git status over the submodules as well, seconds on
+    the 9p mount of a Windows drive: a test asks once."""
     return results.tree_build_id(results.provenance())
 
 
 def test_a_result_of_binaries_of_this_tree_records_their_build(tmp_path):
-    node = _program(tmp_path, "fcn_node", f"fcn_node 0.1.0 (FreeRTOS V11.3.3) build {_tree_id()}")
+    tree = _tree_id()
+    node = _program(tmp_path, "fcn_node", f"fcn_node 0.1.0 (FreeRTOS V11.3.3) build {tree}")
     out = tmp_path / "out"
     path = results.write_result("probe", {}, out_dir=out, binaries={"fcn_node": node},
-                                reported_build_ids={"node statistics": _tree_id()},
+                                reported_build_ids={"node statistics": tree},
                                 binary_sha256={"fcn_node": results.sha256_of(node)})
     build = json.loads(path.read_text())["build"]
-    assert build["tree"] == _tree_id()
-    assert build["binaries"]["fcn_node"] == {"path": str(node), "build_id": _tree_id(),
+    assert build["tree"] == tree
+    assert build["binaries"]["fcn_node"] == {"path": str(node), "build_id": tree,
                                              "sha256": results.sha256_of(node)}
-    assert build["reported"] == {"node statistics": _tree_id()}
+    assert build["reported"] == {"node statistics": tree}
 
 
 def test_a_result_of_another_build_is_not_written_and_the_old_one_stays(tmp_path):

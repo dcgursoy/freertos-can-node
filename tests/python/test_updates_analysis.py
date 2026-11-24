@@ -1,7 +1,7 @@
 """The analysis of bench/updates.py on constructed inputs with known answers: the versions and
 slots of a campaign, the big image's payload, the node's own account of a download in its log,
-the step counts of the erase and the check, when a campaign can go on, and the figures and the
-summary of constructed records."""
+the node's restart by its log stamps, the step counts of the erase and the check, when a
+campaign can go on, and the figures and the summary of constructed records."""
 from __future__ import annotations
 
 import importlib.util
@@ -76,6 +76,32 @@ def test_the_trial_runs_log_gives_the_confirm_by_the_routine():
     assert bench.parse_trial_log("trial in slot B ran 5 s in good health") is None
 
 
+TRIAL_START_LOG = """\
+[ 81953.703100] I main: fcn_node 0.1.0 starting (FreeRTOS V11.3.3)
+[ 81953.704750] I app: started by the bootloader: slot B as a trial, attempt 1 of 3, image 2.1.0
+[ 81953.707520] I app: metadata: record 3, active slot A, trial slot B
+"""
+
+
+def test_the_nodes_restart_is_from_its_reset_line_to_the_trials_hand_off_line():
+    # The stamps of the two runs' logs, in microseconds: 81953.700000 to 81953.704750.
+    assert bench.node_restart(DOWNLOAD_LOG, TRIAL_START_LOG) == {
+        "reset_us": 81_953_700_000, "trial_start_us": 81_953_704_750, "us": 4750}
+    # A stamp of seven digits of seconds has no padding; the first matching line counts.
+    assert bench.log_stamp_us("[1234567.000001] W app: ECUReset: resetting (requested by the "
+                              "tester)\n", bench.RESET_STAMP) == 1_234_567_000_001
+    # Refused (us None) without either line, with the trial's line not after the reset's, and
+    # for a start of the confirmed image, which is no trial's.
+    assert bench.node_restart("", TRIAL_START_LOG)["us"] is None
+    assert bench.node_restart(DOWNLOAD_LOG, "") == {"reset_us": 81_953_700_000,
+                                                    "trial_start_us": None, "us": None}
+    assert bench.node_restart(DOWNLOAD_LOG.replace("81953.700000", "81953.800000"),
+                              TRIAL_START_LOG)["us"] is None
+    confirmed = ("[ 81953.704750] I app: started by the bootloader: slot A, the confirmed image, "
+                 "image 1.0.0\n")
+    assert bench.node_restart(DOWNLOAD_LOG, confirmed)["us"] is None
+
+
 @pytest.mark.parametrize("image_bytes, erase, check", [
     (244368, 61, 3824),        # the release node of docs/diagnostics.md's measurement
     (8448, 4, 137),            # a payload of 8192 bytes
@@ -97,12 +123,14 @@ def test_a_campaign_goes_on_only_from_a_confirmed_image_without_a_trial():
 
 def record(number: int, success: bool = True, total: float = 24.0, transport: str = "udp") -> dict:
     steps = {step: 0.001 for step in bench.UPDATE_STEPS}
-    steps.update(erase=2.75, transfer=19.7 + number / 100, wait_for_trial=1.2)
+    steps.update(erase=2.75, transfer=19.7 + number / 100, wait_for_trial=0.052)
     return {"number": number, "transport": transport, "success": success,
             "image_bytes": 244368, "steps": steps if success else {"boot_info": 0.002},
             "total_s": total + number / 100, "flasher_wall_s": total + 0.5,
             "start_to_ready_s": 0.014, "confirmed_by": "routine" if number % 5 else "node",
             "node_download": {"erase": {"us": 2_750_000}},
+            "node_restart": {"reset_us": 10_000_000, "trial_start_us": 10_004_000 + number,
+                             "us": 4000 + number},
             "report": {"transfer": {"bytes_per_s": 12_400.0},
                        "block_ms": {"p50": 82.5}}}
 
@@ -126,6 +154,21 @@ def test_the_figures_of_a_campaign_count_only_its_successful_updates():
     assert figures["raw_total_s"]["n"] == 12
 
 
+def test_the_nodes_restart_is_its_own_figure_and_an_update_without_its_lines_is_counted():
+    records = [record(n) for n in range(1, 13)]
+    records[3]["node_restart"] = bench.node_restart("", TRIAL_START_LOG)    # no reset line
+    del records[7]["node_restart"]                                          # no trial run
+    records.append(record(13, success=False))
+    figures = bench.campaign_figures({"records": records})
+    # 4001 to 4012 us of the node's clock, less updates 4 and 8: in ms, the step apart.
+    restart = figures["reset_to_trial_ms"]
+    assert (restart["unit"], restart["n"], restart["min"], restart["max"]) == ("ms", 10, 4.001,
+                                                                               4.012)
+    assert restart["p50"] == pytest.approx(4.0065, abs=0.0005)   # rounded to 1 us
+    assert figures["reset_to_trial_refused"] == 2
+    assert figures["steps_s"]["wait_for_trial"]["mean"] == pytest.approx(0.052)
+
+
 def test_the_summary_gives_every_figure_with_its_unit():
     records = [record(n) for n in range(1, 4)]
     part = {"counts": bench.campaign_counts(records, 3), "records": records}
@@ -142,4 +185,12 @@ def test_the_summary_gives_every_figure_with_its_unit():
     summary = bench.summarise({"campaigns": {"udp": part}, "big_image": big})
     results.check_summary(summary)
     assert summary["updates_udp"]["succeeded"] == {"value": 3, "unit": "updates"}
+    # reset_to_trial is the node's restart by its log stamps, labelled as such; the flasher's
+    # wait_for_trial is a step of its own.
+    restart = summary["updates_udp"]["reset_to_trial"]
+    assert (restart["unit"], restart["n"], restart["mean"]) == ("ms", 3, 4.002)
+    assert "log stamps" in restart["measured"] and "host timing" in restart["measured"]
+    assert summary["updates_udp"]["reset_to_trial_refused"] == {"value": 0, "unit": "updates"}
+    assert summary["updates_udp"]["wait_for_trial"]["mean"] == pytest.approx(0.052)
+    assert summary["updates_udp"]["wait_for_trial"]["unit"] == "s"
     assert summary["big_image"]["payload_bytes"]["value"] == 262_144

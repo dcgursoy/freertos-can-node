@@ -55,11 +55,13 @@ def log_line(t_ns: int, level: str, tag: str, text: str) -> str:
 
 class Trial:
     """A constructed trial: a short (or 32 injected errors) at 500 kbit/s with every time known.
-    The knobs make one thing wrong at a time."""
+    The knobs make one thing wrong at a time; `reload_ns` is a frame loaded into an idle bus
+    (after a recall of the mailboxes) that much after the bus became free, at the third attempt
+    after error passive, which then starts at the driver's time."""
 
     def __init__(self, fault="short", *, holdoff_ns=100_800_000, sequence_extra_ns=0,
                  bad_tec_at=None, removal_late=False, resyncs=0, passive_bits=26,
-                 drop_first_tx=False, attempts_status=None):
+                 drop_first_tx=False, attempts_status=None, reload_ns=0):
         self.fault = fault
         attempts_total = busoff.ATTEMPTS_TO_BUS_OFF[fault]
         passive_at = 8 if fault == "short" else 16
@@ -79,7 +81,7 @@ class Trial:
             if k <= passive_at:
                 end = s1 + ((k - 1) * active_bits + (active_bits - 3)) * BIT
             else:
-                end += passive_bits * BIT
+                end += passive_bits * BIT + (reload_ns if k == passive_at + 3 else 0)
             tec = busoff.tec_after_attempts(fault, k)
             if k == bad_tec_at:
                 tec += 8
@@ -94,7 +96,7 @@ class Trial:
                     tec=tec)
         b = self.bus_off
         self.removal = b + 1_000_000 if fault == "short" else None
-        self.seen_bus_off = b + 40_000
+        self.seen_bus_off = b - b % 1000 + 40_000          # the log has microseconds
         self.asked = self.seen_bus_off + holdoff_ns
         self.restart = self.asked + 21_000
         self.active = self.restart + 2_816_000 + sequence_extra_ns
@@ -115,7 +117,7 @@ class Trial:
                 value=busoff.ID_FAULT, start=self.submit, submit=self.submit,
                 frames=FIRST_NUMBER)
         self.records = records
-        self.dtc_on = b + 60_000_000
+        self.dtc_on = self.seen_bus_off + 59_960_000
         self.dtc_off = self.active + 4_950_000_000
         self.log_text = "\n".join([
             log_line(T0 - 1_000_000, "I", "main", "fcn_node 0.1.0 starting"),
@@ -250,6 +252,7 @@ def test_a_short_trial_gives_every_interval_to_the_nanosecond():
     f = out["figures"]
     assert f["fault_to_bus_off"] == trial.bus_off - T0 == 2_114_000
     assert f["passive_to_bus_off"] == 832_000 and f["passive_to_bus_off_bits"] == 416.0
+    assert f["passive_to_bus_off_exact"] is True
     assert f["bus_off_report_lag"] == 7_000
     assert f["bus_off_to_driver"] == 40_000
     assert f["holdoff"] == 100_800_000
@@ -281,7 +284,7 @@ def test_injected_errors_end_at_the_bus_off():
     assert f["attempts_to_bus_off"] == 32
     assert f["t_removal_ns"] == trial.bus_off
     assert f["removal_to_active"] == f["bus_off_to_active"]
-    assert f["passive_to_bus_off_bits"] == 16 * 26
+    assert f["passive_to_bus_off_bits"] == 16 * 26 and f["passive_to_bus_off_exact"] is True
     assert out["trajectory"][0] == [1, 8] and out["trajectory"][-1] == [31, 248]
 
 
@@ -303,6 +306,40 @@ def test_a_late_pass_excuses_the_spacing_but_nothing_else():
     assert out["problems"] == []
     assert out["figures"]["late_resyncs"] == 1
     assert out["figures"]["passive_to_bus_off_bits"] == 16 * 27
+    # Wherever in the trial the late pass was, the interval is no sample of the model.
+    assert out["figures"]["passive_to_bus_off_exact"] is False
+
+
+def test_an_interval_is_the_models_only_on_the_bit_grid_and_without_a_late_pass():
+    assert busoff.model_exact(832_000, 500_000, 0)
+    assert not busoff.model_exact(832_001, 500_000, 0)
+    assert not busoff.model_exact(832_000, 500_000, 1)
+    assert busoff.model_exact(3_328_000, 125_000, 0)
+    assert not busoff.model_exact(3_330_000, 125_000, 0)   # 416.25 bit times
+    assert busoff.model_exact(416_000, 1_000_000, 0)
+
+
+def test_a_frame_loaded_into_an_idle_bus_is_no_fault_of_the_model_and_no_sample_of_it():
+    # The queue recalled the mailboxes, and the driver loaded a frame 1.234 µs after the bus had
+    # become free: that attempt started at the driver's time, and nothing counts it. Off the bit
+    # grid the interval is no sample of the model, and under a short it breaks no rule either.
+    for fault in busoff.FAULTS:
+        out = busoff.trial_figures(Trial(fault, reload_ns=1_234).input())
+        assert out["problems"] == [], (fault, out["problems"])
+        f = out["figures"]
+        assert f["passive_to_bus_off"] == 16 * 26 * BIT + 1_234, fault
+        assert f["late_resyncs"] == 0 and f["passive_to_bus_off_exact"] is False, fault
+
+
+def test_a_host_time_on_the_bit_grid_cannot_be_told_from_the_model():
+    # What model_exact() cannot see (the trace does not say when each attempt started): a frame
+    # loaded into an idle bus a whole number of bit times after it became free. Under a short the
+    # interval then looks like the model's and breaks its rule, and the trial is refused.
+    out = busoff.trial_figures(Trial(reload_ns=2 * BIT).input())
+    assert out["figures"]["passive_to_bus_off_exact"] is True
+    assert any("836000 ns from error passive to bus off" in p for p in out["problems"])
+    out = busoff.trial_figures(Trial("tx_errors", reload_ns=2 * BIT).input())
+    assert out["problems"] == [] and out["figures"]["passive_to_bus_off_exact"] is True
 
 
 @pytest.mark.parametrize("knob, expected", [
@@ -625,6 +662,12 @@ def test_the_summary_gives_every_figure_with_its_unit():
     assert short["holdoff_ms"]["part"] == "policy"
     assert short["recovery_sequence_bits"]["mean"] == 1408.0
     assert short["recovery_sequence_bits"]["part"] == "model"
+    assert short["passive_to_bus_off_bits"] == {
+        **results.distribution([416.0] * 12, "bit times"), "part": "model"}
+    assert short["passive_to_bus_off_bits_not_exact"] == {"unit": "bit times", "n": 0,
+                                                          "samples": [], "part": "mixed"}
+    assert short["first_frame_bits"]["max"] == 118.0
+    assert short["first_frame_bits"]["part"] == "mixed"
     assert short["host_request_to_count_ms"]["part"] == "host"
     assert short["bus_off_dtc_heal_ms"]["n"] == 11
     assert short["heartbeat_values_lost"] == {**results.distribution([10] * 12, "frames"),
@@ -645,6 +688,72 @@ def test_the_summary_names_the_same_part_as_the_intervals():
         assert part in ("model", "policy", "host", "mixed"), name
         if key in busoff.INTERVALS:
             assert part == busoff.INTERVALS[key][2], name
+    # The first frame's length and its time from the mailbox: which frame goes first is the
+    # node's schedule.
+    parts = {name: part for _, name, _, _, part in bench.SUMMARY_FIGURES}
+    assert parts["first_frame_bits"] == busoff.INTERVALS["first_frame_on_bus"][2] == "mixed"
+    assert busoff.INTERVALS["passive_to_bus_off"][2] == "mixed"
+
+
+def run_of(trials: dict[str, list[Trial]], rate: int = BITRATE) -> dict:
+    """A run of the bench made of constructed trials, kept as analyse_bitrate() keeps them."""
+    columns: dict[str, dict[str, list]] = {}
+    for fault, constructed in trials.items():
+        group = columns.setdefault(fault, {})
+        for trial in constructed:
+            out = busoff.trial_figures(trial.input())
+            assert out["problems"] == [], out["problems"]
+            frames, _, _ = heard_around(trial)
+            seen = busoff.observer_figures(frames, out["figures"],
+                                           trial.active + 6_000_000_000, OFFSET)
+            for key in bench.TRIAL_COLUMNS:
+                group.setdefault(key, []).append(out["figures"][key])
+            for key in bench.OBSERVER_COLUMNS:
+                group.setdefault(key, []).append(seen[key])
+    return {"bitrate": rate, "trials": columns, "repeated_trials": [], "persisting_short": None}
+
+
+def model_figures(entry: dict) -> dict:
+    """The figures of a fault kind's summary that are labelled the model's."""
+    return {name: figure for name, figure in entry.items() if figure.get("part") == "model"}
+
+
+def test_a_short_a_late_pass_may_have_moved_is_no_sample_of_the_model():
+    # can.status counted a late pass in the trial: wherever it was, the interval is "mixed".
+    # The model's figure holds the exact trials, and like every figure of the model it is a
+    # constant.
+    late = Trial(passive_bits=27, resyncs=1)
+    summary = bench.summarize([run_of({"short": [Trial(), late, Trial()]})])
+    results.check_summary(summary)
+    short = summary["500_kbit_s"]["short"]
+    assert short["passive_to_bus_off_bits"] == {
+        **results.distribution([416.0, 416.0], "bit times"), "part": "model"}
+    assert short["passive_to_bus_off_bits_not_exact"] == {"unit": "bit times", "n": 1,
+                                                          "samples": [432.0], "part": "mixed"}
+    assert set(model_figures(short)) == {"passive_to_bus_off_bits",
+                                         "destroyed_attempts_to_bus_off", "recovery_sequence_bits"}
+    for name, figure in model_figures(short).items():
+        assert figure["min"] == figure["max"], name
+
+
+def test_injected_errors_whose_attempt_started_at_a_host_time_are_no_sample_of_the_model():
+    # No late pass, but a frame loaded into an idle bus started at the driver's time, off the bit
+    # grid. Under tx_errors the figure is "mixed" as a whole (which frames are attempted is the
+    # node's schedule), the exact trials apart; no figure labelled the model's holds the other.
+    moved = Trial("tx_errors", reload_ns=1_234)
+    summary = bench.summarize([run_of({"tx_errors": [Trial("tx_errors"), moved]})])
+    results.check_summary(summary)
+    errors = summary["500_kbit_s"]["tx_errors"]
+    assert errors["passive_to_bus_off_bits"] == {
+        **results.distribution([416.0, 416.617], "bit times"), "part": "mixed"}
+    assert errors["passive_to_bus_off_bits_exact"] == {
+        **results.distribution([416.0], "bit times"), "part": "mixed"}
+    assert errors["passive_to_bus_off_bits_not_exact"] == {"unit": "bit times", "n": 1,
+                                                           "samples": [416.617], "part": "mixed"}
+    assert set(model_figures(errors)) == {"destroyed_attempts_to_bus_off",
+                                          "recovery_sequence_bits"}
+    for name, figure in model_figures(errors).items():
+        assert figure["min"] == figure["max"], name
 
 
 def test_the_frames_of_a_window_are_taken_by_their_monotonic_time():

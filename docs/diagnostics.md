@@ -592,7 +592,8 @@ the server does not name is sent as generalReject (0x10). The server's statistic
 can-isotp's NotifierBasedCanStack on python-can, for `socketcan:vcan0` or `udp:<port>`. ISO-TP:
 0x7E0 and 0x7E8, padding 0xCC, the tester's own flow control with BS 0 and STmin 0, `wftmax` 0
 (the node never sends WAIT). UDS timing: P2client 1 s, P2*client 6 s (the node's P2*server and a
-second for the hosts), never the server's own figures; request timeouts from the part's maximum
+second for the hosts), never the server's own figures (the flasher's wait for the trial, below,
+polls with the node's P2server instead); request timeouts from the part's maximum
 times: eraseMemory sectors × 400 ms + 409 ms + 10 s, the check (size / 64 + 8) × 0.1 ms + 409 ms +
 10 s (0.1 ms per validation step on a Cortex-M3 is an assumed design figure), a block (pages + 1)
 × 3 ms + 10 s, anything else 10 s.
@@ -612,7 +613,7 @@ times: eraseMemory sectors × 400 ms + 409 ms + 10 s, the check (size / 64 + 8) 
 | transfer_exit | `37` | `77` |
 | check | `31 01 FF 01` | `71 01 FF 01 00 00` (responsePending first if it takes longer than 40 ms) |
 | ecu_reset | `11 01` | `51 01`, then the reset; fcn_boot starts the trial as attempt 1 |
-| wait_for_trial | `22 FD 00` until it names the target slot as a trial | an answer of the image before the reset does not count |
+| wait_for_trial | `22 FD 00` until it names the target slot as a trial: the first 50 ms after the `51 01`, each waiting 50 ms, the next 50 ms after one that did not find it | an answer of the image before the reset does not count |
 | read_version | `22 F1 89` | the trial's version |
 | extended_session_trial | `10 03` | |
 | confirm | `31 01 F0 00` | `71 01 F0 00 00 00`, or `7F 31 22` when the trial confirmed itself first |
@@ -641,14 +642,35 @@ failed, with its report: a step failed (a negative response, a timeout, an answe
 rejects or the flasher cannot use, an error of the bus or the transport), or the flasher stopped
 between two steps on an error of its own, or it could not close the bus after the sequence.
 
+**wait_for_trial** is the flasher's poll for the trial (`_wait_for_trial()`). A request sent at
+once after the `51 01` reaches no node: the node that answered is in its reset, and the trial is
+not started yet. So the first `22 FD 00` goes 50 ms after it, when the restart through fcn_boot,
+a few ms on the host (bench/updates.py measures it from the node's own log, `reset_to_trial`),
+is normally over. Each request waits 50 ms, the node's P2server, within which a node that runs
+answers it; one without an answer by then reached no node, or a node the host held up. The next
+goes 50 ms after one that did not find the trial, up to `--trial-wait-s` (30 s). The step is
+therefore the restart rounded up to the poll and one request (normally the first 50 ms and one
+request), a time of the tester's and not the node's, and an update's total, the sum of the
+steps, includes it. An answer that comes after its request's 50 ms is still sent, as the node
+answers every request in order (RESPONSES in app/diag.h). One at most 100 ms late is dropped by
+udsoncan before the next request; a later one is taken by the next request as its own, which is
+the same `22 FD 00` with the same slot and mode, so no wrong answer. The answer to that next
+request is then still due, and would reach read_version, whose `22 F1 89` it does not answer
+(udsoncan refuses it: an unexpected response, a failed step); so after a request that went
+unanswered, once the trial has answered, the flasher takes the answers still due, at most one
+per unanswered request, each awaited 50 ms, before the step ends.
+
 **One download, measured.** The release node of 244,368 bytes (stripped, with its header), 239
 blocks, over the UDP bus: the report of `test_a_download_confirms_the_new_image[udp]` in the
 release run of the system tests in one run of `scripts/check.sh` (its `report.json` in the
 test's log directory, under `system-test/logs-functional/` of the build root; the times are the
 tester's and include both hosts): erase 2.75 s (the node's log: 61 steps in 2,751,004 µs), transfer 19.70 s
 (12,404 bytes/s; the median block 82.4 ms, the slowest 84.2 ms), check 3 ms, ecu_reset 0.7 ms,
-wait_for_trial 1.20 s, confirm 2.5 ms; over SocketCAN the erase and the transfer took the same
-within 0.1 %, and the median block was the same to 0.1 ms (the slowest 85.0 ms). The block time
+wait_for_trial 1.20 s (the flasher of then: its first request at once, which nobody answers,
+waited out P2client, 1 s, and the next came 0.2 s later: the tester's time, not the restart's,
+which bench/updates.py measures as `reset_to_trial`), confirm 2.5 ms; over SocketCAN the erase
+and the transfer took the same within 0.1 %, and the median block was the same to 0.1 ms (the
+slowest 85.0 ms). The block time
 is the diagnostic task's budget of 2 events per tick at work (the floor is 79 ticks). Phase 6's
 benches measure it properly: [bench/isotp_throughput.py](../bench/isotp_throughput.py) the
 transfer rate by block size from the tester to the node and the node's longest response to the

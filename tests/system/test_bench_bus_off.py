@@ -2,7 +2,8 @@
 """bench/bus_off.py runs: its --quick mode, into a temporary directory, against the binaries of
 this test run (FCN_NODE and the others under the asan pass of scripts/test-system.sh). The test
 checks the result's structure and its counts, and the figures the controller model fixes (1408
-bit times, 24 and 32 destroyed attempts, TEC 128 and 256), never a figure of the host's clock:
+bit times, 24 and 32 destroyed attempts, TEC 128 and 256, and 416 bit times from error passive to
+bus off under a short in a trial that no host time entered), never a figure of the host's clock:
 those may be anything on a loaded test machine. The bench itself checks the run's counts against
 the node's statistics and refuses to write a result where they do not fit."""
 from __future__ import annotations
@@ -77,6 +78,21 @@ def test_a_quick_run_writes_a_result_whose_counts_fit(tmp_path):
         assert all(lost >= 0 for lost in columns["heartbeats_lost"])
         for attempts, tec, count in run_data["tec_samples"][fault]:
             assert tec == busoff.tec_after_attempts(fault, attempts) and count >= 1
+        # Whether a host time entered error passive to bus off is the host's; that the summary
+        # keeps such a trial out of the figure labelled the model's is not.
+        exact = columns["passive_to_bus_off_exact"]
+        assert all(isinstance(value, bool) for value in exact)
+        entry = data["summary"]["500_kbit_s"][fault]
+        assert entry["passive_to_bus_off_bits_not_exact"]["n"] == 2 - sum(exact)
+        if fault == "short":
+            assert entry["passive_to_bus_off_bits"]["part"] == "model"
+            assert entry["passive_to_bus_off_bits"]["n"] == sum(exact)
+            assert all(bits == busoff.SHORT_PASSIVE_TO_BUS_OFF_BITS for bits, ok in zip(
+                columns["passive_to_bus_off_bits"], exact) if ok)
+        else:
+            assert entry["passive_to_bus_off_bits"]["part"] == "mixed"
+            assert entry["passive_to_bus_off_bits"]["n"] == 2
+            assert entry["passive_to_bus_off_bits_exact"]["n"] == sum(exact)
     assert persisting["attempts"] == [24, 24, 24]
     assert persisting["recovery_sequence_bits"] == [1408.0] * 3
     assert persisting["recoveries_under_short"] == 2

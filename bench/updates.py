@@ -17,10 +17,12 @@ CAN bus over SocketCAN (vcan0) or the UDP bus.
    statistics and the flash (fcn_flash info and fcn_tools.flash, which must agree, and the
    reference model's invariants), so the next update starts from the image this one confirmed.
    Per update: every step's time from the flasher's report, the total, the flasher's wall time,
-   the board's start to its first status frame; the node's own counts: the download run's log
-   (the bytes it erased for, its erase and check steps and times: a run that ends in a reset
-   writes no statistics) and the trial run's statistics (the hand-off it took, who confirmed it,
-   the confirm job, its UDS counts); success or the failed step. A failure is kept with the
+   the board's start to its first status frame; the node's restart (reset_to_trial), from the
+   download run's log line of the tester's ECUReset to the trial run's line of its hand-off, by
+   the node's own log stamps; the node's own counts: the download run's log (the bytes it
+   erased for, its erase and check steps and times: a run that ends in a reset writes no
+   statistics) and the trial run's statistics (the hand-off it took, who confirmed it, the
+   confirm job, its UDS counts); success or the failed step. A failure is kept with the
    flasher's whole report and is never retried; the campaign goes on with the next update if
    the flash allows one (no trial pending), and stops otherwise.
 2. The 256 KiB image. --big-downloads (default 10) downloads, each into slot B of a fresh flash
@@ -66,7 +68,7 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
-from fcn_tools import bench, bus, image as image_format, paths, plotstyle, results, runner
+from fcn_tools import bench, bus, flasher, image as image_format, paths, plotstyle, results, runner
 from fcn_tools.node import EXIT_OK, RESET_REQUESTED, RESETS
 
 NAME = "updates"
@@ -113,10 +115,16 @@ FLASHER_TIMEOUT_S = 240.0
 TIMING_NOTE = (
     "An update's time is set by the node's diagnostic task (2 events per 1 ms tick: about 79 ms "
     "for each block of 1024 bytes, bench/isotp_throughput.py), the modelled flash (45 ms per "
-    "sector erase, 0.4 ms per page, each wait ending at a tick) and the restart through fcn_boot; "
-    "the host adds its scheduling to each and the tester's Python start-up and turnaround, which "
-    "a tester on a CAN adapter does not have. The counts and the success of every update do not "
-    "depend on the host's timing."
+    "sector erase, 0.4 ms per page, each wait ending at a tick) and, after the ECUReset, the "
+    "flasher's poll for the trial (wait_for_trial: its first request 50 ms after the reset's "
+    "answer, the next 50 ms after each one that did not find it); the restart itself, fcn_boot "
+    "as a host process and the trial's start-up, is reset_to_trial, by the node's own log "
+    "stamps. The host adds its scheduling to each and the tester's Python start-up and "
+    "turnaround, which a tester on a CAN adapter does not have. The bytes, blocks, steps and "
+    "slots of an update do not depend on the host's timing; its success can, in one direction "
+    "only: a stall of the host past the node's 500 ms watchdog or the 1 s ISO-TP timeout fails "
+    "an update, and none makes one succeed. A failed update is kept with its record and "
+    "counted, so the updates counted as succeeded did succeed, whatever the host did."
 )
 
 # The download run's own account of the download (app/app.c, log_job()), and the trial run's of
@@ -128,6 +136,23 @@ CHECK_LINE = re.compile(r"download: the image validated and is committed as the 
 RESET_LINE = "ECUReset: resetting (requested by the tester)"
 CONFIRM_LINE = re.compile(r"confirmed by the tester's confirm routine: slot ([AB]), image "
                           r"(\d+\.\d+\.\d+), is the active image \((\d+) us\)")
+
+# The node's restart after the tester's ECUReset, by its own log stamps (lib/log's
+# "[seconds.microseconds]", plat_time_ns(): CLOCK_MONOTONIC of the host, so the stamps of two
+# runs on the same host can be subtracted): from the download run's line just before its
+# plat_reset() (app/app.c, reset_if_due()) to the trial run's line of its hand-off, at its
+# start-up before the scheduler (app/app.c, log_handoff()). Host timing: the old run's end, the
+# Board starting fcn_boot again (fcn_tools.node, as a reset into the bootloader would), fcn_boot
+# as a host process (memfd and exec, not a jump) and the trial's start-up.
+STAMP = r"^\[\s*(\d+)\.(\d{6})\] "
+RESET_STAMP = re.compile(STAMP + r"W app: " + re.escape(RESET_LINE) + r"$", re.MULTILINE)
+TRIAL_START_STAMP = re.compile(STAMP + r"I app: started by the bootloader: slot [AB] as a trial",
+                               re.MULTILINE)
+RESET_TO_TRIAL = ("host timing, by the node's own log stamps (CLOCK_MONOTONIC of the host): the "
+                  "download run's 'ECUReset: resetting' line to the trial run's 'started by the "
+                  "bootloader' line; the old run's end, the Board starting fcn_boot again, "
+                  "fcn_boot as a host process (memfd and exec, not a jump) and the trial's "
+                  "start-up")
 
 
 # --------------------------------------------------------------------------- pure analysis
@@ -179,6 +204,25 @@ def parse_trial_log(text: str) -> dict[str, Any] | None:
     if found is None:
         return None
     return {"slot": found.group(1), "version": found.group(2), "us": int(found.group(3))}
+
+
+def log_stamp_us(text: str, line: re.Pattern[str]) -> int | None:
+    """The stamp of the first line of the log `text` that `line` matches, in microseconds of the
+    node's clock; None if no line does."""
+    found = line.search(text)
+    return None if found is None else int(found.group(1)) * 1_000_000 + int(found.group(2))
+
+
+def node_restart(download_log: str, trial_log: str) -> dict[str, int | None]:
+    """The node's restart after the tester's ECUReset by its own log stamps (RESET_STAMP and
+    TRIAL_START_STAMP): the download run's reset line (reset_us), the trial run's line of its
+    hand-off (trial_start_us) and the time between them (us). "us" is None, the update refused
+    for reset_to_trial and counted, if either line is missing or the trial's is not after the
+    reset's."""
+    reset = log_stamp_us(download_log, RESET_STAMP)
+    start = log_stamp_us(trial_log, TRIAL_START_STAMP)
+    us = start - reset if reset is not None and start is not None and start > reset else None
+    return {"reset_us": reset, "trial_start_us": start, "us": us}
 
 
 def erase_steps(image_bytes: int, sector: int = 4096) -> int:
@@ -424,6 +468,8 @@ def one_update(session: runner.Session, images: Images, flash: Path, cell: Path,
     runs = note_ends(board)
     record["runs"] = runs
     record["node_download"] = parse_download_log(board.runs[0].log())
+    if trial is not None:
+        record["node_restart"] = node_restart(board.runs[0].log(), trial.log())
     if not problems:
         problems += download_log_problems(record["node_download"], record["image_bytes"])
     if runs[0]["status"] != RESET_REQUESTED:
@@ -566,16 +612,26 @@ def big_downloads(session: runner.Session, images: Images, count: int, out: Path
 # ------------------------------------------------------------------------------ the figures
 
 
+def restart_times_us(good: Sequence[dict]) -> tuple[list[int], int]:
+    """The node's restart (node_restart()) of each successful update that has both of its log
+    lines, in microseconds, and how many have not (refused, not dropped unseen)."""
+    times = [r.get("node_restart", {}).get("us") for r in good]
+    return [us for us in times if us is not None], sum(1 for us in times if us is None)
+
+
 def campaign_figures(part: dict) -> dict:
     """The distributions of a campaign's successful updates: every step, the total, the
-    flasher's wall time, the start to the first status frame, the throughput, the median
-    block."""
+    flasher's wall time, the start to the first status frame, the node's restart by its log
+    stamps (with the count refused for a missing line), the throughput, the median block."""
     records = part["records"]
     good = [r for r in records if r["success"]]
     steps = step_durations(records, UPDATE_STEPS)
+    restarts, refused = restart_times_us(good)
     return {
         "steps_s": distributions(steps),
         "total_s": results.distribution([r["total_s"] for r in good], "s"),
+        "reset_to_trial_ms": results.distribution(restarts, "ms", scale=1e-3),
+        "reset_to_trial_refused": refused,
         "flasher_wall_s": results.distribution([r["flasher_wall_s"] for r in good], "s"),
         "start_to_ready_s": results.distribution([r["start_to_ready_s"] for r in good], "s"),
         "transfer_bytes_per_s": results.distribution(
@@ -625,7 +681,10 @@ def summarise(data: dict) -> dict:
             "erase": figures["steps_s"]["erase"],
             "transfer": figures["steps_s"]["transfer"],
             "check": figures["steps_s"]["check"],
-            "reset_to_trial": figures["steps_s"]["wait_for_trial"],
+            "wait_for_trial": figures["steps_s"]["wait_for_trial"],
+            "reset_to_trial": {**figures["reset_to_trial_ms"], "measured": RESET_TO_TRIAL},
+            "reset_to_trial_refused": results.figure(figures["reset_to_trial_refused"],
+                                                     "updates"),
             "confirm": figures["steps_s"]["confirm"],
             "transfer_throughput": figures["transfer_bytes_per_s"],
         }
@@ -679,7 +738,7 @@ def plot(data: dict, path: Path) -> None:
 
     rows, labels = [], []
     groups = (("erase", ("erase",)), ("transfer", ("transfer",)),
-              ("reset and trial start", ("ecu_reset", "wait_for_trial")),
+              ("ecu_reset and wait_for_trial", ("ecu_reset", "wait_for_trial")),
               ("the rest", None))
     for name, part in campaigns.items():
         if part["counts"]["succeeded"]:
@@ -731,6 +790,8 @@ def config_of(settings: dict, images: Images | None) -> dict:
         "node_options": [],
         "trial_window": "the product's (5 s of good health): no --confirm-periods",
         "flasher_options": {"updates": [], "big_image": ["--address", BIG_ADDRESS, "--no-reset"]},
+        "flasher_wait_for_trial": {"first_request_and_interval_s": flasher.TRIAL_POLL_S,
+                                   "request_timeout_s": flasher.TRIAL_POLL_TIMEOUT_S},
         "big_image": {"downloads": settings["big_downloads"],
                       "payload_bytes": settings["big_payload"],
                       "payload_kind": images.big_kind if images else None,

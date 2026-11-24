@@ -8,6 +8,11 @@ the first failure, and bench/platform_timing.py last.
     python bench/run_all.py --only NAME        # one bench of the plan
 
 What it does, in order:
+  0. Refuses to do anything (exit status 4, results.EXIT_BUILD_MISMATCH) unless this script is
+     the file of the checkout fcn_tools is imported from (results.script_mismatch()): it runs
+     that checkout's benches, and a run_all.py of another checkout, with another plan, would
+     run them in its name. Every bench it starts lies in that checkout and checks itself the
+     same way.
   1. Refuses a tree with uncommitted changes (--allow-dirty overrides): a final result must
      name a commit in its provenance, not a dirty tree.
   2. Builds the release preset once (scripts/build.sh release); every bench builds it again,
@@ -142,6 +147,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                              "dirty tree: not for the final runs)")
     args = parser.parse_args(argv)
 
+    # This file, not sys.argv[0]: the tests load and run main() in pytest.
+    foreign = results.script_mismatch(Path(__file__))
+    if foreign is not None:
+        print(f"no bench run: {foreign}", file=sys.stderr)
+        return results.EXIT_BUILD_MISMATCH
     try:
         benches = select(PLAN, args.start, args.only)
     except ValueError as error:

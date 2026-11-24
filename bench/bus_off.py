@@ -340,11 +340,12 @@ def trial_input(raw: dict, bitrate: int, log: list[busoff.LogEvent]) -> busoff.T
 
 
 #: The figures of a trial kept in the result, per trial: the intervals (ns), the bit-time
-#: figures, the counts, and what the observer heard.
+#: figures, whether no host time entered error passive to bus off, the counts, and what the
+#: observer heard.
 TRIAL_COLUMNS = (*busoff.INTERVALS, "recovery_sequence_bits", "passive_to_bus_off_bits",
-                 "first_frame_on_bus_bits", "attempts_to_bus_off", "tec_at_passive",
-                 "tec_at_bus_off", "late_resyncs", "counter_samples", "first_frame_id",
-                 "t_fault_ns")
+                 "passive_to_bus_off_exact", "first_frame_on_bus_bits", "attempts_to_bus_off",
+                 "tec_at_passive", "tec_at_bus_off", "late_resyncs", "counter_samples",
+                 "first_frame_id", "t_fault_ns")
 OBSERVER_COLUMNS = ("silence_ns", "observer_lag_ns", "removal_to_observer_ns", "heartbeats_lost",
                     "first_heartbeat_fresh", "dtc_bus_off_after", "dtc_passive_after",
                     "dtc_bus_off_healed_ns", "dtc_passive_healed_ns")
@@ -448,12 +449,14 @@ def analyse_bitrate(bitrate: int, transport: str, collected: list[dict], retried
 
 #: The figures of each fault kind in the summary: (key in the trial columns, summary key, unit,
 #: scale, part). The part says who fixes the figure (busoff.INTERVALS): "model" (the controller
-#: model, by ISO 11898-1's rules and the frames' lengths: the same on any host), "policy" (the
-#: node's recovery policy, run on the FreeRTOS tick), "host" (when the host ran a thread), or
-#: "mixed" (a sum of them; busoff.INTERVALS says of which). Each summary entry carries it.
+#: model by ISO 11898-1's rules alone: the same on any host and whatever frames the node
+#: sends), "policy" (the node's recovery policy, run on the FreeRTOS tick), "host" (when the
+#: host ran a thread), or "mixed" (a sum of them, the node's schedule among them;
+#: busoff.INTERVALS says of which). Each summary entry carries it. Error passive to bus off is
+#: not among them: whether a host time entered it differs from trial to trial
+#: (passive_to_bus_off()).
 SUMMARY_FIGURES = (
     ("fault_to_bus_off", "fault_to_bus_off_ms", "ms", 1e-6, "mixed"),
-    ("passive_to_bus_off_bits", "passive_to_bus_off_bits", "bit times", 1.0, "model"),
     ("attempts_to_bus_off", "destroyed_attempts_to_bus_off", "attempts", 1.0, "model"),
     ("bus_off_to_active", "bus_off_to_error_active_ms", "ms", 1e-6, "mixed"),
     ("removal_to_active", "removal_to_error_active_ms", "ms", 1e-6, "mixed"),
@@ -465,7 +468,7 @@ SUMMARY_FIGURES = (
     ("request_to_count", "host_request_to_count_ms", "ms", 1e-6, "host"),
     ("recovery_report_lag", "host_recovery_report_lag_ms", "ms", 1e-6, "host"),
     ("active_to_first_submit", "host_active_to_first_submit_ms", "ms", 1e-6, "host"),
-    ("first_frame_on_bus_bits", "first_frame_bits", "bit times", 1.0, "model"),
+    ("first_frame_on_bus_bits", "first_frame_bits", "bit times", 1.0, "mixed"),
     ("heartbeats_lost", "heartbeat_values_lost", "frames", 1.0, "mixed"),
     ("silence_ns", "bus_silence_heard_ms", "ms", 1e-6, "mixed"),
     ("dtc_heal", "bus_off_dtc_heal_ms", "ms", 1e-6, "mixed"),
@@ -477,9 +480,37 @@ def with_part(entry: dict, part: str) -> dict:
     return {**entry, "part": part}
 
 
+def passive_to_bus_off(fault: str, columns: dict) -> dict:
+    """The summary entries of error passive to bus off, in bit times. A trial that no host time
+    entered (busoff.model_exact(), "passive_to_bus_off_exact") is the model's under a short and
+    "mixed" under tx_errors, where the frames attempted are the node's schedule
+    (busoff.PASSIVE_TO_BUS_OFF_PART); any other trial is "mixed". "passive_to_bus_off_bits" is
+    the distribution of the exact trials where they are the model's (a short), else of every
+    trial, with the exact ones apart as "passive_to_bus_off_bits_exact" (tx_errors);
+    "passive_to_bus_off_bits_not_exact" gives the count and the values of the others."""
+    bits = columns["passive_to_bus_off_bits"]
+    exact = columns["passive_to_bus_off_exact"]
+    exact_bits = [value for value, ok in zip(bits, exact) if ok]
+    other_bits = [value for value, ok in zip(bits, exact) if not ok]
+    part = busoff.PASSIVE_TO_BUS_OFF_PART[fault]
+    entries: dict = {}
+    if part == "model":
+        entries["passive_to_bus_off_bits"] = with_part(
+            results.distribution(exact_bits, "bit times"), part)
+    else:
+        entries["passive_to_bus_off_bits"] = with_part(
+            results.distribution(bits, "bit times"), "mixed")
+        entries["passive_to_bus_off_bits_exact"] = with_part(
+            results.distribution(exact_bits, "bit times"), part)
+    entries["passive_to_bus_off_bits_not_exact"] = with_part(
+        results.raw_samples(other_bits, "bit times"), "mixed")
+    return entries
+
+
 def summarize(runs: list[dict]) -> dict:
     """The figures the README may quote, each with its unit (results.check_summary()) and, where
-    it is a time or a count of the trials, the part that fixes it (SUMMARY_FIGURES)."""
+    it is a time or a count of the trials, the part that fixes it (SUMMARY_FIGURES,
+    passive_to_bus_off())."""
     summary: dict = {"standard_minimum_recovery_bits": with_part(
         results.figure(busoff.RECOVERY_BITS, "bit times"), "standard")}
     for run in runs:
@@ -500,6 +531,7 @@ def summarize(runs: list[dict]) -> dict:
             for key, name, unit, scale, part in SUMMARY_FIGURES:
                 values = [v for v in columns.get(key, []) if v is not None]
                 entry[name] = with_part(results.distribution(values, unit, scale=scale), part)
+            entry.update(passive_to_bus_off(fault, columns))
             fresh, known = busoff.share(columns["first_heartbeat_fresh"])
             entry["first_heartbeat_fresh"] = results.figure(fresh, f"of {known} trials")
             reported, known = busoff.share(columns["dtc_bus_off_after"])
@@ -604,7 +636,7 @@ def plot(data: dict, path: Path) -> None:
              ("recovery_sequence", "recovery sequence (model)"),
              ("recovery_report_lag", "report of it (host)"),
              ("active_to_first_submit", "driver reloads (host)"),
-             ("first_frame_on_bus", "first frame (model)")]
+             ("first_frame_on_bus", "first frame (mixed)")]
     height = 0.8 / len(runs)
     for i, run in enumerate(runs):
         columns = run["trials"].get("short") or next(iter(run["trials"].values()))

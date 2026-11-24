@@ -316,9 +316,12 @@ short and 100 of 32 destroyed transmissions at each of 500, 125 and 1000 kbit/s,
 the model's figures are those of the tests: every recovery took 1408 bit times (2.816, 11.264
 and 1.408 ms), also at each of the 7 bus offs of the persisting short per bit rate; a short took
 the controller bus off after 24 destroyed attempts and the injected errors after 32, in every
-trial; and error passive to bus off under a short was 416 bit times in 298 of the 300 trials,
-545 and 606 bit times in two of the four in which a late pass of the hardware thread moved a start
-(`late_resyncs`). The hold-off, the node's policy on its tick, was 100 to 101 ms in the trials,
+trial; and error passive to bus off under a short, the model's figure only in a trial that no
+host time entered (no late pass counted, a whole number of bit times;
+[docs/measurements.md](measurements.md#bus_off-the-way-into-bus-off-and-the-recovery)), was 416
+bit times in each of the 296 such trials. The other four had a late pass of the hardware thread
+counted (`late_resyncs`): two took 416 bit times all the same, two 545 and 606, which are not the
+model's. The hold-off, the node's policy on its tick, was 100 to 101 ms in the trials,
 and under the persisting short it went 100, 200, 400, 800, 1600, 1600 and 1600 ms, each at
 most 1.03 ms above. The host's part from the bus off to the driver's log line had medians of
 0.049 to 0.062 ms per bit rate and fault, and a longest of 0.410 ms.

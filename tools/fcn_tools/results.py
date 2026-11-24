@@ -24,12 +24,22 @@ the same rule. raw_samples() keeps the samples themselves in the JSON up to RAW_
 
 THE BUILD ID. Every host program carries the build id of the tree it was built from
 (platform/posix/build_id.h, cmake/FcnBuildId.cmake): the commit, and "-dirty-" with a hash of
-the uncommitted changes for a tree that has them. tree_build_id() computes the id a binary
+the uncommitted changes for a tree that has them, in the submodules as well (a submodule moved
+to another commit, or a tracked file changed in one). tree_build_id() computes the id a binary
 built from the tree of a provenance carries, by the same rule; binary_build_id() asks a program
 (`<program> --version`); require_tree_build() refuses (BuildIdMismatch) a set of binaries, or of
 ids they reported (a node's statistics have "build_id"), of which one is not the tree's.
 write_result() checks again just before and just after it writes, against the provenance it
 writes, and puts the previous file back if the tree changed in between.
+
+THE SCRIPT. A result names the commit of paths.REPO_ROOT, the checkout this package is imported
+from, and its command names the bench script by its path in its own checkout; the script
+computes the figures. script_mismatch() says why the script running is not the file at that
+path in REPO_ROOT, byte for byte: a script of another checkout (the editable install of
+scripts/setup-python.sh points the virtual environment at one checkout) or of none.
+require_tree_build() refuses such a script before the bench measures, write_result() when it
+writes, and build_id_mismatch() for platform_timing.py, so that no result names code that did
+not compute it.
 
 A LOADED HOST. Timing benches assume an otherwise idle machine. check_load() compares the
 1-minute load average at the start of the bench (taken when this module is imported, before the
@@ -68,8 +78,13 @@ from . import paths
 HOST_TIMING_NOTE = (
     "Measured on the FreeRTOS POSIX port, where every task is a thread of a Linux process. "
     "Times, jitter and latencies are those of the host's scheduler and are not what the same "
-    "code shows on a microcontroller; counts, orderings and sizes of protocol data are "
-    "independent of the host."
+    "code shows on a microcontroller. The contents, orderings and sizes of protocol data, and "
+    "the frames and bytes an exchange takes, do not depend on the host. What happens in a "
+    "stretch of time does: the jobs and frames of a run of fixed length, ticks dropped, jobs "
+    "released early; and a stall of the host past the node's 500 ms watchdog or a 1 s protocol "
+    "timer fails what the node would have passed. Such a failure is never hidden (the bench "
+    "counts and keeps it, or writes no result), and no stall makes a check pass, so a count of "
+    "0 failures holds whatever the host did."
 )
 
 
@@ -115,18 +130,22 @@ def _cpu_model() -> str:
     return platform.processor() or "unknown"
 
 
-def provenance() -> dict:
-    """Who produced a result: command, commit, uncommitted source changes, host."""
-    modified = _modified_files(
-        _git("status", "--porcelain", "--untracked-files=no", "--ignore-submodules"))
-    # The script's path relative to the repository it lives in, found by walking up from the
-    # script itself (the package may be imported through a different mount of the same tree).
-    script = Path(sys.argv[0]).resolve()
-    script_name = script.name
+def _checkout_of(script: Path) -> tuple[Path | None, str]:
+    """The checkout `script` (an absolute path) lies in, the nearest directory above it with a
+    CMakePresets.json, and the script's path in it; (None, its file name) outside every
+    checkout."""
     for parent in script.parents:
         if (parent / "CMakePresets.json").exists():
-            script_name = script.relative_to(parent).as_posix()
-            break
+            return parent, script.relative_to(parent).as_posix()
+    return None, script.name
+
+
+def provenance() -> dict:
+    """Who produced a result: command, commit, uncommitted source changes, host."""
+    modified = _modified_files(_git(*STATUS_FOR_BUILD_ID))
+    # The script's path relative to the checkout it lives in, found by walking up from the
+    # script itself (the package may be imported through a different mount of the same tree).
+    _, script_name = _checkout_of(Path(sys.argv[0]).resolve())
     release = platform.release()
     return {
         "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -279,9 +298,15 @@ def check_summary(summary: Mapping, where: str = "summary") -> None:
 
 # ------------------------------------------------------------------------------- the build id
 
-# The changes that make up a dirty build id; must match cmake/FcnBuildId.cmake exactly.
+# Whether the tree is dirty (the files of the provenance), and the changes that make up a dirty
+# build id; both must match cmake/FcnBuildId.cmake exactly. A submodule moved to another commit,
+# or with a tracked file changed in it, is a change: the status lists it, and --submodule=diff
+# puts its own diff into the hash. Untracked files are none, in the tree or in a submodule.
+STATUS_FOR_BUILD_ID = ["status", "--porcelain", "--untracked-files=no",
+                       "--ignore-submodules=untracked"]
 DIFF_FOR_BUILD_ID = ["diff", "HEAD", "--binary", "--no-color", "--no-ext-diff", "--no-textconv",
-                     "--no-renames", "--ignore-submodules", "--", ".", ":(exclude)results"]
+                     "--no-renames", "--submodule=diff", "--ignore-submodules=untracked", "--",
+                     ".", ":(exclude)results"]
 
 #: What a build id looks like: the commit (40 hex digits, 64 in a SHA-256 repository), with
 #: "-dirty-" and 12 hex digits for a tree with uncommitted changes; or "unknown".
@@ -319,10 +344,41 @@ def tree_build_id(provenance: dict, repo: Path | None = None) -> str:
     return "unknown" if digest == "unknown" else f"{commit}-dirty-{digest}"
 
 
+def script_mismatch(script: Path | None = None) -> str | None:
+    """Why the bench script `script` (default the one running, sys.argv[0], as provenance()
+    names it) is not this checkout's own, or None if it is (see THE SCRIPT in the module text).
+
+    It must be the file at its path in its own checkout under paths.REPO_ROOT, with the same
+    bytes. The bytes are compared, not the paths: under WSL the same tree is reached through
+    more than one mount (/home/dev/fcn and /mnt/c/...), and a copy with the same bytes computes
+    the same figures, as a bench imports nothing from its own directory."""
+    path = Path(sys.argv[0] if script is None else script).resolve()
+    root, relative = _checkout_of(path)
+    if root is None:
+        return (f"the bench script {path} lies in no checkout of this project, so a result "
+                f"could not name the code that computed it: run the bench of {paths.REPO_ROOT}")
+    own = paths.REPO_ROOT / relative
+    try:
+        same = own.is_file() and own.read_bytes() == path.read_bytes()
+    except OSError:
+        same = False
+    if not same:
+        return (f"the bench script {path} is not {own}: fcn_tools is imported from "
+                f"{paths.REPO_ROOT}, whose commit a result would name, but the figures would be "
+                f"computed by the script of {root}. Run that checkout's bench with "
+                f"PYTHONPATH={root / 'tools'}, or the bench of {paths.REPO_ROOT}")
+    return None
+
+
 def build_id_mismatch(build_ids: set[str], provenance: dict,
                       reporter: str = "the self-test") -> str | None:
-    """Why the binary does not belong to the tree in `provenance`, or None if it does.
-    `build_ids` are the ids `reporter` reported (bench/platform_timing.py: the self-test)."""
+    """Why the result would not name what made it, or None: the bench script running is not
+    this checkout's (script_mismatch()), or the binary does not belong to the tree in
+    `provenance`. `build_ids` are the ids `reporter` reported (bench/platform_timing.py: the
+    self-test)."""
+    script = script_mismatch()
+    if script is not None:
+        return script
     expected = tree_build_id(provenance)
     if expected == "unknown":
         return "the tree's build id is unknown (no git?), so the binary cannot be tied to it"
@@ -397,12 +453,13 @@ def binaries_mismatch(binaries: Mapping[str, Path], provenance: dict,
 
 def require_tree_build(binaries: Mapping[str, Path], reported: Mapping[str, str] | None = None,
                        provenance_: dict | None = None) -> str:
-    """Refuse (BuildIdMismatch, with binaries_mismatch()'s message) unless every binary and
-    every reported id is the build of the tree (of `provenance_`, default the tree as it is
-    now); the tree's build id otherwise. A bench calls it before it measures, so that it does
-    not measure for an hour what it would not write, and write_result() again when it writes."""
+    """Refuse (BuildIdMismatch, with script_mismatch()'s or binaries_mismatch()'s message)
+    unless the bench script running is this checkout's and every binary and every reported id
+    is the build of the tree (of `provenance_`, default the tree as it is now); the tree's build
+    id otherwise. A bench calls it before it measures, so that it does not measure for an hour
+    what it would not write, and write_result() again when it writes."""
     prov = provenance() if provenance_ is None else provenance_
-    mismatch = binaries_mismatch(binaries, prov, reported)
+    mismatch = script_mismatch() or binaries_mismatch(binaries, prov, reported)
     if mismatch is not None:
         raise BuildIdMismatch(mismatch)
     return tree_build_id(prov)
@@ -528,7 +585,8 @@ def write_result(name: str, data: dict, summary: dict | None = None, config: dic
     are the build of the tree the provenance names (BuildIdMismatch otherwise, and nothing is
     written), and "build" records the tree's id, each binary's path, id and SHA-256.
     `binary_sha256` (name -> digest taken before the bench measured): a binary that changed
-    since is refused as well. `summary` must give every figure with its unit (check_summary()).
+    since is refused as well, and so is a bench script that is not this checkout's
+    (require_tree_build()). `summary` must give every figure with its unit (check_summary()).
     Without these arguments the file is what bench/platform_timing.py has always written:
     schema, provenance, host timing note and the data."""
     clash = [key for key in data if key in RESERVED]

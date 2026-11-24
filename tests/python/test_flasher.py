@@ -6,8 +6,10 @@ the test makes it answer: the steps in their order, the report, a refusal, a tri
 itself before the routine, an answer of the old image while the node resets, answers udsoncan
 finds unexpected or invalid and errors of the bus, each a failed step with its report, an error
 closing the bus after the sequence, also with its report, and the exit statuses of the command
-line. The node itself is the system tests'
-(tests/system/test_download.py)."""
+line. And the wait for the trial with udsoncan's own client against a node that restarts, on a
+clock of the test's: the first request one poll interval after the reset, never a wait of
+P2client, and a late answer taken by the next request with the one still due taken before
+read_version. The node itself is the system tests' (tests/system/test_download.py)."""
 from __future__ import annotations
 
 import contextlib
@@ -19,6 +21,8 @@ from types import SimpleNamespace
 import can
 import pytest
 import udsoncan
+import udsoncan.client
+import udsoncan.connections
 from udsoncan.exceptions import (InvalidResponseException, NegativeResponseException,
                                  TimeoutException, UnexpectedResponseException)
 
@@ -253,6 +257,144 @@ def test_no_trial_within_the_wait_fails_wait_for_trial(fake, image_file):
     fake.old_answers_after_reset = 10**6
     report = flasher.flash("udp:1", image_file, trial_wait_s=0.05).as_json()
     assert report["failed_step"] == "wait_for_trial"
+
+
+class Clock:
+    """A clock that only the test moves, with time.monotonic() and time.sleep() of its own."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += max(seconds, 0.0)
+
+
+class RestartingNode(udsoncan.connections.BaseConnection):
+    """The node from the ECUReset's answer on (time 0 of `clock`), at the level of UDS payloads,
+    under udsoncan's own client: nothing on the bus until `up_at` (a request sent before then
+    reaches no node); then every request is answered, in the order of the requests (app/diag.h,
+    RESPONSES), `turnaround` after the later of the request, `answers_from` (the trial's
+    diagnostic task held up until then) and the answer before it. 22 FD 00 answers the trial's
+    boot information (slot B, attempt 1, WAITING, 1.1.0) and 22 F1 89 its version. What has
+    arrived is dropped by empty_rxqueue(), as can-isotp's receive queue is cleared."""
+
+    def __init__(self, clock: Clock, up_at: float, answers_from: float = 0.0,
+                 turnaround: float = 0.002) -> None:
+        super().__init__("restarting node")
+        self.clock = clock
+        self.up_at = up_at
+        self.answers_from = answers_from
+        self.turnaround = turnaround
+        self.free_at = 0.0
+        self.due: list[tuple[float, bytes]] = []      # (arrival, answer), in their order
+        self.requests: list[tuple[float, bytes]] = []
+        self.waits: list[float] = []                  # the timeout of every wait for an answer
+        self.opened = False
+
+    def open(self) -> RestartingNode:
+        self.opened = True
+        return self
+
+    def close(self) -> None:
+        self.opened = False
+
+    def is_open(self) -> bool:
+        return self.opened
+
+    def empty_txqueue(self) -> None:
+        pass
+
+    def empty_rxqueue(self) -> None:
+        self.due = [(at, answer) for at, answer in self.due if at > self.clock.now]
+
+    def specific_send(self, payload: bytes, timeout: float | None = None) -> None:
+        now = self.clock.now
+        request = bytes(payload)
+        self.requests.append((now, request))
+        if now < self.up_at:
+            return
+        self.free_at = max(now, self.answers_from, self.free_at) + self.turnaround
+        if request == bytes([0x22, 0xFD, 0x00]):
+            answer = request[1:3] + boot_info_bytes(1, 2, 1, 1, 0x01010000)
+        elif request == bytes([0x22, 0xF1, 0x89]):
+            answer = request[1:3] + b"1.1.0"
+        else:
+            raise AssertionError(f"not a request of this test: {request.hex(' ')}")
+        self.due.append((self.free_at, bytes([0x62]) + answer))
+
+    def specific_wait_frame(self, timeout: float | None = None) -> bytes | None:
+        assert timeout is not None
+        self.waits.append(timeout)
+        if self.due and self.due[0][0] <= self.clock.now + timeout:
+            at, answer = self.due.pop(0)
+            self.clock.now = max(self.clock.now, at)
+            return answer
+        self.clock.now += timeout
+        raise TimeoutException(f"no answer within {timeout} s")
+
+
+@pytest.fixture
+def clock(monkeypatch) -> Clock:
+    """The test's clock for the flasher and for udsoncan's client (its request timeouts)."""
+    now = Clock()
+    monkeypatch.setattr(flasher, "time", now)
+    monkeypatch.setattr(udsoncan.client, "time", now)
+    return now
+
+
+def _wait_and_read_version(node: RestartingNode
+                           ) -> tuple[diag.BootInfo, float, list[float], str]:
+    """wait_for_trial from the ECUReset's answer (time 0), as the flasher makes it; what it
+    found, the time it took, its waits for an answer, and what read_version gets after it."""
+    with udsoncan.client.Client(node, config=diag.client_config()) as client:
+        found = flasher._wait_for_trial(client, "B", flasher.TRIAL_WAIT_S)
+        took, waits = node.clock.now, list(node.waits)
+        return found, took, waits, diag.read_version(client)
+
+
+@pytest.mark.parametrize("up_at, polls, took", [
+    # The trial up 5 ms after the reset: the first request, one interval after it, finds it.
+    (0.005, 1, flasher.TRIAL_POLL_S + 0.002),
+    # Up after 120 ms: the first request reaches no node and waits P2server, the second finds
+    # the trial an interval later, and the step waits P2server for an answer still due.
+    (0.120, 2, 2 * flasher.TRIAL_POLL_S + 2 * diag.P2_SERVER_S + 0.002),
+], ids=["restart-5ms", "restart-120ms"])
+def test_wait_for_trial_asks_every_poll_interval_and_never_waits_p2client(clock, up_at, polls,
+                                                                          took):
+    node = RestartingNode(clock, up_at=up_at)
+    found, elapsed, waits, version = _wait_and_read_version(node)
+    assert (found.slot, found.mode, found.attempt, found.confirm_state) == ("B", "trial", 1,
+                                                                         "WAITING")
+    assert version == "1.1.0"
+    asked = [at for at, request in node.requests if request == bytes([0x22, 0xFD, 0x00])]
+    assert len(asked) == polls
+    assert asked[0] == pytest.approx(flasher.TRIAL_POLL_S)   # not at once: no node is there
+    # Every wait of the step for an answer is the node's P2server, none P2client: the step is
+    # the restart rounded up to the poll (at most a period of P2server and the interval beyond
+    # it), one request, and P2server for an answer still due; not the second of P2client.
+    assert waits and all(wait == pytest.approx(diag.P2_SERVER_S) for wait in waits)
+    assert elapsed == pytest.approx(took)
+    assert elapsed < (up_at + diag.P2_SERVER_S + flasher.TRIAL_POLL_S + node.turnaround
+                      + diag.P2_SERVER_S) < diag.P2_CLIENT_S
+
+
+def test_a_late_answer_is_taken_by_the_next_request_and_the_one_still_due_before_read_version(
+        clock):
+    # The trial's receive path is up after 10 ms, its diagnostic task only after 180 ms: the
+    # first request (at 50 ms) gets no answer within P2server; its answer comes at 182 ms, while
+    # the second request (at 150 ms) waits, and is taken as the second's (the same request,
+    # 22 FD 00); the second's own answer follows at 184 ms.
+    node = RestartingNode(clock, up_at=0.010, answers_from=0.180)
+    found, elapsed, _, version = _wait_and_read_version(node)
+    assert (found.slot, found.mode) == ("B", "trial")
+    assert [request.hex(" ") for _, request in node.requests] == ["22 fd 00"] * 2 + ["22 f1 89"]
+    # The step ended only with the second answer taken: read_version got its own answer, and
+    # nothing is left.
+    assert elapsed == pytest.approx(0.184)
+    assert version == "1.1.0" and node.due == []
 
 
 def test_a_trial_of_another_version_fails(fake, image_file):

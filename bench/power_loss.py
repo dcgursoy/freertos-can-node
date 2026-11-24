@@ -1180,9 +1180,16 @@ def main(argv=None) -> int:
         path = results.write_result(
             NAME, data, summary, config, out, load=load, binaries=checked,
             reported_build_ids=reported, binary_sha256=sha,
-            timing_note="The outcomes of the trials are decided by the node and the flash, not "
-                        "the host's clock; only the times per trial and the wall time are the "
-                        "host's, with the workers running in parallel.")
+            timing_note="What a cut leaves and the state the board comes back in are decided "
+                        "by the node and the flash, not the host's clock. The host can still "
+                        "fail a trial (a stall past the node's 500 ms watchdog resets the node, "
+                        "one past the 1 s ISO-TP timeout ends a download); such a trial is kept "
+                        "as a failure, never repeated, and no stall makes a check pass, so a "
+                        "count of 0 failures holds whatever the host did. The host's timing "
+                        "can also change how often a start finds the files still locked by the "
+                        "run before it (lock_retries: such a start is repeated and counted). "
+                        "The times per trial and the wall time are the host's, with the "
+                        "workers running in parallel.")
     except results.HostLoaded as error:
         print(error, file=sys.stderr)
         return results.EXIT_HOST_LOADED

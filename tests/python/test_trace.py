@@ -91,6 +91,42 @@ def test_every_tick_is_due_on_the_base_in_force_for_it():
         grid.due_ns([0])
 
 
+def test_a_tick_can_be_held_against_the_base_before_a_drop():
+    # The grid of the test above: tick 49 is on the first base, tick 50 on the second, which
+    # is 3 periods later (3 ticks given up). On the first base tick 50 was due at 50 ms.
+    grid = trace.tick_grid(make(
+        {"kind": TICK_BASE, "time_ns": 1_000_000, "value": 1, "arg": 1_000_000},
+        {"kind": TICK_BASE, "time_ns": 4_000_000, "value": 50, "arg": 1_000_000}))
+    assert grid.base_index([1, 49, 50, 51]).tolist() == [0, 0, 1, 1]
+    assert grid.due_ns([50, 51], base=[0, 0]).tolist() == [50_000_000, 51_000_000]
+    assert grid.due_ns([50], base=[1]).tolist() == grid.due_ns([50]).tolist() == [53_000_000]
+    assert (grid.ticks_given_up(1, 0), grid.ticks_given_up(1, 1)) == (3, 0)
+    with pytest.raises(trace.TraceError):
+        grid.base_index([0])
+
+
+def test_of_two_bases_with_the_same_first_tick_the_later_one_holds():
+    # Tick k due at k ms; two drops before the kernel counted tick 10, both from tick 10 on: 2
+    # ticks given up, then 5 more. Tick 10 is due on the last base, 7 ms later than on the
+    # first; the base between holds for no tick.
+    grid = trace.tick_grid(make(
+        {"kind": TICK_BASE, "time_ns": 1_000_000, "value": 1, "arg": 1_000_000},
+        {"kind": TICK_BASE, "time_ns": 3_000_000, "value": 10, "arg": 1_000_000},
+        {"kind": TICK_BASE, "time_ns": 8_000_000, "value": 10, "arg": 1_000_000}))
+    assert grid.base_index([9, 10, 11]).tolist() == [0, 2, 2]
+    assert grid.due_ns([9, 10]).tolist() == [9_000_000, 17_000_000]
+    assert (grid.ticks_given_up(2, 0), grid.ticks_given_up(1, 0)) == (7, 2)
+
+
+def test_a_base_moved_by_part_of_a_period_gives_no_ticks_given_up():
+    # posix_tick.c moves the base by whole periods: one moved by 1.5 ms cannot be its.
+    grid = trace.tick_grid(make(
+        {"kind": TICK_BASE, "time_ns": 1_000_000, "value": 1, "arg": 1_000_000},
+        {"kind": TICK_BASE, "time_ns": 2_500_000, "value": 50, "arg": 1_000_000}))
+    with pytest.raises(trace.TraceError, match="part of a tick period"):
+        grid.ticks_given_up(1, 0)
+
+
 def test_a_trace_without_a_base_or_with_two_periods_has_no_grid():
     with pytest.raises(trace.TraceError, match="no TICK_BASE"):
         trace.tick_grid(make(switch(1, 1)))

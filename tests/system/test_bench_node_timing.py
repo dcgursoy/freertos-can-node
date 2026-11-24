@@ -68,6 +68,27 @@ def test_the_quick_run_writes_a_consistent_result(tmp_path, transport):
         summary = result["summary"][transport][condition]
         assert summary["sensor_released_more_than_a_tick_early"] == results.figure(
             entry["release"]["sensor"]["released_more_than_a_tick_early"], "jobs")
+        # The first jobs after a drop (posix_tick.c gave ticks up and moved the grid), listed
+        # whether the host made the node give ticks up or not (that is its matter): only of runs
+        # that gave ticks up, at least 6 a drop (a lag of more than
+        # POSIX_TICK_MAX_CATCH_UP_TICKS, all but one tick of it) and no more than the run gave
+        # up; each job later on the grid of the job before than on its own by exactly the ticks
+        # given up (1 ms each); the summary counts those in the window.
+        dropped = {run_["name"]: run_["tick_dropped"] for run_ in entry["runs"]}
+        for task in ("sensor", "health"):
+            listed = entry["release"][task]["after_drop"]
+            for found in listed:
+                assert found["drops"] >= 1 and found["dropped_ticks"] >= 6 * found["drops"]
+                assert found["wake_tick"] >= found["first_tick"]
+                for key in ("release_lateness", "start_lateness"):
+                    assert math.isclose(found[f"{key}_on_the_base_before_us"] - found[f"{key}_us"],
+                                        found["dropped_ticks"] * 1000.0, abs_tol=0.002)
+            for name, ticks in dropped.items():
+                assert sum(found["dropped_ticks"] for found in listed if found["run"] == name) \
+                    <= ticks
+            assert {found["run"] for found in listed} <= set(dropped)
+            assert summary[f"{task}_first_jobs_after_a_drop"] == results.figure(
+                sum(found["in_window"] for found in listed), "jobs")
         # The tick count against the grid: the counts first seen ahead are among the counts
         # seen, and a stretch ahead needs a count seen ahead; a result is written only when the
         # longest is within the limit (the node's tick period is 1 ms).

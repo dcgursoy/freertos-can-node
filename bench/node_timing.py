@@ -35,7 +35,10 @@ From the trace (fcn_tools.trace, fcn_tools.latency):
             the task ready), the start (its first switch-in), the end (its block in
             xTaskDelayUntil), the execution time between; for the processing task, released by
             the sensor task's sample, the same from the sensor job's arrival; the jobs released
-            before their tick was due, and more than a tick early, are counted
+            before their tick was due, and more than a tick early, are counted. When posix_tick.c
+            gives ticks up it moves the grid later by as many periods, and each job is measured
+            on the grid in force for its tick: the first job of a periodic task after a drop is
+            listed with its lateness on the grid before as well (after_drop)
   latency   per frame of the protected telemetry (BMS_PackStatus, BMS_CellVoltages1/2,
             BMS_Temperatures): from the release of the sensor job whose sample it carries to the
             model's end of frame (transmit done), and to the observer's kernel timestamp; the
@@ -334,11 +337,39 @@ def tick_lead_of(run: Run, grid: trace_module.TickGrid) -> trace_module.TickLead
     return lead
 
 
+def first_jobs_after_drops(run: Run, grid: trace_module.TickGrid, jobs: trace_module.Jobs,
+                           arrival: np.ndarray, keep: np.ndarray) -> list[dict]:
+    """The jobs of a periodic task whose tick was due on a later base than the tick of the job
+    before (for its first job, than the trace's first base): the first job after one drop or
+    more, when posix_tick.c gave ticks up and moved the base. Its lateness on its own base is
+    the one the distributions hold, from a due time moved later by the ticks given up; on the
+    base of the job before, its lateness is larger by exactly those ticks. For each such job of
+    the whole run (raw, in ns): the run, the base's first tick, the drops since the job before
+    and the ticks they gave up, the tick the job waited for, whether it is in the window
+    (`keep`), and its release and start lateness on both bases."""
+    base = grid.base_index(jobs.wake_tick)
+    before = np.concatenate(([0], base[:-1]))
+    found = []
+    for i in np.flatnonzero(base > before):
+        old = int(grid.due_ns(jobs.wake_tick[i:i + 1], base=before[i:i + 1])[0])
+        found.append({
+            "run": run.name, "first_tick": int(grid.first_ticks[base[i]]),
+            "drops": int(base[i] - before[i]),
+            "dropped_ticks": int(grid.ticks_given_up(base[i], before[i])),
+            "wake_tick": int(jobs.wake_tick[i]), "in_window": bool(keep[i]),
+            "release_lateness": int(jobs.release_ns[i] - arrival[i]),
+            "release_lateness_on_the_base_before": int(jobs.release_ns[i]) - old,
+            "start_lateness": int(jobs.start_ns[i] - arrival[i]),
+            "start_lateness_on_the_base_before": int(jobs.start_ns[i]) - old})
+    return found
+
+
 def periodic_release(run: Run, name: str, grid: trace_module.TickGrid,
                      intervals: trace_module.Intervals,
                      window: tuple[int, int] | None) -> tuple[dict, trace_module.Jobs, np.ndarray]:
     """The release figures of the periodic task `name` in the window (raw, in ns, for pooling
-    over runs), and every job of it in the trace with its arrival."""
+    over runs), the first jobs after a drop of the whole run (first_jobs_after_drops()), and
+    every job of it in the trace with its arrival."""
     trace = run.trace
     assert trace is not None
     period_ns = task_table(run.stats)[name]["period_us"] * 1000
@@ -349,6 +380,7 @@ def periodic_release(run: Run, name: str, grid: trace_module.TickGrid,
     lateness = jobs.release_ns - arrival
     keep = in_window(jobs.release_ns, window)
     entry = {
+        "after_drop": first_jobs_after_drops(run, grid, jobs, arrival, keep),
         "early": int((lateness[keep] < 0).sum()),
         # The tick count two or more ahead (see EARLY_MARGIN_NS).
         "beyond_a_tick": int((lateness[keep] < -(grid.period_ns + EARLY_MARGIN_NS)).sum()),
@@ -547,6 +579,16 @@ def release_counts(parts: list[dict]) -> dict:
             "released_more_than_a_tick_early": sum(part["beyond_a_tick"] for part in parts)}
 
 
+def after_drop_data(parts: list[dict]) -> list[dict]:
+    """The first jobs after a drop (first_jobs_after_drops()) of a condition's runs, in µs."""
+    return [{**{key: found[key] for key in ("run", "first_tick", "drops", "dropped_ticks",
+                                              "wake_tick", "in_window")},
+             **{f"{key}_us": round(found[key] * US, 3) for key in (
+                 "release_lateness", "release_lateness_on_the_base_before", "start_lateness",
+                 "start_lateness_on_the_base_before")}}
+            for part in parts for found in part["after_drop"]]
+
+
 def condition_data(runs: list[Run], analyses: list[dict], observers: list[dict]) -> dict:
     """One condition of one transport: the figures pooled over its runs."""
     first = runs[0].stats
@@ -584,7 +626,8 @@ def condition_data(runs: list[Run], analyses: list[dict], observers: list[dict])
 
     for name in (*PERIODIC, SAMPLE_TASK):
         parts = [analysis["release"][name] for analysis in analyses]
-        entry = {"arrival": ("its period's tick, as due" if name != SAMPLE_TASK else
+        entry = {"arrival": ("its period's tick, as due on the base in force for that tick"
+                             if name != SAMPLE_TASK else
                              "the arrival of the sensor job whose sample released it"),
                  "jobs": sum(part["jobs"] for part in parts),
                  "merged_parts": sum(part["merged"] for part in parts),
@@ -601,6 +644,7 @@ def condition_data(runs: list[Run], analyses: list[dict], observers: list[dict])
             entry["not_released_by_a_sample"] = sum(part["not_by_a_sample"] for part in parts)
         else:
             entry.update(release_counts(parts))
+            entry["after_drop"] = after_drop_data(parts)
         data["release"][name] = entry
     data["tick_lead"] = tick_lead_data([analysis["tick_lead"] for analysis in analyses])
 
@@ -781,6 +825,12 @@ def measure(binaries: runner.Binaries, args: argparse.Namespace) -> tuple[dict, 
 # -------------------------------------------------------------------------------- the summary
 
 
+def after_drop_count(condition: dict, task: str) -> dict:
+    """The first jobs after a drop of `task` in the analysis window of a condition's runs."""
+    return results.figure(sum(found["in_window"]
+                              for found in condition["release"][task]["after_drop"]), "jobs")
+
+
 def summary_of(data: dict) -> dict:
     out: dict = {}
     for transport, conditions in data["transports"].items():
@@ -799,6 +849,10 @@ def summary_of(data: dict) -> dict:
                     entry["release"]["sensor"]["released_before_due"], "jobs"),
                 "sensor_released_more_than_a_tick_early": results.figure(
                     entry["release"]["sensor"]["released_more_than_a_tick_early"], "jobs"),
+                # The jobs in the window measured on a base moved since the job before
+                # (release.<task>.after_drop): from a due time moved later by the ticks given up.
+                "sensor_first_jobs_after_a_drop": after_drop_count(entry, "sensor"),
+                "health_first_jobs_after_a_drop": after_drop_count(entry, "health"),
                 # From the release to the start, which the tick's error does not touch.
                 "sensor_start_after_release": entry["release"]["sensor"]["start_after_release"],
                 "health_start_lateness": entry["release"]["health"]["start_lateness"],
@@ -842,8 +896,10 @@ TIMING_NOTE = (
     "the tick handler, which on this port run in host threads: the figures include the host's "
     "delivery of the tick and of thread wake-ups. The execution times and CPU shares are "
     "x86-64 times of a host thread and say nothing about a Cortex-M3; the stack depths are those "
-    "of host threads with x86-64 frames. Counts (jobs, frames, gaps) are independent of the "
-    "host.")
+    "of host threads with x86-64 frames. Which frame carries which sample does not depend on "
+    "the host; the counts of a run do: its jobs and frames, the publishes missing on the bus, "
+    "the ticks dropped and the jobs released early are what the host let the node do in the "
+    "run's duration, and the result keeps every one.")
 
 
 # ------------------------------------------------------------------------------------ the plot
@@ -1012,12 +1068,14 @@ def main(argv: list[str] | None = None) -> int:
             after = entry["release"]["sensor"]["start_after_release"]
             early = entry["release"]["sensor"]["released_before_due"]
             beyond = entry["release"]["sensor"]["released_more_than_a_tick_early"]
+            dropped = after_drop_count(entry, "sensor")["value"]
             stretch = entry["tick_lead"]["longest_stretch_ahead"]["value"]
             pack = entry["latency"]["BMS_PackStatus"]["sample_to_tx_done"]
             print(f"{transport:9s} {condition:8s} sensor start lateness p50 {sensor['p50']} us "
                   f"max {sensor['max']} us (n {sensor['n']}, {early} released before due, "
-                  f"{beyond} more than a tick early), after release p50 {after['p50']} us max "
-                  f"{after['max']} us; tick count ahead {stretch} ms in a row at most; "
+                  f"{beyond} more than a tick early, {dropped} first after a drop), after "
+                  f"release p50 {after['p50']} us max {after['max']} us; tick count ahead "
+                  f"{stretch} ms in a row at most; "
                   f"PackStatus sample to tx done p50 "
                   f"{pack['p50']} us max {pack['max']} us (n {pack['n']}); idle "
                   f"{entry['cpu']['idle_share'] * 100:.2f} %")

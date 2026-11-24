@@ -9,7 +9,9 @@ THE SOURCES OF A TRIAL, and the clock of each. Every time is CLOCK_MONOTONIC in 
 
   - The controller's trace (can.trace, platform/posix/posix_can_trace.h; SimControl.can_trace):
     for each step the model's time (model_ns) and the start of the hardware thread's pass that
-    carried it out (pass_ns). The model's times are exact; the passes are the host's.
+    carried it out (pass_ns). The model's times follow exactly from the model's rules and the
+    times they start from, which are sometimes the host's (model_exact()); the passes are the
+    host's.
   - The node's log (the driver's side, app/can_io.c, written by the transmit task): "controller
     state 1 -> 2 (TEC 256, REC 0)" when it took the state event, "bus off: requesting recovery"
     just before it asked, and the health task's "fault CAN_BUS_OFF active (DTC 0xD00100)" and
@@ -33,6 +35,8 @@ RECOVERY_BITS bit times: the model reports it at that time, whenever the thread 
 count starts is the host's (the pass that served the driver's request), and so is everything the
 driver does (when it saw the bus off, when its hold-off timer ended, when it loaded the next
 frame). The node's policy adds a hold-off of HOLDOFF_INITIAL_MS before it asks (app/can_io.c).
+On the way into bus off the destroyed attempts follow each other at the model's times, unless a
+host time starts one (model_exact()); which frames are attempted is the node's schedule.
 trial_figures() names each interval with the part it belongs to (INTERVALS).
 """
 from __future__ import annotations
@@ -64,9 +68,36 @@ BUS_OFF_LIMIT = 256
 SHORT_ATTEMPT_BITS = 1 + 14
 INTERMISSION_BITS = 3
 SUSPEND_BITS = 8
-#: From error passive to bus off under a short: 16 attempts, 26 bit times apart. The model's
-#: figure, exact unless a late pass of the hardware thread moved a start (late_resyncs).
+#: From error passive to bus off under a short: 16 attempts, 26 bit times apart, whatever the
+#: frames. The model's figure in a trial that no host time entered (model_exact()).
 SHORT_PASSIVE_TO_BUS_OFF_BITS = 16 * (SHORT_ATTEMPT_BITS + INTERMISSION_BITS + SUSPEND_BITS)
+#: The part of error passive to bus off in a trial that no host time entered: under a short the
+#: model's alone; injected errors destroy each attempt halfway through its frame (half the frame
+#: and the error frame, then the intermission and the suspend), so there the frames the node had
+#: in its mailboxes, its schedule, set the length too. In the other trials it is "mixed" under
+#: both faults.
+PASSIVE_TO_BUS_OFF_PART = {"short": "model", "tx_errors": "mixed"}
+
+
+def model_exact(span_ns: int, bitrate: int, late_resyncs: int) -> bool:
+    """Whether an interval between two of the model's times in a trial is the model's alone:
+    no late pass counted in the trial (`late_resyncs`, can.status's count over the whole trial,
+    0) and the interval a whole number of bit times, to the nanosecond.
+
+    The model's times follow exactly from the times they start from, and two kinds of start are
+    host times (lib/can/can_ctrl.c). A pass of the hardware thread more than a frame length late
+    starts the frame that was due at its own time (start_transmission(), counted in
+    late_resyncs). A frame loaded into an idle bus starts when it entered its mailbox, the
+    driver's time (transmission_start()); between two destroyed attempts that happens only after
+    the transmit queue recalled the mailboxes (lib/can/can_txq.h, stale frames), and nothing
+    counts it. The trace does not say when each attempt started, so such a start shows only as an
+    interval off the bit grid; one whose host time fell on the grid by chance passes the test (at
+    1 Mbit/s a bit is 1000 ns: about one host time in 1000). The test needs a bit time of a whole
+    number of nanoseconds, as at the bench's bit rates (8000, 2000 and 1000 ns); at another the
+    model rounds its times to the nanosecond, and its own intervals are seldom whole bit
+    times."""
+    return late_resyncs == 0 and span_ns * bitrate % 1_000_000_000 == 0
+
 
 # ------------------------------------------------------- the node (app/can_io.c, app/fault.c)
 
@@ -267,16 +298,21 @@ def fault_bits(data: bytes) -> tuple[int, int]:
 # ---------------------------------------------------------------------------- one trial
 
 #: Every interval of a trial (trial_figures()), with the part of the system it belongs to:
-#: "model" (the controller model, exact, fixed by ISO 11898-1 and the frames on the bus),
-#: "policy" (the node's recovery policy: the hold-off, run on the tick), "host" (when the host
-#: ran the hardware thread, the node's tasks or the observer), or a sum of them ("mixed").
-#: Each is (start, end, part, what it is).
+#: "model" (the controller model by ISO 11898-1's rules alone: exact, and the same on any host
+#: and whatever frames the node sends), "policy" (the node's recovery policy: the hold-off, run
+#: on the tick), "host" (when the host ran the hardware thread, the node's tasks or the
+#: observer), or a sum of them ("mixed"; the node's schedule, which frames it sends when, is
+#: one of them). Each is (start, end, part, what it is).
 INTERVALS: dict[str, tuple[str, str, str, str]] = {
     "fault_to_bus_off": ("fault applied", "bus off (model)", "mixed",
                          "the wait for a frame to send under the fault (the node's schedule) "
                          "and the destroyed attempts (model)"),
-    "passive_to_bus_off": ("error passive (model)", "bus off (model)", "model",
-                           "the destroyed attempts of an error-passive transmitter"),
+    "passive_to_bus_off": ("error passive (model)", "bus off (model)", "mixed",
+                           "the destroyed attempts of an error-passive transmitter (model; "
+                           "under tx_errors of the frames the node had in its mailboxes, its "
+                           "schedule), and a start a late pass moved or a frame loaded into an "
+                           "idle bus (host); passive_to_bus_off_exact: neither of the last two "
+                           "(model_exact())"),
     "bus_off_report_lag": ("bus off (model)", "the pass that carried it out", "host",
                            "how late the hardware thread ran"),
     "bus_off_to_driver": ("bus off (model)", "the driver took the event (log)", "host",
@@ -293,8 +329,9 @@ INTERVALS: dict[str, tuple[str, str, str, str]] = {
                            "the pass, the simulated interrupt and the transmit task"),
     "active_to_first_submit": ("error active (model)", "the first frame in a mailbox", "host",
                                "the driver loads the mailboxes again"),
-    "first_frame_on_bus": ("the first frame in a mailbox", "its end of frame (model)", "model",
-                           "arbitration and the frame's length"),
+    "first_frame_on_bus": ("the first frame in a mailbox", "its end of frame (model)", "mixed",
+                           "arbitration and the length (model) of whichever frame the node sent "
+                           "first (its schedule), and a start a late pass moved (host)"),
     "first_frame_write_lag": ("its end of frame (model)", "its write to the transport", "host",
                               "how late the hardware thread ran"),
     "bus_off_to_active": ("bus off (model)", "error active (model)", "mixed",
@@ -336,17 +373,19 @@ def trial_figures(trial: TrialInput) -> dict:
 
     Returns {"problems": [...], "retry": bool, "figures": {...}, "trajectory": [[attempts,
     tec], ...]}: every interval of INTERVALS in nanoseconds, the bit-time figures
-    ("recovery_sequence_bits", "passive_to_bus_off_bits", "first_frame_on_bus_bits"), the counts
-    ("attempts_to_bus_off", "tec_at_passive", "tec_at_bus_off", "late_resyncs", "bus_offs",
-    "counter_samples") and the times the observer needs ("t_fault_ns", "t_removal_ns",
-    "t_bus_off_ns", "t_restart_ns", "t_active_ns", "t_first_write_ns", "first_frame_id",
-    "first_frame_number"). An interval whose source is missing is None.
+    ("recovery_sequence_bits", "passive_to_bus_off_bits", "first_frame_on_bus_bits"), whether
+    no host time entered error passive to bus off ("passive_to_bus_off_exact", model_exact()),
+    the counts ("attempts_to_bus_off", "tec_at_passive", "tec_at_bus_off", "late_resyncs",
+    "bus_offs", "counter_samples") and the times the observer needs ("t_fault_ns",
+    "t_removal_ns", "t_bus_off_ns", "t_restart_ns", "t_active_ns", "t_first_write_ns",
+    "first_frame_id", "first_frame_number"). An interval whose source is missing is None.
 
     A trial with a problem is not a sample. "retry" says that the host, not the node, made it
     one, so that the bench may repeat it: a short removed only after the node had asked to
     recover (the bench was held up for most of the hold-off; the node then recovered under the
     short and went bus off again), or a hold-off that a stall of the transmit task made look
-    like a doubled one. Any other problem contradicts the rules or the model."""
+    like a doubled one. Any other problem contradicts the rules or the model (or, for error
+    passive to bus off under a short, is a host time that fell on the bit grid; model_exact())."""
     problems: list[str] = []
     rec = list(trial.records)
     kind, value = FAULT_RECORD[trial.fault]
@@ -464,9 +503,11 @@ def trial_figures(trial: TrialInput) -> dict:
         "bus_off_to_dtc": span(bus_off.model_ns, dtc_on and dtc_on.t_ns),
         "dtc_heal": span(active.model_ns, dtc_off and dtc_off.t_ns),
     })
+    exact = model_exact(figures["passive_to_bus_off"], trial.bitrate, resyncs)
     figures.update({
         "recovery_sequence_bits": ns_to_bits(sequence_ns, trial.bitrate),
         "passive_to_bus_off_bits": ns_to_bits(bus_off.model_ns - passive.model_ns, trial.bitrate),
+        "passive_to_bus_off_exact": exact,
         "first_frame_on_bus_bits": ns_to_bits(first.model_ns - first.start_ns, trial.bitrate),
         "attempts_to_bus_off": attempts,
         "tec_at_passive": passive.tec,
@@ -490,14 +531,18 @@ def trial_figures(trial: TrialInput) -> dict:
         problems.append(f"a hold-off of {figures['holdoff'] / 1e6:.3f} ms, not the initial "
                         f"{HOLDOFF_INITIAL_MS} ms")
         out["retry"] = True
-    # Under a short the attempts from error passive on are 26 bit times apart: exact, unless a
-    # late pass moved a start. Injected errors destroy frames halfway, so there it depends on
-    # the frames.
-    if (trial.fault == "short" and resyncs == 0
+    # Under a short the attempts from error passive on are 26 bit times apart whatever the
+    # frames, so a trial that no host time entered takes exactly 416 bit times. A trial that one
+    # did is no sample of the model, not a fault of it (only one whose host time fell on the bit
+    # grid by chance passes for exact, and is refused here). Injected errors destroy frames
+    # halfway, so there the interval depends on the frames attempted, which the trace does not
+    # give.
+    if (trial.fault == "short" and exact
             and figures["passive_to_bus_off"] != bits_to_ns(SHORT_PASSIVE_TO_BUS_OFF_BITS,
                                                              trial.bitrate)):
         problems.append(f"{figures['passive_to_bus_off']} ns from error passive to bus off "
-                        f"without a late pass, not {SHORT_PASSIVE_TO_BUS_OFF_BITS} bit times")
+                        f"without a late pass and on the bit grid, not "
+                        f"{SHORT_PASSIVE_TO_BUS_OFF_BITS} bit times")
     return out
 
 
