@@ -67,7 +67,13 @@ is more urgent.
 
 Every task's stack is 512 words (`APP_TASK_STACK_WORDS`, `TASK_STACK_WORDS` in can_io.c), the
 size meant for the target; on the host each task runs on a pthread stack of its own, which the
-platform measures ([README](../README.md#what-phase-0-contains)).
+platform measures ([README](../README.md#what-phase-0-contains)). In the final run of
+bench/node_timing.py ([results/node_timing.json](../results/node_timing.json), `stack_max`) the
+deepest use of its host thread's stack by a task's code was the health task's, 4648 bytes
+against the 4096 bytes (512 words of 8 bytes) it was created with, under the SocketCAN download
+and the UDP flood (2824 bytes in the six other conditions), and the idle task used 2072 bytes
+against its 2048: host depths with x86-64 frames and the port's signal frames, not an overflow
+of the target, whose high-water marks phase 7 measures.
 
 **Why the flash task is the lowest.** A flash operation is synchronous and slow: the driver of a
 serial NOR polls the part's busy flag, and the host's flash blocks the calling task one tick at a
@@ -385,8 +391,11 @@ replace them with measurements: it runs on the host and has no target. What it m
 is the host's run time per task, from FreeRTOS's run-time statistics (`run_time_us`), and per
 job from the node's host-only trace ([bench/node_timing.py](../bench/node_timing.py),
 [docs/measurements.md](measurements.md)): x86-64 times of a host thread, which say nothing about
-a Cortex-M3. Phase 7 builds the node for a Cortex-M3 under QEMU, which is not cycle-accurate
-either. "Schedulable" therefore means: schedulable as long as no job runs longer than its
+a Cortex-M3. The final run's figures per task, transport and condition are in
+[results/node_timing.json](../results/node_timing.json) (`cpu.tasks`), host figures next to the
+design budgets, not in their place. Phase 7 builds the node for a Cortex-M3 under QEMU, which
+is not cycle-accurate either. "Schedulable" therefore means: schedulable as long as no job runs
+longer than its
 budget.
 
 ### How the node's tasks are modelled
@@ -473,7 +482,9 @@ as app/task_table.c applies them:
     responsePending), and 62 passes of 5 µs: 1270 µs. Without the cap a tester that floods 0x7E0
     at 1 Mbit/s could ask for 91 frames in 10 ms and make the set unschedulable; the cap is what
     bounds the task's demand, and with it the throughput of a download (79 ticks at least for a
-    TransferData of 1024 bytes: 147 frames in and 11 reports).
+    TransferData of 1024 bytes: 147 frames in and 11 reports; the final run of
+    bench/isotp_throughput.py took 82.8 ms per block over SocketCAN and 82.9 ms over UDP in the
+    median, host times, [results/isotp_throughput.json](../results/isotp_throughput.json)).
   - `can_tx`: one pass more, 26 → 27 (479 → 492 µs). A frame of the diagnostic task wakes
     `can_tx` only when no other event frame is held (`can_io_send_event_stamped()`); otherwise the
     report of the frame ahead of it, a pass counted already, loads it. So between two such
@@ -625,13 +636,22 @@ that of a laptop CPU under a general-purpose operating system, and it says nothi
 Cortex-M. The tick and the simulated CAN interrupt are signals that host threads outside the
 scheduler send to the thread of the running task ([posix_tick.c](../platform/posix/posix_tick.c),
 [posix_irq.c](../platform/posix/posix_irq.c)). A periodic task is released as late as the host
-delivers its tick.
+delivers its tick. The final run of bench/node_timing.py also released three jobs early over
+UDP, none by more than a tick: one sensor job 763 µs before its due time under the flood, and
+one sensor job (776 µs) and one health job (918 µs) during the downloads
+([results/node_timing.json](../results/node_timing.json), `release.<task>.released_before_due`).
 
 On the POSIX port the check is therefore a check of the design: the task set, its priorities,
 its budgets and its blocking. It does not predict the response times the node shows on the host.
 A response time measured on the host that exceeds the analysed one does not contradict the
-analysis. What carries over is what is counted rather than timed: which task can preempt or
-block which.
+analysis. The final run of bench/node_timing.py has such cases in all six conditions it timed
+([results/node_timing.json](../results/node_timing.json), `release.<task>.response` of each
+transport and condition): the sensor task's longest response, analysed at 306 µs, was 628 µs on
+an idle bus over SocketCAN and went past its deadline of 2000 µs in the SocketCAN download
+(2219 µs) and over UDP under the flood (3556 µs), where a sensor job was released 3485 µs after
+its arrival and a processing response took 3773 µs against the analysed 2484 µs (the p99.9 of
+the sensor's release lateness and of that response there 900 and 987 µs, `summary.udp.flood`).
+What carries over is what is counted rather than timed: which task can preempt or block which.
 
 ### Filling in the table for another task
 

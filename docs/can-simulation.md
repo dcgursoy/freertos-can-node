@@ -310,3 +310,15 @@ counter on the rules attempt by attempt, error passive at 128 and bus off at 256
 attempts, the 416 bit times from error passive to bus off, the recovery 128 x 11 bit times after
 the served request to the nanosecond, and the first frame's times and number equal to those
 its outcome gave the driver. bench/bus_off.py is the trace's user.
+
+In its final run ([results/bus_off.json](../results/bus_off.json): over UDP, 100 trials of a
+short and 100 of 32 destroyed transmissions at each of 500, 125 and 1000 kbit/s, none repeated)
+the model's figures are those of the tests: every recovery took 1408 bit times (2.816, 11.264
+and 1.408 ms), also at each of the 7 bus offs of the persisting short per bit rate; a short took
+the controller bus off after 24 destroyed attempts and the injected errors after 32, in every
+trial; and error passive to bus off under a short was 416 bit times in 298 of the 300 trials,
+545 and 606 bit times in two of the four in which a late pass of the hardware thread moved a start
+(`late_resyncs`). The hold-off, the node's policy on its tick, was 100 to 101 ms in the trials,
+and under the persisting short it went 100, 200, 400, 800, 1600, 1600 and 1600 ms, each at
+most 1.03 ms above. The host's part from the bus off to the driver's log line had medians of
+0.049 to 0.062 ms per bit rate and fault, and a longest of 0.410 ms.

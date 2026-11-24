@@ -2,10 +2,13 @@
 
 Every measurement the README quotes comes from a bench here: a script `bench/<name>.py` that
 writes `results/<name>.json` (the data, with its provenance) and `results/<name>.png` (its plot).
-Every figure is a measurement of the FreeRTOS POSIX port on a Linux host, not of a
-microcontroller: each result carries `HOST_TIMING_NOTE` (tools/fcn_tools/results.py), and
-docs/measurements.md says for each bench what it measures, exactly how, and what the figure
-does and does not say about a target.
+Every measured figure is one of the FreeRTOS POSIX port on a Linux host, not of a
+microcontroller, and a result says which of its figures are computed instead (a standard's
+constant, the DBC's nominal load, the bus time of known frames, a projection) and which do not
+depend on the host: each result carries `HOST_TIMING_NOTE` (tools/fcn_tools/results.py) with
+the bench's own sentence, bus_off gives each of its times and bit counts a `part` (`standard`,
+`model`, `policy`, `host` or `mixed`), and docs/measurements.md says for each bench what it
+measures, exactly how, and what the figure does and does not say about a target.
 
 ## Running a bench
 
@@ -181,6 +184,15 @@ about 5, and little after the others. --quick runs took 4.5 s (isotp_throughput)
 (node_timing) each. The medium power_loss run ended with exit status 5: one trial's next update
 was reset by the node's watchdog under the campaign's own load, and its replay passed
 (docs/measurements.md, power_loss).
+
+The final run, `python bench/run_all.py` on commit 28d8f7a (a clean tree) from 18:36:09 to
+20:51:33 EST on 2026-11-23, 2 hours 15 minutes in all, took by run_all's own summary (each
+bench's time includes its build and setup): node_timing 12.7 minutes, bus_load 3.0, bus_off
+54.1, isotp_throughput 1.0, updates 29.1, power_loss 26.1 and platform_timing 0.9, each with
+exit status 0; before platform_timing it waited 60 s for the load average to fall to 1.0 after
+power_loss. Windows logged no standby from 18:30 to the end of the run. The results are
+committed as 2d93e3e; results/power_loss.json holds no failure (`failures` is empty, 1062
+trials).
 
 ## The final runs
 

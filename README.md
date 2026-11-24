@@ -7,10 +7,10 @@ measurements on CAN and takes fail-safe A/B firmware updates over the same bus. 
 as a Linux process on the FreeRTOS POSIX port, and its CAN controller, flash and sensors are
 simulated around it, so that all of it builds, runs and is tested on a laptop and in CI.
 
-> **Work in progress: phases 0 to 5 of 8 are done, and phase 6's benches are built; their
-> results come next.** This page is a placeholder until the last phase. The sections below
-> describe only what exists today and quote no results; the final README will take every number
-> from `results/*.json`.
+> **Work in progress: phases 0 to 6 of 8 are done; phase 6's final runs are measured and
+> committed.** This page is a placeholder until the last phase. The sections below describe
+> only what exists today, and only the section on phase 6 quotes results, its headline figures;
+> the final README will take every number from `results/*.json`.
 
 ## Where the project stands
 
@@ -22,7 +22,7 @@ simulated around it, so that all of it builds, runs and is tested on a laptop an
 | 3 | Fault handling: trouble codes, the fault frame, watchdogs, reset cause | done |
 | 4 | Simulated NOR flash, bootloader, A/B update logic | done |
 | 5 | ISO-TP, UDS download, end-to-end update | done |
-| 6 | Measurements and plots | benches done, results next |
+| 6 | Measurements and plots | done |
 | 7 | Cortex-M3 build in QEMU with a real bootloader jump | |
 | 8 | Final README and documentation | |
 
@@ -111,8 +111,9 @@ end, judges and filters the readings, and publishes them on CAN in seven cyclic 
 of them protected end to end; a tester can switch the protected telemetry off and on with a
 protected command. [docs/architecture.md](docs/architecture.md) describes the tasks and how
 they work together, [docs/can-protocol.md](docs/can-protocol.md) the messages and the protection.
-No timing of the application is quoted yet: phase 6's benches measure it
-([docs/measurements.md](docs/measurements.md)), and their results come with the final runs.
+Phase 6's benches measure the application's timing on the host
+([docs/measurements.md](docs/measurements.md)); [results/node_timing.json](results/node_timing.json)
+holds the final runs' figures, and [the section on phase 6](#what-phase-6-adds) the headline ones.
 
 - **Messages in a DBC** ([dbc/fcn.dbc](dbc/fcn.dbc)). Every frame the node sends or accepts,
   with cycle times, value tables with "signal not available" codes, and the Data IDs of the
@@ -353,9 +354,10 @@ of which writes `results/<name>.json` (the data, with the command, the commit, t
 average and the build id of every binary it ran) and `results/<name>.png`.
 [docs/measurements.md](docs/measurements.md) says for each one what it measures, exactly how,
 under which conditions, why its trial counts are enough, and what its figures do and do not say
-about a microcontroller. Their results come with the final runs on a committed tree; this page
-quotes none yet. Every figure is host timing of the FreeRTOS POSIX port, and every result says
-so.
+about a microcontroller. The final runs were made on commit 28d8f7a, a clean tree, one bench
+after the other with `python bench/run_all.py` on 2026-11-23; the table at the end of this
+section quotes their headline figures. Every result says which of its figures are host timing of
+the FreeRTOS POSIX port and which do not depend on the host.
 
 - **node_timing** ([bench/node_timing.py](bench/node_timing.py)). The release jitter of the
   periodic tasks against their tick's due time, the latency from a sample to the frame that
@@ -409,6 +411,49 @@ so.
 - **Tests.** Unit tests of every analysis on constructed data with known answers, a functional
   system test per bench, and tests of the shared runner (cleanup on every signal) and of the
   build-id checks.
+
+The headline figures of the final runs. The bus runs at 500 kbit/s unless a row gives the bit
+rate, and node_timing's flood takes half of it; where three figures are given they are
+p50 / p99 / max.
+
+| Measurement | Result | Kind | Source |
+|---|---|---|---|
+| Power cuts on the real programs, each followed by the restart through fcn_boot and the next update | 1062 trials (400 in a staging, 200 in a download, 462 in a trial's boot): 0 invariant violations, 0 cuts not where drawn, 0 failed next updates, 0 bench errors; `lock_retries` 0 in every trial (no start found the flash or the cell still locked) | count | [results/power_loss.json](results/power_loss.json) |
+| Updates over the bus end to end with the flasher, image of 252,560 bytes | 50 of 50 succeeded over SocketCAN, 10 of 10 over UDP; total p50 24.5 s on both | count; times host | [results/updates.json](results/updates.json) |
+| Download of an image whose payload is 256 KiB (262,144 bytes), SocketCAN, up to the check | 10 of 10 succeeded; total p50 24.2 s: erase 2.98 s, transfer 21.2 s, check 4 ms | count; times host | [results/updates.json](results/updates.json) |
+| ISO-TP/UDS TransferData, 1024-byte blocks | 12,378 bytes/s over SocketCAN, 12,358 bytes/s over UDP; block period p50 82.8 ms and 82.9 ms, against a floor of 79.0 ms from the node's budget of 2 events of the diagnostic task per 1 ms tick | host; floor policy | [results/isotp_throughput.json](results/isotp_throughput.json) |
+| Bus-off recovery sequence at 125 / 500 / 1000 kbit/s (UDP bus, idle) | 1408 bit times (11.3 ms at 125 kbit/s, 2.82 ms at 500 kbit/s, 1.41 ms at 1000 kbit/s) in all 200 recoveries per rate, ISO 11898-1's minimum, by construction of the model on an idle bus | model | [results/bus_off.json](results/bus_off.json) |
+| Hold-off before the node asks for recovery (policy: 100 ms, doubled at each further bus off up to 1600 ms, back to 100 ms after 5 s out of bus off) | 100 to 101 ms in all 600 trials (3 rates, a short and transmit errors, 100 each); a short that persists for 7 bus offs at 500 kbit/s: 101, 201, 401, 801 ms, then 1600 ms three times | policy | [results/bus_off.json](results/bus_off.json) |
+| Bus load at 500 kbit/s, intermission included | idle 7.7 % (the DBC's nominal load 7.6 % typical, 8.8 % worst case); during a download 47.7 %, the tester's frames 37.2 % and the node's 10.5 %; the same on both transports to one decimal | mixed: frame lengths are protocol data, frame rates the host's | [results/bus_load.json](results/bus_load.json) |
+| Sensor task (10 ms) start lateness against its tick's due time, SocketCAN | idle 48 / 210 / 570 µs; flood 36 / 234 / 1204 µs; download 37 / 230 / 2164 µs | host | [results/node_timing.json](results/node_timing.json) |
+| The same, UDP | idle 50 / 199 / 1856 µs; flood 36 / 228 / 3521 µs; download 38 / 233 / 1316 µs | host | [results/node_timing.json](results/node_timing.json) |
+| BMS_PackStatus, from the release of the sensor job that took the sample to the frame's end, SocketCAN | idle 362 / 554 / 911 µs; flood 338 / 636 / 2356 µs; download 360 / 638 / 2054 µs | host | [results/node_timing.json](results/node_timing.json) |
+| The same, UDP | idle 370 / 557 / 1482 µs; flood 344 / 665 / 2432 µs; download 366 / 675 / 1130 µs | host | [results/node_timing.json](results/node_timing.json) |
+| Idle task's share of the CPU (FreeRTOS run-time statistics) | SocketCAN: idle 97.1 %, flood 92.7 %, download 90.1 %; UDP: 97.0 %, 92.0 %, 90.0 % | host | [results/node_timing.json](results/node_timing.json) |
+| Tick period against CLOCK_MONOTONIC, 1000 µs nominal, runs of 10 s | stock POSIX port: 1025 µs, 2.5 % long, 250 ms behind the clock after 10 s; locked tick (posix_tick.c): 1000 µs, 0.0 %, 30 µs ahead after 10 s | host | [results/platform_timing.json](results/platform_timing.json) |
+| Simulated interrupt, from the raise to the task it wakes, one raise every 250 µs | signal delivery 31 / 136 / 773 µs; tick-hook polling 534 / 1045 / 2060 µs; 40,021 raises each | host | [results/platform_timing.json](results/platform_timing.json) |
+
+Every figure marked host is the timing of the FreeRTOS POSIX port (for the updates and the
+transfer, with a tester in Python) under WSL2's scheduler on the development laptop and is not
+a microcontroller's timing. The update times, though, are set for the most part by the node's
+budget of 2 events of the diagnostic task per 1 ms tick, which a target with the same tick keeps,
+and by the flash model's 45 ms per sector erase; the host adds its scheduling and the tester's
+turnaround to them. The counts, the protocol data and the model's figures do not depend on the
+host. The stock port's tick runs 2.5 % long, which the locked tick the node runs on corrects,
+and polling has a latency of about half a millisecond because the tick hook serves it, once per
+1 ms tick. Over UDP the flood and the download runs each released one sensor job before its tick
+was due (763 µs and 776 µs early, none more than a tick), and those jobs stay in the
+distributions; the maxima of the start lateness and the BMS_PackStatus latency are 1.13 to
+3.52 ms under flood and download (and up to 1.86 ms on the idle UDP bus), against a p99 of at
+most 675 µs in every condition. Over SocketCAN the host made the node give up ticks in the flood
+run (15) and in two of the three download runs (16 and 6); the lateness is measured from the
+tick grid as posix_tick.c shifts it after a drop, so the drops show in the periods instead:
+BMS_Heartbeat (10 ms) had one interval 15.3 ms too long in that flood run and none more than
+10.3 ms too long in the downloads ([docs/measurements.md](docs/measurements.md)). The health
+task's own use of its host stack reaches 4648 bytes (SocketCAN download, UDP flood), more than
+the 4096 bytes it was created with, and the idle task's is 2072 bytes against its 2048 in every
+condition, because host threads have x86-64 frames; that is no overflow of the target's stacks,
+which phase 7 measures.
 
 ## Build and test
 
@@ -488,8 +533,8 @@ tools/           Python package: node and bus control, UDP bus for python-can, d
                  (the runner, the bus observer, the analyses); the codec generator
 bench/           the benches (one script per measurement, bench/README.md) and run_all.py, the
                  final runs; they write results/
-results/         measured data (JSON with provenance and the build ids) and plots; host timing
-                 only
+results/         measured data (JSON with provenance and the build ids) and plots of the final
+                 runs; no microcontroller timing
 scripts/         one script per build, test and analysis step
 docs/            the application, the CAN protocol, the simulated CAN bus, the sensor model,
                  fault handling, the update, diagnostics (ISO-TP and UDS), the measurements,

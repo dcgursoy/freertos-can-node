@@ -74,6 +74,13 @@ BMS: 9 cyclic messages, 327 frames/s, at most 44145 bit/s = 8.83 % of 500000 bit
 TESTER: 1 cyclic messages, 10 frames/s, at most 1350 bit/s = 0.27 % of 500000 bit/s
 ```
 
+The final run of bench/bus_load.py counted the frames of the node alone on the 500 kbit/s bus
+in a run of 60 s, with their exact stuffed lengths ([results/bus_load.json](../results/bus_load.json)):
+327.0 frames per second and 7.7 % of the bus, the intermission included, over SocketCAN and UDP
+alike, below the worst case above and close to the 7.6 % that the DBC gives with typical
+stuffing. The lengths and the load per frame are protocol data; the frames per second depend on
+the host keeping the node's time.
+
 ## Signals
 
 Start bit and length in bits; range is the physical range the DBC gives (`[min|max]`), values

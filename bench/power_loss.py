@@ -19,10 +19,10 @@ its sequence (fcn_tools.powerloss has the sequences, operation by operation):
             crashes at every start. The next update is a staging, as for "stage".
 
 The image cut in "stage" and "download" is the 9256-byte data image of the phase 5 tests (44
-operations: 2 + 3 erases + 37 pages + 2); the node's own image (244,368 bytes) would make 1018,
-too many to cut each of them several times. Each of these classes also runs at two places of the
-metadata log where its BEGIN or its COMMIT record is the first of a sector, and so erases a
-sector that holds older records first; "boot" the same for its CONFIRM and ROLLBACK records.
+operations: 2 + 3 erases + 37 pages + 2); the node's own image (252,560 bytes at the final runs)
+would make 1053, too many to cut each of them several times. Each of these classes also runs at
+two places of the metadata log where its BEGIN or its COMMIT record is the first of a sector,
+and so erases a sector that holds older records first; "boot" the same for its CONFIRM and ROLLBACK records.
 
 After every cut: the run ended as a power loss (12) with the FATAL line of the operation drawn;
 `fcn_flash info` and fcn_tools.flash read the flash the same; check_invariants() holds; the state

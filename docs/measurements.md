@@ -4,9 +4,10 @@ Every figure the README quotes comes from a file in [results/](../results), writ
 in [bench/](../bench). This document says, for every bench, what it measures, exactly how
 (where each time is taken, by which clock, in which process, what an interval includes and what
 it leaves out), under which conditions, how many trials and why that is enough, what the figure
-does and does not say about a microcontroller, and the command that makes it. It holds no
-figures: those are in results/*.json, from the final runs on a committed tree, and the README
-quotes them from there.
+does and does not say about a microcontroller, and the command that makes it. Each bench's
+section also gives what its final run measured (**Results.**), read from results/*.json, the
+final runs on a committed tree ([the final runs](#the-final-runs)); the README quotes its
+figures from the same files.
 
 Every figure is a measurement of the FreeRTOS POSIX port, where every task is a thread of a
 Linux process on a WSL2 virtual machine of the development laptop. Every result carries this
@@ -166,6 +167,26 @@ figures only. The verification of phase 6 found that the first version of this r
 out every frame with an interrupted reading, dropped most BMS_PackStatus frames (the first frame
 after the observer had waited, whose reading is the one most often interrupted), and with them
 the p99.9 that the counts below promise; the rule above uses them.
+
+The VM's clock was checked against Windows' just before the final runs (2026-11-23, 18:26 to
+18:40, WSL freshly restarted, on AC power, no standby), outside the benches, with two PowerShell
+scripts on the Windows side:
+
+- CLOCK_MONOTONIC of the guest (/proc/uptime) against Windows' Stopwatch over 180 s, each
+  reading taken at the midpoint of its wsl call: 174.300 s of guest time against 180.117 s of
+  Windows time, −3.230 % (±0.059 %, from the durations of the calls), with the guest's
+  clocksource tsc; with hyperv_clocksource_tsc_page, switched to for this test only, −4.007 %
+  (±0.074 %).
+- A guest ticker printing a line every 0.2 s of guest time for 90 s, each line stamped by
+  Windows on arrival: 449 steps, the median guest step 0.2000 s and the median Windows step
+  0.2007 s (a rate of −0.353 %), no Windows step over 0.3 s (the longest 0.221 s), and in all
+  89.800 s of guest time against 93.456 s of Windows time, −3.912 %.
+
+The guest clock runs at the right rate to within about 0.35 %, and the VM loses about 3 to 4 % of
+wall time in short freezes, of up to about 20 ms each, in which guest time does not advance.
+Everything the benches measure runs inside the VM on its CLOCK_MONOTONIC, so the node, the
+benches and vcan0 alike see a freeze as time that did not pass. It is a property of the host,
+covered by calling every time here host timing; no result corrects for it.
 
 ## node_timing: latency and jitter, CPU load, stack
 
@@ -357,9 +378,9 @@ participant of the UDP bus, keeps every frame with its kernel receive time on CL
   0x55) offered at half of the 500 kbit/s bus by `fcn_tools.bench.Flood`, 120 s.
 - *Download:* `--downloads` (3) runs, each started through fcn_boot from a flash holding the
   factory image. In each, the flasher (`--no-reset`) downloads the release node, stripped (an
-  image of about 243 KiB), into the other slot; the figures cover the download from the tester's
-  first request frame to the node's last response frame at the observer. `--no-reset`, because a
-  run that ends in a reset writes no statistics.
+  image of 252,560 bytes in the final run), into the other slot; the figures cover the download
+  from the tester's first request frame to the node's last response frame at the observer.
+  `--no-reset`, because a run that ends in a reset writes no statistics.
 - *Control:* the idle run again without the trace, `--control-seconds` (60 s).
 
 Idle, flood and control figures are taken from 1 s after the node's first heartbeat at the
@@ -375,7 +396,8 @@ which put the start of the window into the node's start-up, 392 sensor jobs wher
 - 120 s give about 11,900 sensor jobs and BMS_PackStatus frames per condition and transport,
   enough for p99.9 (5000 needed); the cell messages, about 5,950 frames, have it too.
 - Health jobs and temperature frames, about 1,190, have p99 and no p99.9.
-- The three downloads give about 6,800 sensor jobs and about 690 health jobs (p99 only).
+- The three downloads give about 7,000 sensor jobs (6,988 per transport in the final run) and
+  about 700 health jobs (699 and 698; p99 only).
 
 **What it says about a microcontroller.** The orderings and counts carry over: which frame
 carries which sample, the jobs, the gaps. The times do not.
@@ -394,6 +416,87 @@ carries which sample, the jobs, the gaps. The times do not.
   exception nested in it; a context switch saves r4 to r11, 8 words more, on the task's stack. A
   host peak above a task's configured size is therefore no overflow of the target; the target's
   own high-water marks are for phase 7's Cortex-M3 build.
+
+**Results.** The final run is [results/node_timing.json](../results/node_timing.json), drawn in
+[results/node_timing.png](../results/node_timing.png). Every time below is host timing of the
+POSIX port (the result's `host_timing_note`); the counts are not. Each idle and flood run had
+11,899 sensor jobs (11,898 in the UDP idle run) and 1,189 health jobs. The summary's
+distributions (`summary.<transport>.<condition>`), in µs, p50 / p99.9 / max unless the row says
+otherwise:
+
+| µs | SocketCAN idle | SocketCAN flood | SocketCAN download | UDP idle | UDP flood | UDP download |
+|---|---|---|---|---|---|---|
+| sensor release lateness | 42 / 334 / 570 | 33 / 848 / 1204 | 32 / 398 / 2164 | 45 / 278 / 1855 | 33 / 900 / 3485 | 34 / 371 / 1315 |
+| sensor start lateness | 48 / 363 / 570 | 36 / 850 / 1204 | 37 / 438 / 2164 | 50 / 312 / 1856 | 36 / 903 / 3521 | 38 / 438 / 1316 |
+| sensor start after release | 0.6 / 117 / 230 | 0.2 / 131 / 350 | 0.4 / 105 / 150 | 0.6 / 141 / 317 | 0.3 / 120 / 178 | 0.4 / 152 / 217 |
+| health start lateness, p50 / p99 / max | 58 / 282 / 509 | 32 / 180 / 1084 | 53 / 280 / 339 | 41 / 171 / 300 | 32 / 292 / 958 | 53 / 252 / 385 |
+| processing response from the sensor job's arrival | 120 / 502 / 680 | 93 / 909 / 1259 | 97 / 586 / 2256 | 125 / 493 / 1929 | 95 / 987 / 3773 | 102 / 632 / 1456 |
+| BMS_PackStatus, sample → transmit done | 362 / 678 / 911 | 338 / 971 / 2356 | 360 / 925 / 2054 | 370 / 700 / 1482 | 344 / 827 / 2432 | 366 / 909 / 1130 |
+| BMS_PackStatus, sample → observer | 386 / 807 / 960 | 358 / 1003 / 2496 | 383 / 979 / 3093 | 404 / 811 / 1600 | 365 / 881 / 2448 | 392 / 954 / 1177 |
+| BMS_Heartbeat period deviation, p50 / p99.9 / min / max | −2.7 / 485 / −2020 / 1908 | −0.7 / 888 / −1846 / 15270 | −2.3 / 748 / −3239 / 10283 | −0.3 / 497 / −2655 / 2212 | −0.6 / 941 / −3377 / 3465 | −1.1 / 793 / −1356 / 1352 |
+
+The medians stay within 32 to 45 µs (sensor release lateness) and 338 to 370 µs (BMS_PackStatus
+to the bus) in all six. The worst cases of the sensor release lateness, the processing response
+and BMS_PackStatus are single jobs and frames under the flood and the download, and over UDP also
+on the idle bus: the sensor task's release lateness reached 2.16 ms (SocketCAN download), 1.86 ms
+(UDP idle) and 3.48 ms (UDP flood), the processing task's response 3.77 ms (UDP flood), and
+BMS_PackStatus reached the bus at most 2.43 ms (UDP flood) and the observer at most 3.09 ms
+(SocketCAN download) after its sample. The other protected
+messages, sample → transmit done (`transports.<transport>.<condition>.latency`): p50 810 to
+842 µs and at most 2.98 ms (BMS_CellVoltages1, on the SocketCAN idle bus), p50 1.04 to 1.07 ms
+and at most 3.70 ms (BMS_CellVoltages2), p50 1.28 to 1.31 ms and at most 3.95 ms
+(BMS_Temperatures).
+
+No job was released more than a tick early (`released_more_than_a_tick_early` 0 for both tasks
+in every condition), and over SocketCAN none before its tick was due. Over UDP the flood run
+released one sensor job before its due time, 763 µs early, and the three download runs one
+sensor job, 776 µs early, and one health job, 918 µs early (`release.<task>.released_before_due`
+and the minima of `release_lateness`); the processing jobs those two samples released have the
+negative minima of the processing response, −616 and −724 µs. The trace saw the tick count
+ahead of the grid 7 to 27 times per condition, never more than a period ahead
+(`tick_lead.seen_more_than_a_tick_before_due` 0), and the longest stretch ahead was 0.885 to
+0.955 ms per condition (`tick_lead.longest_stretch_ahead`), against the limit of 50 periods.
+
+posix_tick.c made up 27 to 160 ticks per condition and gave 7 to 27 of them back
+(`runs[].tick_catch_ups`, `tick_give_backs`). The host made the node give up ticks only over
+SocketCAN: 15 in the flood run, and 16 and 6 in two of the three download runs
+(`runs[].tick_dropped`); none in any UDP run or any idle or control run. The lateness is measured
+from the grid as posix_tick.c shifted it after a drop, so a drop shows in the periods instead:
+the sensor task's longest period was 15.1 ms over its 10 ms in the SocketCAN flood run and
+10.1 ms over in the SocketCAN downloads (`release.sensor.period_deviation`), and BMS_Heartbeat
+had one interval of a cycle and a half or longer in that flood run and three in those downloads
+(`periods.BMS_Heartbeat.a_cycle_and_a_half_or_longer`; the 15.3 ms and 10.3 ms maxima of the
+table). Over UDP no interval of any cyclic message was that long.
+
+Every run passed the refusal rules above: no sample lost, no publish missing on the bus
+(`publishes_missing_on_the_bus` 0), no overrun, no trace record dropped, and every observer saw
+exactly the node's frames. The wall clock stepped 2 to 4 times per condition, by up to 1.83 s
+(UDP flood; `runs[].wall_clock_steps`, `largest_wall_clock_step_us`); 0 to 3 frames of the
+protected messages and 0 to 14 intervals of the cyclic ones per condition had untrusted times
+and were left out of the timing figures (`frames_time_not_trusted`,
+`intervals_time_not_trusted`).
+
+One trace record cost 18.8 to 22.6 ns (`runs[].trace_event_cost_ns`) at 2,415 to 10,807 events a
+second, under 0.1 % of the time in every run (`trace_time_share`, a lower bound). The control
+runs without the trace are no better: an idle share of 97.1 % on both transports against 97.1 %
+and 97.0 % with the trace, and a BMS_Heartbeat period deviation p99 of 317 µs (SocketCAN) and
+345 µs (UDP) against 314 µs and 284 µs with it (`transports.<transport>.control`).
+
+The idle task had 97.1 % (SocketCAN) and 97.0 % (UDP) of the run time on the idle bus, 92.7 % and
+92.0 % under the flood, where can_rx took 4.8 % and 5.5 %, and 90.1 % and 90.0 % during the
+downloads, where diag took 3.0 % and can_rx 3.2 % and 3.3 % (`cpu.idle_share`,
+`cpu.tasks.<task>.share`). The run time per job, x86-64 host time, next to the task table's
+design budget (`cpu.tasks.<task>.run_time_per_job_us`): sensor 29 to 41 µs (100 µs), processing
+31 to 37 µs (160 µs), health 631 to 665 µs (5,466 µs). Single jobs ran up to 7.83 ms (can_rx,
+SocketCAN download, `execution_per_job.max`) in FreeRTOS's view, which includes any time the
+host took the thread away.
+
+The host stack depth, the maximum over every run (`stack_max`, `own_bytes` against
+`size_bytes`): health 4,648 bytes against the 4,096 it was created with (in the SocketCAN
+download and the UDP flood; 2,824 in the other conditions), IDLE 2,072 against 2,048 in every
+condition, flash 3,752 of 4,096, and the other tasks 2,248 to 2,536 of 4,096. These are host
+threads with x86-64 frames and the port's signal frames (above), not an overflow of the target;
+phase 7 measures the target's.
 
 **Command.** `python bench/node_timing.py`; `--transport`, `--seconds`, `--downloads`,
 `--control-seconds`, `--flood-load` and `--sensor-seed` change the plan, and each is recorded in
@@ -442,6 +545,38 @@ node's model places them on its own timeline.
 are protocol data and hold for the same frames on a real bus. The frames per second depend on the
 host keeping the node's time: a host that makes the node give up ticks leaves its 10 ms messages
 short of 100 per second, and the result records the ticks given up.
+
+**Results.** The final run is [results/bus_load.json](../results/bus_load.json), drawn in
+[results/bus_load.png](../results/bus_load.png). The frames' lengths and the nominal load are
+protocol data; the frames per second, and the loads with them, depend on when the host ran the
+node's tasks (the result's `host_timing_note`).
+
+- *Idle* (a window of 58.99 s): the node sent 327.0 frames a second, a load of 7.7 % of the
+  500 kbit/s bus on both transports, 7.6 % without the intermission
+  (`summary.<transport>.idle_load`, `idle_load_without_intermission`), against the DBC's nominal
+  7.6 % with the typical lengths and 8.8 % with the worst case (`idle_nominal_load_typical`,
+  `idle_nominal_load_worst_case`; protocol data). Each message came at its nominal rate to
+  within the frame at each edge of the window (100.0 a second for BMS_PackStatus and
+  BMS_Heartbeat, 50.0 for each cell message, 58 BMS_NodeInfo frames in the window), with mean
+  lengths of 112.1 to 121.0 bits against typical lengths of 110.7 to 112.8 bits and a worst case
+  of 132. That puts each message's load at 0.99 to 1.08 times its typical nominal load
+  (`transports.<transport>.idle.nominal.<message>.load_ratio_to_typical`), and the total at 1.02
+  times (derived: `idle_load` over `idle_nominal_load_typical`).
+- *Download* (one per transport, windows of 23.28 s and 23.32 s): 47.7 % of the bus on both
+  transports (`download_load`), of which the tester's requests (0x7E0) 37.2 % at 1,558 and
+  1,555 frames a second (`download_tester_load`; what was offered, as above) and the node's
+  frames 10.5 % (`download_node_load`), its diagnostic responses (0x7E8) 2.7 % of the bus among
+  them (`download_node_diag_load`).
+- *Checks.* The observer captured every frame the node's controller model sent, 19,620 of 19,620
+  idle and 10,608 of 10,608 in the download on both transports (`node_counters.tx_frames`,
+  `captured_node_frames`), and the 36,268 tester frames it captured are the 36,268 the node
+  received. The model was busy 7.6 % of the idle run and 45.2 % of the download run
+  (`idle_model_busy_share`, `node_counters.model_busy_share`), the captured frames' share
+  without intermission over the same spans 7.6 % and 45.2 %
+  (`node_counters.captured_share_without_intermission`). No run dropped a tick
+  (`node_counters.tick_dropped` 0). The wall clock stepped twice in each idle run and once in
+  the SocketCAN download; 3 and 2 frames of the idle runs and 1 of each download had untrusted
+  times and were placed by the time of their read (`times_not_trusted`).
 
 **Command.** `python bench/bus_load.py` (`--seconds` of at least 60, `--downloads`,
 `--transport`).
@@ -523,7 +658,7 @@ sum of them).
 | removal to error active, removal to first frame | `can.fault none` (short) or the bus off (tx_errors) → model times | mixed |
 | removal to frame heard | removal → the observer's thread | mixed, including the observer's wake-up |
 | bus silence heard | the last frame before → the first after, by kernel times | mixed |
-| DTC heal | error active (model) → the first BMS_Fault without the DTC (observer's monotonic time) | mixed |
+| DTC heal | error active (model) → the health task's log line that the DTC is no longer active | mixed |
 
 The recovery sequence equals the standard's minimum by construction of the model on an idle bus,
 where no frame shortens or lengthens the recessive runs: the figure shows that the model
@@ -574,6 +709,50 @@ The hold-off and its doubling are the node's policy and would be the same on a m
 timed by its tick. The host parts are wake-ups of Linux threads and say nothing about a
 microcontroller, where the driver sees the bus-off interrupt within microseconds. The heartbeat
 values lost follow from the time off the bus (mostly the 100 ms hold-off) and the 10 ms period.
+
+**Results.** The final run is [results/bus_off.json](../results/bus_off.json), drawn in
+[results/bus_off.png](../results/bus_off.png), on the UDP transport; each figure carries its part
+in the result. No trial was repeated (`summary.<bit rate>.repeated_trials` 0), and every check of
+every bit rate held (38 each, `runs[].checks`), among them the 207 bus offs caused per bit rate
+against the controller's events, the queue's bus-off count and its recovery requests, and the
+frames heard against the frames sent.
+
+- *Standard and model.* The recovery sequence was 1408 bit times in every trial, 200 per bit
+  rate with the minimum equal to the maximum: 2.816 ms at 500 kbit/s, 11.264 ms at 125 kbit/s and
+  1.408 ms at 1 Mbit/s, the standard's minimum (`recovery_sequence_ms`, "model";
+  `standard_minimum_recovery_ms`, "standard"). Every trial went error passive at a TEC of 128
+  and bus off at 256, after 24 destroyed attempts under a short and 32 under tx_errors
+  (`destroyed_attempts_to_bus_off`; `runs[].trials.<fault>.tec_at_passive`, `tec_at_bus_off`).
+  Error passive to bus off under a short took 416 bit times in 298 of the 300 trials; the other
+  two, 545 bit times at 500 kbit/s and 606 at 1 Mbit/s, each had a late pass counted
+  (`runs[].trials.short.late_resyncs` 1). Under tx_errors it took 1280 to 1476 bit times
+  (`passive_to_bus_off_bits`). The first frame after a recovery took 116 to 120 bit times on the
+  bus (`first_frame_bits`).
+- *Policy.* The hold-off was 100 ms plus 0.30 to 0.83 ms at the median of each fault and bit
+  rate, and at most 1.14 ms more (`holdoff_ms`, "policy": 100 ms in whole ticks plus the host's
+  wake-up of the task, as in the table above; derived: less the policy's 100 ms).
+  The persisting short doubled it from 100 ms to the 1600 ms limit and held it there at every
+  bit rate (`runs[].persisting_short.holdoffs_as_policy`), each of its 21 hold-offs 0.04 to
+  1.03 ms above the policy's value (`persisting_short_holdoffs_ms`; derived).
+- *Host.* Bus off to the transmit task's log line p50 49 to 62 µs, at most 410 µs
+  (`host_bus_off_to_driver_ms`); the request to the pass that served it p50 25 to 28 µs, at most
+  199 µs (`host_request_to_count_ms`); error active to the first frame in a mailbox p50 95 to
+  117 µs, at most 607 µs (`host_active_to_first_submit_ms`).
+- *Mixed.* Fault to bus off p50 4.75 to 9.52 ms at 500 kbit/s and 1 Mbit/s, 7.42 ms (short) and
+  22.7 ms (tx_errors) at 125 kbit/s, at most 28.9 ms (`fault_to_bus_off_ms`). Bus off to error
+  active p50 104 ms at 500 kbit/s, 112 ms at 125 kbit/s and 102 ms at 1 Mbit/s under both faults
+  (`bus_off_to_error_active_ms`); removal of the fault to the end of the first frame p50 103 and
+  104 ms, 112 and 113 ms, 101 and 102 ms (short and tx_errors), at most 114 ms
+  (`removal_to_first_frame_ms`). The silence heard on the bus p50 112 to 140 ms
+  (`bus_silence_heard_ms`), 0 to 6 trials per fault and bit rate left out where the two clocks
+  disagreed by more than 1 ms.
+- *Counts and the DTC heal.* 9 or 10 BMS_Heartbeat values lost per trial at 500 kbit/s and
+  1 Mbit/s, 11 under a short and 12 or 13 under tx_errors at 125 kbit/s (`heartbeat_values_lost`,
+  "mixed"). The first heartbeat after every recovery was fresh, and the first BMS_Fault after it
+  already carried the DTCs, in 100 of 100 trials of each fault and bit rate
+  (`first_heartbeat_fresh`, `dtc_reported_after_recovery`). The DTC heal took 4.94 to 4.96 s at
+  the median and 4.90 to 5.01 s in all, 5 of the 600 at 5 s or more (`bus_off_dtc_heal_ms`,
+  "mixed"; derived from `runs[].trials.<fault>.dtc_heal`).
 
 **Command.** `python bench/bus_off.py`; `--bitrates`, `--faults`, `--trials`, `--persist`,
 `--transport`, `--seed` and `--max-delay-ms` change the plan.
@@ -686,6 +865,39 @@ tick, because the platform's wait hook polls once per tick, so a 1024-byte write
 bursts a tester on a CAN adapter would not have. The node's processor time per event is not
 measured here.
 
+**Results.** The final run is [results/isotp_throughput.json](../results/isotp_throughput.json),
+drawn in [results/isotp_throughput.png](../results/isotp_throughput.png). The periods, write jobs
+and turnarounds are host timing; the event floors and bus times are computed, and the
+projection is marked as one.
+
+- *Blocks of 1024 bytes:* period p50 82.8 ms over SocketCAN and 82.9 ms over UDP
+  (`summary.<transport>.block_period`), 12,378 and 12,358 bytes/s (`transfer_throughput`),
+  against the event floor of 79.0 ms (157 events) and 36.8 ms of bus time (`block_event_floor`,
+  `block_bus_time`); the write job 3.97 and 3.96 ms on average (`block_write_job_mean`), the
+  tester's turnaround 0.50 and 0.51 ms (`block_turnaround_mean`).
+- *The floor.* At every block size the mean period less the mean write job was within 0.40 ms of
+  the event floor (derived from `transports.<transport>.transfer[]`: `wire.period_ms.mean`,
+  `write_job_ms.mean`, `event_floor_ms`). The line fitted to the 8 sizes of 6 bytes and more has
+  a slope of 0.499 ms per event (SocketCAN) and 0.500 ms per event (UDP) against the budget's
+  0.5 ms, intercepts of 0.45 and 0.38 ms, and r² of 0.99997 and 0.99999
+  (`projection_2048.fit`). The diagnostic task waited with events left 76.5 and 76.0 ticks per
+  1024-byte block (`budget_waits_per_block`). A block of 1 byte took p50 0.976 and 0.974 ms,
+  against its floor of one tick.
+- *Checks.* One block (of the 64 of 768 bytes over UDP) was left out of the decomposition, its
+  stamps disagreeing with the tester's (`clock_disagreements`); every other full-size block was
+  cut into its turns (`full_blocks_decomposed`). No stray frame and no response pending in any
+  run.
+- *The longest response* (71 bytes, 11 frames): wire time p50 6.41 ms (SocketCAN) and 6.43 ms
+  (UDP), p99 7.71 and 7.70 ms, at most 8.25 and 7.84 ms (`longest_response_time`), 11,082 and
+  11,050 bytes/s at the median (`longest_response_throughput`), against 3.14 ms of bus time; the
+  gap between consecutive frames p50 0.425 and 0.415 ms; no response left out. The tester's own
+  time for one response over SocketCAN was 23.6 ms (`response.tester_ms.max`), where the wire's
+  longest was 8.25 ms: time in the tester's Python, not on the bus.
+- *The projection* (`"projection": true`, not a measurement): blocks of 2048 bytes would carry
+  12,482 bytes/s over SocketCAN and 12,469 over UDP, and save 0.186 s (0.9 %) and 0.176 s
+  (0.8 %) of a 256 KiB image's transfer (`projected_2048_throughput`,
+  `projected_256KiB_saving`, `projected_256KiB_saving_share`).
+
 **Command.** `python bench/isotp_throughput.py`; `--transports`, `--block-sizes`, `--blocks` and
 `--responses` change the plan.
 
@@ -763,6 +975,37 @@ sector, each wait ending at a tick); the reset and the start of the trial are fc
 process (memfd and exec, not a jump); and the tester's Python adds its turnaround to every
 request.
 
+**Results.** The final run is [results/updates.json](../results/updates.json), drawn in
+[results/updates.png](../results/updates.png). The counts and the successes do not depend on the
+host; the times are host timing.
+
+- *Updates.* All 50 over SocketCAN and all 10 over UDP succeeded
+  (`summary.updates_<transport>.succeeded`), versions 2.1.0 to 2.50.0 and 3.1.0 to 3.10.0 into
+  slots B and A in turn, each confirmed by the routine
+  (`campaigns.<transport>.figures.confirmed_by`: the routine 50 and 10, the node 0). The image
+  was 252,560 bytes in 247 blocks. Every download
+  run ended with status 10 and every trial run with 0, every download log had the erase in 63
+  steps and the check in 3952, and every trial started in its target slot as a trial, attempt 1,
+  and ended CONFIRMED (`campaigns.<transport>.records`).
+- *Times over SocketCAN* (p50, p90, max; `summary.updates_socketcan`): total 24.5, 24.5 and
+  24.6 s; erase 2.85, 2.85 and 2.89 s; transfer 20.4, 20.5 and 20.6 s; check 4, 5 and 49 ms;
+  the reset and the start of the trial (`reset_to_trial`) 1.20 s in all three; confirm 3, 4 and
+  49 ms. The transfer ran at 12,378 bytes/s at the median (`transfer_throughput`).
+- *Times over UDP* (p50 and max; `summary.updates_udp`): total 24.5 and 24.6 s, erase 2.84 and
+  2.85 s, transfer 20.5 and 20.5 s, check 4 and 5 ms, reset to trial 1.20 and 1.20 s, confirm
+  3 and 4 ms, the transfer at 12,350 bytes/s at the median.
+- *Around the steps:* the flasher's wall time, with its start-up, p50 24.8 s (SocketCAN) and
+  24.9 s (UDP); the board's start to its first status frame 14 ms at the median on both
+  (`campaigns.<transport>.figures.flasher_wall_s`, `start_to_ready_s`).
+- *The 256 KiB image* (262,400 bytes): all 10 downloads committed
+  (`summary.big_image.succeeded`), each with 257 blocks and 257 write jobs, the erase job in 66
+  steps and the check job in 4105 (`big_image.records`); erase p50 2.98 s, transfer 21.2 s,
+  check 4 ms, total 24.2 s; 12,375 bytes/s by the flasher's count and 12,374 bytes/s by the
+  node's at the median (`summary.big_image.transfer_throughput`,
+  `big_image.figures.node_transfer_bytes_per_s`), the mean write job p50 4.00 ms
+  (`big_image.figures.write_job_mean_ms`). Started through fcn_boot afterwards, the image ran as
+  the trial in slot B, attempt 1 (`big_image.booted_afterwards`).
+
 **Command.** `python bench/updates.py`; `--socketcan-updates`, `--udp-updates`, `--big-downloads`,
 `--big-payload` and `--big-transport` change the plan.
 
@@ -784,8 +1027,9 @@ supply, and makes the next update. Three classes:
 
 - **stage**: `fcn_flash stage` of a 9256-byte image, 44 operations: the BEGIN record (a 96-byte
   record program and an 8-byte commit-field program), 3 sector erases, 37 page programs (the last
-  of 40 bytes) and the COMMIT record. The node's own image (244,368 bytes) would make 1018
-  operations, too many to cut each several times.
+  of 40 bytes) and the COMMIT record. The node's own image (252,560 bytes in the final run,
+  `images` in the result) would make 1053 (2 + 62 erases + 987 pages + 2), too many to cut each
+  several times.
 - **download**: the same 44 operations, made by the node's flash task for a tester's download.
   The check routine's validation only reads, so a cut "in the validation" is a cut at the start of
   the COMMIT record's first program.
@@ -853,8 +1097,8 @@ transfer ("not kicked for 501 ms"), and the flasher timed out. Its `--replay` al
 cut, tear and state, passed, next update included. The bench counts such a trial as a failed next
 update (`follow_up_failures`, apart from the invariant violations), keeps it with its message and
 replay, and exits 5: it cannot tell a host that stalled the node from a node that hung, and it
-does not repeat a trial. A final campaign of 200 download trials may therefore end with a few of
-them; `--workers` fewer than 8 loads the host less and takes longer.
+does not repeat a trial. A campaign of 200 download trials can therefore end with a few of them
+(the final one had none); `--workers` fewer than 8 loads the host less and takes longer.
 
 **Trial counts and why they are enough.** The boot operations get the most cuts because each of
 them changes the metadata, and a one-unit program (an attempt, a commit field) has three outcomes,
@@ -870,6 +1114,32 @@ tear model. That model has no weak or unstable bits, no ECC, no erase suspend an
 pre-programming; it tears a program in the order of its units; and its flash is a file
 ([docs/update.md](update.md), the NOR model). The times per trial are host times of parallel
 processes and say nothing about a target.
+
+**Results.** The final run is [results/power_loss.json](../results/power_loss.json), drawn in
+[results/power_loss.png](../results/power_loss.png). Its counts do not depend on the host; only the
+times per trial and the wall time do.
+
+- *Trials.* 1062: 400 of stage, 200 of download and 462 of boot (`summary.trials_per_class`),
+  every one of the 114 cells cut exactly 8, 4 or 33 times (derived from the rows of `trials`).
+  Invariant violations 0, cuts not where drawn 0, failed next updates 0 and bench errors 0
+  (`summary.invariant_violations`, `cuts_not_where_drawn`, `follow_up_failures`,
+  `bench_errors`), and `failures` is empty: every trial passed checks 1 to 7, and every next
+  update confirmed.
+- *What the cuts left.* The state before the operation in 901 trials and the state after it in
+  161 (stage 390 and 10, download 195 and 5, boot 316 and 146); a tear of all the transitions in
+  378, of some in 299, of none in 331, and nothing to change in 54 (`trials`, columns `left` and
+  `tear`; per role in `by_class.<class>.by_role`). Every role of the boot class saw all three
+  tears; with 4 cuts per cell, the two commit-field programs of the download class saw two of
+  the three each.
+- *The first start after the cut* ran the confirmed image in slot A in 618 trials, rolled back
+  to it (ROLLBACK) in 164, ran the trial in slot B in 251 (attempt 1 in 18, 2 in 199, 3 in 34),
+  and ran the confirmed image in slot B in 29 (`trials`, column `boot`).
+- *Locks.* No start found the flash or the cell still locked: `lock_retries` is 0 in all 1062
+  rows of `trials`.
+- *Times* (host, 8 workers in parallel): per trial p50 6.18 s (stage), 26.9 s (download) and
+  6.31 s (boot), at most 6.53, 29.9 and 15.8 s (`summary.seconds_per_trial`); the whole campaign
+  26.0 min (`summary.wall_time`, 1561.8 s), with the load average at 2.67 at its end
+  (`provenance.host.load_average_at_end`).
 
 **Command.** `python bench/power_loss.py`; `--workers`, `--seed`, `--stage-repeats`,
 `--download-repeats` and `--boot-repeats` change the plan; `--replay CLASS:SEQUENCE:OP:SEED` runs
@@ -899,6 +1169,26 @@ predates phase 6 (`percentiles()`, the same percentile rule, no standard deviati
 its raw samples next to the build, not in the JSON. Its figures are those of this host's scheduler
 and timers, which is exactly what they are meant to show; they say nothing about a microcontroller.
 
+**Results.** The final run is [results/platform_timing.json](../results/platform_timing.json),
+drawn in [results/platform_timing.png](../results/platform_timing.png): runs of 10 s, all host
+timing.
+
+- *Tick.* The stock port's tick ran 2.5 % long against CLOCK_MONOTONIC, an effective period of
+  1025 µs, 250 ms behind the clock after the run, and the 10 ms task woke every 10.3 ms on
+  average (`tick.stock`). The locked tick kept 1000 µs (an error of 0.0 %, a drift of −30 µs
+  over the run), with 3 ticks made up and none dropped or given back, no stall of the process
+  seen, and the 10 ms task's wake-ups 10.0 ms apart on average, 8.90 to 11.2 ms (`tick.locked`).
+- *Interrupt latency*, every one of 40,021 raises in each mode: with signal delivery p50 31 µs,
+  p99 136 µs, p99.9 282 µs, at most 773 µs, the line serviced 38,824 times by the signal handler
+  and 1,166 times by the tick hook, the handler depth at most 1 (`interrupt.signal`); with
+  tick-hook polling p50 534 µs, p99 1045 µs, p99.9 1539 µs, at most 2060 µs, about half a
+  millisecond on average (532 µs) because the tick hook serves the line once a tick, in 9,986
+  task wake-ups (`interrupt.poll`). No raise was left unserved.
+- *Storm* (5 s each): with signals 75,976,581 raises, 15.2 million a second, and 1,475,166 task
+  wake-ups; with polling 144,078,216 raises and 5,000 wake-ups, one a tick; none unserved, the
+  handler depth at most 1 with signals and 0 with polling, the stack's peak 6,584 and 6,520
+  bytes of a host thread (`interrupt_storm`).
+
 **Command.** `python bench/platform_timing.py` (4 runs of `--seconds` 10 and 2 storms of 5 s).
 
 ## What the figures do not say
@@ -917,7 +1207,9 @@ and timers, which is exactly what they are meant to show; they say nothing about
   node_timing counts those jobs. Two late ticks taken in the same period put the count two
   ahead, and a task released at the second one to two periods early; node_timing counts those
   apart (`released_more_than_a_tick_early`) and gives the longest stretch with the count ahead
-  of the grid. The platform's long-run tick period (platform_timing) is not affected.
+  of the grid. In the final run it counted one sensor job each in the UDP flood and download
+  conditions and one health job in the UDP download, each less than a tick early, and none over
+  SocketCAN. The platform's long-run tick period (platform_timing) is not affected.
 - **Host stacks are not target stacks** (node_timing), **the recovery sequence is the model's**
   (bus_off), **the 2048-byte block is a projection** (isotp_throughput), and **the power-loss
   counts hold under lib/flash's tear model** (power_loss).
@@ -925,6 +1217,9 @@ and timers, which is exactly what they are meant to show; they say nothing about
   VM; the final runs are made with the laptop otherwise idle.
 - **The wall clock steps under WSL2**, which costs a few frames per run of the observers' timing
   figures, never silently (they are counted).
+- **The VM loses wall time in short freezes** that its own clocks do not see, about 3 to 4 % in
+  the check made before the final runs ([the clocks of a run](#the-clocks-of-a-run)); every
+  figure here is on the VM's clock, and none corrects for them.
 
 ## The final runs
 
@@ -944,3 +1239,19 @@ provenance names a commit and no other work shares the host:
 
 [bench/README.md](../bench/README.md) gives each bench's expected duration, measured in the
 verification's rehearsal and extrapolated to the default.
+
+The final runs followed this procedure. bench/run_all.py ran the seven benches in the order above
+on commit 28d8f7a with a clean tree, from 18:36:09 to 20:51:33 EST on 2026-11-23, and results/
+was committed as 2d93e3e, whose message names 28d8f7a. run_all's own summary, each duration with
+the bench's build and setup: node_timing 12.7 min, bus_load 3.0 min, bus_off 54.1 min,
+isotp_throughput 1.0 min, updates 29.1 min, power_loss 26.1 min and platform_timing 0.9 min,
+every one with exit status 0; before platform_timing it waited 60 s for the load average to
+fall to 1.0 after the power-loss campaign. Windows logged no standby (System log, Kernel-Power events 506 and 507)
+between 18:30 and the end of the run. Every result's provenance names commit 28d8f7a with no
+modified files, every binary it measured carries that commit as its build id, and none is marked
+loaded: the 1-minute load average at the benches' starts was 0.10 to 0.98
+(`provenance.host.load_average_at_start`). No start of the board in the power-loss campaign
+found the flash or the cell still locked by the run before it: `lock_retries`, the count of such
+starts, is 0 in all 1062 rows of [results/power_loss.json](../results/power_loss.json); their
+cause was fixed by
+[bug 012](bug-log.md#012-the-next-start-found-the-files-still-locked-by-the-run-that-had-just-ended).

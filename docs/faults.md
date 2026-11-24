@@ -687,6 +687,16 @@ reply) to the moment the tester read the frame, or saw the process end (a thread
 | the node's log line about a change to the frame that shows it | 0.55 to 1.85 ms (16 changes) | 0 to 25 ms |
 | BMS_Fault period | mean 99.99 ms, longest gap 102.3 ms (85 frames) | mean 100 ± 1 ms, gaps below 125 ms |
 
+The final run of bench/node_timing.py timed the BMS_Fault intervals at its observer over longer
+runs at 500 kbit/s ([results/node_timing.json](../results/node_timing.json),
+`periods.BMS_Fault` of each transport and condition, host timing as above): on an idle bus 1188
+intervals over SocketCAN and 1184 over UDP, every one within 598 µs (SocketCAN) and 542 µs (UDP)
+of 100 ms; under a flood at half the bus the longest was 115 ms over SocketCAN and 101 ms over
+UDP, during downloads 113 ms and 101 ms. The two longest come from the SocketCAN flood and
+download conditions, the only ones in which the host made the node give up ticks (15 in the
+flood run, 16 and 6 in two of the three downloads, `runs[].tick_dropped`); no interval was a
+cycle and a half or longer, and every one was below the test's 125 ms.
+
 The faults of the pack, each applied after its test had passed and then removed (UDP):
 
 | Fault | Command | To active | To no longer active | Evidence needed |
@@ -705,7 +715,12 @@ piece of evidence follows it closely: the times lie near k T for k pieces of evi
 or near one health period where one piece decides. The test's bounds are (k − 1) T and
 k T + 100 ms + 25 ms. A shorted bus (`pytest tests/system/test_faults.py -k shorted -rP`): from
 the first BMS_Fault back on the bus, error passive healed after 989.1 / 989.1 ms and bus off
-after 4987.9 / 4988.1 ms.
+after 4987.9 / 4988.1 ms. bench/bus_off.py times the heal of CAN_BUS_OFF from another start,
+the controller's return to error active, to the node's log line that the DTC is no longer
+active: 4.90 to 5.01 s in its final run, the medians 4.94 to 4.96 s, over 600 trials of a short
+and of 32 destroyed transmissions at 500, 125 and 1000 kbit/s over UDP
+([results/bus_off.json](../results/bus_off.json), `bus_off_dtc_heal_ms`, a mixed figure: the
+health task's 50 cycles and the host's scheduling of it).
 
 The hardware watchdog model alone, with the platform's self-test program:
 
