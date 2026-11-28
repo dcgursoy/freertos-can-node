@@ -555,18 +555,18 @@ minimum of 1024 data bytes:
   exact bit counts, a computed figure). Each block also costs a round trip: the node's flow
   controls, the write job (four page programs: 1.6 ms typical, 12 ms at the part's maximum, on
   the part; on the host each program's wait ends at the next tick, so the job takes longer, as
-  bench/isotp_throughput.py measures: 3.97 ms over SocketCAN and 3.96 ms over UDP on average in
+  bench/isotp_throughput.py measures: 4.01 ms over SocketCAN and 4.03 ms over UDP on average in
   its final run, a host time), the
   response and the tester's next request. Blocks of 2048 bytes would halve the round trips (128
   instead of 256 for a 256 KiB image). Phase 6 does not rebuild the node to try it:
   [bench/isotp_throughput.py](../bench/isotp_throughput.py) measures the blocks of 1 to 1024
   bytes, cuts each into its parts, and projects from them what blocks of 2048 bytes would save
   (a projection, labelled so in [results/isotp_throughput.json](../results/isotp_throughput.json)).
-  The final run's projection saves 0.186 s over SocketCAN and 0.176 s over UDP of the 21.2 s
-  that a 256 KiB image takes in blocks of 1024 bytes, 0.9 % and 0.8 %: a block's time is
-  almost all its events at the budget's rate (the line fitted to the measured sizes: 0.452 ms
-  per block and 0.499 ms per event over SocketCAN, against the budget's 0.5 ms), and a block of
-  2048 bytes has 312 events, two fewer than two blocks of 1024.
+  The final run's projection saves 0.167 s over SocketCAN and 0.169 s over UDP of the 21.2 s
+  that a 256 KiB image takes in blocks of 1024 bytes on the fitted line, 0.8 % on both: a
+  block's time is almost all its events at the budget's rate (the line fitted to the measured
+  sizes: 0.307 ms per block and 0.500 ms per event over SocketCAN, against the budget's 0.5 ms),
+  and a block of 2048 bytes has 312 events, two fewer than two blocks of 1024.
 - **Whole pages.** 1024 bytes are four 256-byte pages, so every block but the last programs whole
   pages and nothing waits in the slot writer's page buffer between blocks.
 
@@ -676,16 +676,21 @@ benches measure it properly: [bench/isotp_throughput.py](../bench/isotp_throughp
 transfer rate by block size from the tester to the node and the node's longest response to the
 tester, [bench/updates.py](../bench/updates.py) 50
 updates end to end and the download of a 256 KiB image (docs/measurements.md). Their final runs
-at 500 kbit/s, host times like the ones above: blocks of 1024 bytes took 82.8 ms in the median
-over SocketCAN and 82.9 ms over UDP (64 blocks each, above the floor of 79 ms), and the node's
-longest response, the 71 bytes of `19 0A`, took 6.41 ms over SocketCAN and 6.43 ms over UDP on
+at 500 kbit/s, host times like the ones above: blocks of 1024 bytes took 83.0 ms in the median
+over SocketCAN and over UDP (64 blocks each, above the floor of 79 ms), and the node's
+longest response, the 71 bytes of `19 0A`, took 6.40 ms over SocketCAN and 6.42 ms over UDP on
 the wire from the request to its last frame, in the median of 500
 ([results/isotp_throughput.json](../results/isotp_throughput.json)). All 50 updates over
 SocketCAN and all 10 over UDP, of an image of 252,560 bytes in 247 blocks, were confirmed, each
-by the tester's routine, in 24.5 s in the median (erase 2.85 and 2.84 s, transfer 20.4 and
-20.5 s at 12,378 and 12,350 bytes/s, wait_for_trial 1.20 s), and all 10 downloads of a 256 KiB
-payload over SocketCAN (257 blocks) were committed, the transfer 21.2 s at 12,375 bytes/s in
-the median ([results/updates.json](../results/updates.json)).
+by the tester's routine, in 23.3 s over SocketCAN and 23.4 s over UDP in the median (erase
+2.84 s and transfer 20.4 s on both, at 12,368 and 12,354 bytes/s, wait_for_trial 0.052 s on
+both), and the node's restart from the ECUReset to the trial's start, by its own log stamps
+(`reset_to_trial`, found in every update: `reset_to_trial_refused` 0), took 4.72 ms over
+SocketCAN and 4.57 ms over UDP in the median and 7.76 ms at most; all 10 downloads of a
+256 KiB payload over SocketCAN (257 blocks) were committed, the transfer 21.2 s at 12,371
+bytes/s in the median ([results/updates.json](../results/updates.json)). That every update and
+download succeeded holds whatever the host did: a stall of the host can fail one (past the
+node's 500 ms watchdog or the 1 s ISO-TP timeout), never make one succeed.
 
 **The bench.** `fcn_tools.node.Board`, started through `tests/conftest.py`'s
 `start_board(*args, flash_file=, retained_file=, can=)`, starts the node through fcn_boot and,

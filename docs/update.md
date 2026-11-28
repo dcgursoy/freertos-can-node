@@ -261,7 +261,7 @@ How the waiting is done:
   waits and takes no processor time, so even the tasks below it run during an erase (on the
   node, whose flash task is the lowest, only the idle task); a program of 0.4 ms ends at the
   first tick after its time, at 1 kHz within about 1 ms. In the final runs, host times: the
-  write job of a 1024-byte block, four programs, took 3.97 ms on average over SocketCAN and 3.96 ms
+  write job of a 1024-byte block, four programs, took 4.01 ms on average over SocketCAN and 4.03 ms
   over UDP ([results/isotp_throughput.json](../results/isotp_throughput.json)), and the erase job
   of a 252,560-byte image, its BEGIN record and 62 sector erases (62 × 45 ms and the record's two
   programs: 2.79 s modelled), 2.84 s in the median of 50 updates over SocketCAN
@@ -1145,7 +1145,7 @@ The flash task reads the metadata once and logs
   its attempt limit, which is safe, while writing again and again into a flash that refused a
   write is not.
 - **The cost.** A confirm is one record: 2 page programs (13 units) and the reads of the log.
-  It took 1,697,327 ns in a run of the release build (and 1,907,570 ns in one of the system tests), most of it the two programs of 0.4 ms, each ended at the next tick by the driver's wait; the flash counted 21 reads of 2,376 bytes in all (`confirm.flash_task.confirm_ns` and `flash` in the statistics). The same record written by the tester's confirm routine took 1.43 to 2.44 ms in 59 of the 60 updates of bench/updates.py's final run at 500 kbit/s, 1.95 ms in the median (`node_trial.confirm_job.last_ns` of each record, the trial run's `jobs.confirm.last_ns`, a host time), and 47.9 ms in one, update 32 over SocketCAN, whose CONFIRM record was the flash's 97th (the factory's ADOPT and three records per update) and so the first of a metadata sector, which it erased first ([results/updates.json](../results/updates.json)).
+  It took 1,697,327 ns in a run of the release build (and 1,907,570 ns in one of the system tests), most of it the two programs of 0.4 ms, each ended at the next tick by the driver's wait; the flash counted 21 reads of 2,376 bytes in all (`confirm.flash_task.confirm_ns` and `flash` in the statistics). The same record written by the tester's confirm routine took 1.79 to 2.61 ms in 59 of the 60 updates of bench/updates.py's final run at 500 kbit/s, 2.00 ms in the median (`node_trial.confirm_job.last_ns` of each record, the trial run's `jobs.confirm.last_ns`, a host time), and 47.4 ms in one, update 32 over SocketCAN, whose CONFIRM record was the flash's 97th (the factory's ADOPT and three records per update) and so the first of a metadata sector, which it erased first ([results/updates.json](../results/updates.json)).
 
 The flash task and its place in the schedule are in
 [architecture.md](architecture.md#tasks): it is the lowest-priority task, so that the waits for
@@ -1331,8 +1331,10 @@ fcn_boot, checked against the same reference, and the next update
 ([docs/measurements.md](measurements.md#power_loss-the-power-loss-campaign)). Its final run
 ([results/power_loss.json](../results/power_loss.json)) passed all 1062 trials, 400 cuts in a
 staging, 200 in a download and 462 in a trial's boot: no invariant violated, every cut where it
-was drawn, every next update made, no failure, and no start that found the flash or the cell
-still locked (`lock_retries` 0 in every row of `trials`,
+was drawn, every next update made, no failure (a stall of the host can fail a trial but never
+make one pass, so the 0 holds whatever the host did), and no start that found the flash or the
+cell still locked (`lock_retries`, a count that depends on the host's timing, 0 in every row of
+`trials`,
 [bug 012](bug-log.md#012-the-next-start-found-the-files-still-locked-by-the-run-that-had-just-ended)).
 A cut of a one-unit program (a commit field, an attempt)
 leaves none, some or all of its transitions done, as the seed says; the seeds of those cuts are

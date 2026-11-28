@@ -319,9 +319,11 @@ the controller bus off after 24 destroyed attempts and the injected errors after
 trial; and error passive to bus off under a short, the model's figure only in a trial that no
 host time entered (no late pass counted, a whole number of bit times;
 [docs/measurements.md](measurements.md#bus_off-the-way-into-bus-off-and-the-recovery)), was 416
-bit times in each of the 296 such trials. The other four had a late pass of the hardware thread
-counted (`late_resyncs`): two took 416 bit times all the same, two 545 and 606, which are not the
-model's. The hold-off, the node's policy on its tick, was 100 to 101 ms in the trials,
+bit times in each of the 291 such trials (96, 100 and 95 at 500, 125 and 1000 kbit/s). The
+other nine had a late pass of the hardware thread counted (`late_resyncs` 1, in one of them 2):
+six took 416 bit times all the same (four at 500 kbit/s, two at 1000 kbit/s), three at
+1000 kbit/s 542, 569 and 571, which are not the model's. The hold-off, the node's policy on its
+tick, was 100 to 101 ms in the trials,
 and under the persisting short it went 100, 200, 400, 800, 1600, 1600 and 1600 ms, each at
-most 1.03 ms above. The host's part from the bus off to the driver's log line had medians of
-0.049 to 0.062 ms per bit rate and fault, and a longest of 0.410 ms.
+most 0.919 ms above. The host's part from the bus off to the driver's log line had medians of
+0.045 to 0.075 ms per bit rate and fault, and a longest of 0.523 ms.

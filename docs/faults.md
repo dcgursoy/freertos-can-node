@@ -690,12 +690,10 @@ reply) to the moment the tester read the frame, or saw the process end (a thread
 The final run of bench/node_timing.py timed the BMS_Fault intervals at its observer over longer
 runs at 500 kbit/s ([results/node_timing.json](../results/node_timing.json),
 `periods.BMS_Fault` of each transport and condition, host timing as above): on an idle bus 1188
-intervals over SocketCAN and 1184 over UDP, every one within 598 µs (SocketCAN) and 542 µs (UDP)
-of 100 ms; under a flood at half the bus the longest was 115 ms over SocketCAN and 101 ms over
-UDP, during downloads 113 ms and 101 ms. The two longest come from the SocketCAN flood and
-download conditions, the only ones in which the host made the node give up ticks (15 in the
-flood run, 16 and 6 in two of the three downloads, `runs[].tick_dropped`); no interval was a
-cycle and a half or longer, and every one was below the test's 125 ms.
+intervals over each transport, every one within 478 µs (SocketCAN) and 676 µs (UDP) of 100 ms; under a flood at half the bus every one within 833 µs over SocketCAN and 803 µs over
+UDP, during downloads within 805 µs and 767 µs. The host made the node give up no tick in any
+of its runs (`tick_dropped` 0 in every one); no interval was a cycle and a half or longer, and
+every one was below the test's 125 ms.
 
 The faults of the pack, each applied after its test had passed and then removed (UDP):
 
@@ -717,7 +715,7 @@ k T + 100 ms + 25 ms. A shorted bus (`pytest tests/system/test_faults.py -k shor
 the first BMS_Fault back on the bus, error passive healed after 989.1 / 989.1 ms and bus off
 after 4987.9 / 4988.1 ms. bench/bus_off.py times the heal of CAN_BUS_OFF from another start,
 the controller's return to error active, to the node's log line that the DTC is no longer
-active: 4.90 to 5.01 s in its final run, the medians 4.94 to 4.96 s, over 600 trials of a short
+active: 4.90 to 5.00 s in its final run, the medians 4.95 to 4.96 s, over 600 trials of a short
 and of 32 destroyed transmissions at 500, 125 and 1000 kbit/s over UDP
 ([results/bus_off.json](../results/bus_off.json), `bus_off_dtc_heal_ms`, a mixed figure: the
 health task's 50 cycles and the host's scheduling of it).

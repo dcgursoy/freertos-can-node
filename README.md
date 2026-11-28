@@ -51,7 +51,9 @@ simulated around it, so that all of it builds, runs and is tested on a laptop an
   the host's scheduler. Tick jitter, dropped ticks, wake-up times and interrupt latency in
   any result of this project are those of the host (WSL2 on the development laptop, a shared
   runner in CI) and say nothing about the same code on a microcontroller. What does carry
-  over is everything counted rather than timed: orderings, state machines, protocol content.
+  over is what the host's timing does not decide: orderings, state machines, protocol content;
+  the counts of a stretch of time (jobs per run, ticks dropped, jobs released early) are the
+  host's.
 - **Tests.** Unity unit tests for the portable code in [lib/](lib), platform self-tests that
   run small FreeRTOS programs ([tests/platform](tests/platform)), and pytest system tests that
   start the node and watch it from outside ([tests/system](tests/system)).
@@ -354,10 +356,12 @@ of which writes `results/<name>.json` (the data, with the command, the commit, t
 average and the build id of every binary it ran) and `results/<name>.png`.
 [docs/measurements.md](docs/measurements.md) says for each one what it measures, exactly how,
 under which conditions, why its trial counts are enough, and what its figures do and do not say
-about a microcontroller. The final runs were made on commit 28d8f7a, a clean tree, one bench
-after the other with `python bench/run_all.py` on 2026-11-23; the table at the end of this
-section quotes their headline figures. Every result says which of its figures are host timing of
-the FreeRTOS POSIX port and which do not depend on the host.
+about a microcontroller. The final runs were made on commit 529f1de, a clean tree, one bench
+after the other with `python bench/run_all.py` (its `--only` and `--from` options) on
+2026-11-28, on AC power ([docs/measurements.md](docs/measurements.md#the-final-runs) has the
+record); the table at the end of this section quotes their headline figures. Every result says
+which of its figures are host timing of the FreeRTOS POSIX port and which do not depend on the
+host.
 
 - **node_timing** ([bench/node_timing.py](bench/node_timing.py)). The release jitter of the
   periodic tasks against their tick's due time, the latency from a sample to the frame that
@@ -375,7 +379,8 @@ the FreeRTOS POSIX port and which do not depend on the host.
   controller's count.
 - **bus_off** ([bench/bus_off.py](bench/bus_off.py)). The way into bus off, counter by counter,
   and the recovery against ISO 11898-1's 1408 bit times, at three bit rates, with every interval
-  labelled as the standard's, the model's, the node's recovery policy's or the host's; a host-only
+  labelled as the standard's, the model's, the node's recovery policy's, the host's, or mixed (a
+  sum of them, among them the node's schedule: which frames it sends when); a host-only
   trace of the controller model gives the model's time and the host's of every step.
 - **isotp_throughput** ([bench/isotp_throughput.py](bench/isotp_throughput.py)). The TransferData
   rate for blocks of 1 to 1024 bytes, each block cut into the turns of both sides on one clock
@@ -419,42 +424,51 @@ p50 / p99 / max.
 
 | Measurement | Result | Kind | Source |
 |---|---|---|---|
-| Power cuts on the real programs, each followed by the restart through fcn_boot and the next update | 1062 trials (400 in a staging, 200 in a download, 462 in a trial's boot): 0 invariant violations, 0 cuts not where drawn, 0 failed next updates, 0 bench errors; `lock_retries` 0 in every trial (no start found the flash or the cell still locked) | count | [results/power_loss.json](results/power_loss.json) |
-| Updates over the bus end to end with the flasher, image of 252,560 bytes | 50 of 50 succeeded over SocketCAN, 10 of 10 over UDP; total p50 24.5 s on both | count; times host | [results/updates.json](results/updates.json) |
-| Download of an image whose payload is 256 KiB (262,144 bytes), SocketCAN, up to the check | 10 of 10 succeeded; total p50 24.2 s: erase 2.98 s, transfer 21.2 s, check 4 ms | count; times host | [results/updates.json](results/updates.json) |
-| ISO-TP/UDS TransferData, 1024-byte blocks | 12,378 bytes/s over SocketCAN, 12,358 bytes/s over UDP; block period p50 82.8 ms and 82.9 ms, against a floor of 79.0 ms from the node's budget of 2 events of the diagnostic task per 1 ms tick | host; floor policy | [results/isotp_throughput.json](results/isotp_throughput.json) |
-| Bus-off recovery sequence at 125 / 500 / 1000 kbit/s (UDP bus, idle) | 1408 bit times (11.3 ms at 125 kbit/s, 2.82 ms at 500 kbit/s, 1.41 ms at 1000 kbit/s) in all 200 recoveries per rate, ISO 11898-1's minimum, by construction of the model on an idle bus | model | [results/bus_off.json](results/bus_off.json) |
+| Power cuts on the real programs, each followed by the restart through fcn_boot and the next update | 1062 trials (400 in a staging, 200 in a download, 462 in a trial's boot): 0 invariant violations, 0 cuts not where drawn, 0 failed next updates, 0 bench errors; `lock_retries` 0 in every trial (no start found the flash or the cell still locked) | count (a host stall can only add a failure); `lock_retries` host | [results/power_loss.json](results/power_loss.json) |
+| Updates over the bus end to end with the flasher, image of 252,560 bytes | 50 of 50 succeeded over SocketCAN, 10 of 10 over UDP; total p50 23.3 s over SocketCAN and 23.4 s over UDP; in it, the tester's poll for the trial after the reset (`wait_for_trial`) p50 0.052 s on both; the node's own restart, from its reset to the trial's start by its log stamps (`reset_to_trial`), p50 4.72 ms and 4.57 ms | count (a host stall can only fail an update); times host | [results/updates.json](results/updates.json) |
+| Download of an image whose payload is 256 KiB (262,144 bytes), SocketCAN, up to the check | 10 of 10 succeeded; total p50 24.2 s: erase 2.98 s, transfer 21.2 s, check 3 ms | count (a host stall can only fail a download); times host | [results/updates.json](results/updates.json) |
+| ISO-TP/UDS TransferData, 1024-byte blocks | 12,322 bytes/s over SocketCAN, 12,339 bytes/s over UDP; block period p50 83.0 ms on both, against a floor of 79.0 ms from the node's budget of 2 events of the diagnostic task per 1 ms tick | host; floor policy | [results/isotp_throughput.json](results/isotp_throughput.json) |
+| Bus-off recovery sequence at 125 / 500 / 1000 kbit/s (UDP bus, idle) | 1408 bit times (11.264 ms at 125 kbit/s, 2.816 ms at 500 kbit/s, 1.408 ms at 1000 kbit/s) in all 200 recoveries per rate, ISO 11898-1's minimum, by construction of the model on an idle bus | model | [results/bus_off.json](results/bus_off.json) |
 | Hold-off before the node asks for recovery (policy: 100 ms, doubled at each further bus off up to 1600 ms, back to 100 ms after 5 s out of bus off) | 100 to 101 ms in all 600 trials (3 rates, a short and transmit errors, 100 each); a short that persists for 7 bus offs at 500 kbit/s: 101, 201, 401, 801 ms, then 1600 ms three times | policy | [results/bus_off.json](results/bus_off.json) |
 | Bus load at 500 kbit/s, intermission included | idle 7.7 % (the DBC's nominal load 7.6 % typical, 8.8 % worst case); during a download 47.7 %, the tester's frames 37.2 % and the node's 10.5 %; the same on both transports to one decimal | mixed: frame lengths are protocol data, frame rates the host's | [results/bus_load.json](results/bus_load.json) |
-| Sensor task (10 ms) start lateness against its tick's due time, SocketCAN | idle 48 / 210 / 570 µs; flood 36 / 234 / 1204 µs; download 37 / 230 / 2164 µs | host | [results/node_timing.json](results/node_timing.json) |
-| The same, UDP | idle 50 / 199 / 1856 µs; flood 36 / 228 / 3521 µs; download 38 / 233 / 1316 µs | host | [results/node_timing.json](results/node_timing.json) |
-| BMS_PackStatus, from the release of the sensor job that took the sample to the frame's end, SocketCAN | idle 362 / 554 / 911 µs; flood 338 / 636 / 2356 µs; download 360 / 638 / 2054 µs | host | [results/node_timing.json](results/node_timing.json) |
-| The same, UDP | idle 370 / 557 / 1482 µs; flood 344 / 665 / 2432 µs; download 366 / 675 / 1130 µs | host | [results/node_timing.json](results/node_timing.json) |
-| Idle task's share of the CPU (FreeRTOS run-time statistics) | SocketCAN: idle 97.1 %, flood 92.7 %, download 90.1 %; UDP: 97.0 %, 92.0 %, 90.0 % | host | [results/node_timing.json](results/node_timing.json) |
-| Tick period against CLOCK_MONOTONIC, 1000 µs nominal, runs of 10 s | stock POSIX port: 1025 µs, 2.5 % long, 250 ms behind the clock after 10 s; locked tick (posix_tick.c): 1000 µs, 0.0 %, 30 µs ahead after 10 s | host | [results/platform_timing.json](results/platform_timing.json) |
-| Simulated interrupt, from the raise to the task it wakes, one raise every 250 µs | signal delivery 31 / 136 / 773 µs; tick-hook polling 534 / 1045 / 2060 µs; 40,021 raises each | host | [results/platform_timing.json](results/platform_timing.json) |
+| Sensor task (10 ms) start lateness against its tick's due time, SocketCAN | idle 54 / 230 / 979 µs; flood 40 / 266 / 997 µs; download 47 / 200 / 1618 µs | host | [results/node_timing.json](results/node_timing.json) |
+| The same, UDP | idle 56 / 194 / 738 µs; flood 45 / 245 / 4188 µs; download 51 / 211 / 2227 µs | host | [results/node_timing.json](results/node_timing.json) |
+| BMS_PackStatus, from the release of the sensor job that took the sample to the frame's end, SocketCAN | idle 367 / 580 / 1352 µs; flood 334 / 610 / 983 µs; download 366 / 630 / 7533 µs | host | [results/node_timing.json](results/node_timing.json) |
+| The same, UDP | idle 369 / 567 / 1210 µs; flood 346 / 664 / 2542 µs; download 366 / 631 / 1066 µs | host | [results/node_timing.json](results/node_timing.json) |
+| Idle task's share of the CPU (FreeRTOS run-time statistics) | SocketCAN: idle 97.1 %, flood 93.0 %, download 89.6 %; UDP: 96.9 %, 91.5 %, 89.4 % | host | [results/node_timing.json](results/node_timing.json) |
+| Tick period against CLOCK_MONOTONIC, 1000 µs nominal, runs of 10 s | stock POSIX port: 1074 µs, 7.4 % long, 742 ms behind the clock after 10 s; locked tick (posix_tick.c): 1000 µs, 0.0 %, 40 µs ahead after 10 s | host | [results/platform_timing.json](results/platform_timing.json) |
+| Simulated interrupt, from the raise to the task it wakes, one raise every 250 µs | signal delivery 28 / 118 / 418 µs (40,021 raises); tick-hook polling 542 / 1048 / 2125 µs (40,024 raises) | host | [results/platform_timing.json](results/platform_timing.json) |
 
 Every figure marked host is the timing of the FreeRTOS POSIX port (for the updates and the
 transfer, with a tester in Python) under WSL2's scheduler on the development laptop and is not
 a microcontroller's timing. The update times, though, are set for the most part by the node's
 budget of 2 events of the diagnostic task per 1 ms tick, which a target with the same tick keeps,
-and by the flash model's 45 ms per sector erase; the host adds its scheduling and the tester's
-turnaround to them. The counts, the protocol data and the model's figures do not depend on the
-host. The stock port's tick runs 2.5 % long, which the locked tick the node runs on corrects,
-and polling has a latency of about half a millisecond because the tick hook serves it, once per
-1 ms tick. Over UDP the flood and the download runs each released one sensor job before its tick
-was due (763 µs and 776 µs early, none more than a tick), and those jobs stay in the
-distributions; the maxima of the start lateness and the BMS_PackStatus latency are 1.13 to
-3.52 ms under flood and download (and up to 1.86 ms on the idle UDP bus), against a p99 of at
-most 675 µs in every condition. Over SocketCAN the host made the node give up ticks in the flood
-run (15) and in two of the three download runs (16 and 6); the lateness is measured from the
-tick grid as posix_tick.c shifts it after a drop, so the drops show in the periods instead:
-BMS_Heartbeat (10 ms) had one interval 15.3 ms too long in that flood run and none more than
-10.3 ms too long in the downloads ([docs/measurements.md](docs/measurements.md)). The health
-task's own use of its host stack reaches 4648 bytes (SocketCAN download, UDP flood), more than
-the 4096 bytes it was created with, and the idle task's is 2072 bytes against its 2048 in every
-condition, because host threads have x86-64 frames; that is no overflow of the target's stacks,
-which phase 7 measures.
+by the flash model's 45 ms per sector erase and, after the reset, by the tester's poll for the
+trial (its first request 50 ms after the reset's answer); the host adds its scheduling and the
+tester's turnaround to them. The protocol data (frame contents and lengths, an image's bytes and
+blocks) and the model's bit times and figures do not depend on the host. Whether an update or a
+power-cut trial succeeds can, in one direction only: a stall past the node's 500 ms watchdog or
+the 1 s ISO-TP timeout fails it, and nothing the host does makes one pass, so the 0 failures and
+the 50 of 50 and 10 of 10 successes stand. The ticks dropped, the jobs released early and
+`lock_retries` are counts of the host's timing. The stock port's tick ran 7.4 % long in the final
+run, which the locked tick the node runs on corrects, and polling has a latency of about half a
+millisecond because the tick hook serves it, once per 1 ms tick. Under flood and download the
+node released sensor jobs before their tick was due (over SocketCAN 1 in the flood run and 3 in
+the download runs, over UDP 2 and 3; at most 915 µs early) and one health job (UDP download,
+746 µs early), none more than a tick and none on an idle bus, and those jobs stay in the
+distributions. The maxima of the start lateness and the BMS_PackStatus latency are 0.738 to
+1.35 ms on an idle bus and 0.983 to 7.53 ms under flood and download, against a p99 of at most
+664 µs in every condition. No node_timing run dropped a tick (`tick_dropped` 0 in every run on both
+transports), so no job was measured on a tick grid that posix_tick.c had moved after a drop
+(`release.<task>.after_drop` is empty), and the largest maxima, 7.53 ms of BMS_PackStatus in
+the SocketCAN downloads and 4.19 ms of start lateness in the UDP flood, came without a drop. In the
+periods, BMS_Heartbeat (10 ms) had one interval 9.74 ms too long in the SocketCAN downloads and
+none more than 4.25 ms too long in any other condition (UDP flood)
+([docs/measurements.md](docs/measurements.md)). The health task's own use of its host stack
+reaches 4712 bytes (SocketCAN flood, UDP flood), more than the 4096 bytes it was created with,
+and 4648 bytes in the SocketCAN downloads and on the idle UDP bus; the idle task's is 2072 bytes
+against its 2048 in every condition, because host threads have x86-64 frames; that is no
+overflow of the target's stacks, which phase 7 measures.
 
 ## Build and test
 

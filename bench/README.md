@@ -197,16 +197,37 @@ back to 1.0 between benches: about 5 minutes after power_loss, whose 8 workers l
 about 5, and little after the others. --quick runs took 4.5 s (isotp_throughput) to 33 s
 (node_timing) each. The medium power_loss run ended with exit status 5: one trial's next update
 was reset by the node's watchdog under the campaign's own load, and its replay passed
-(docs/measurements.md, power_loss).
+(docs/measurements.md, power_loss). The rehearsal's updates and its power_loss download trials,
+whose next update is one over the bus, ran the flasher of then, whose wait for the trial took
+1.20 s every time (its first request went at once after the reset's answer, waited out
+P2client, 1 s, and the next came 0.2 s later); the flasher's poll since commit 529f1de took
+0.052 s in the median of the final runs (results/updates.json, `wait_for_trial`). The table's
+figures for an update and for a download trial are the rehearsal's and include that 1.20 s (a
+download of 256 KiB has no reset and no wait).
 
-The final run, `python bench/run_all.py` on commit 28d8f7a (a clean tree) from 18:36:09 to
-20:51:33 EST on 2026-11-23, 2 hours 15 minutes in all, took by run_all's own summary (each
-bench's time includes its build and setup): node_timing 12.7 minutes, bus_load 3.0, bus_off
-54.1, isotp_throughput 1.0, updates 29.1, power_loss 26.1 and platform_timing 0.9, each with
-exit status 0; before platform_timing it waited 60 s for the load average to fall to 1.0 after
-power_loss. Windows logged no standby from 18:30 to the end of the run. The results are
-committed as 2d93e3e; results/power_loss.json holds no failure (`failures` is empty, 1062
-trials).
+The final runs: `python bench/run_all.py` with `--only` or `--from` on commit 529f1de (a clean
+tree) on 2026-11-28 EST, on AC power the whole time, in three parts: node_timing and bus_load
+from 05:54:20 to 06:11:14, bus_off from 07:12:17 to 08:06:46, and isotp_throughput, updates,
+power_loss and platform_timing from 08:09:00 to 09:06:06. They took node_timing 12.8 minutes,
+bus_load 3.1, bus_off 54.3, isotp_throughput 1.1, updates 28.1, power_loss 25.6 and
+platform_timing 1.1, each with exit status 0; before platform_timing the run waited 60 s for the
+load average to fall below 1.0 after power_loss. A first bus_off run that morning (06:11:14 to
+07:05:43, exit status 0) overlapped a Modern Standby of about one second (06:32:56 to 06:32:57,
+Windows' Kernel-Power events 506 and 507, reason Lid) and was not used, as no result may come
+from a window that overlaps a standby; bus_off was run again after a restart of WSL and a clock
+check. Windows logged no standby inside the windows used. Every result's provenance names
+529f1de with no modified files, and every binary, platform_timing's self-test too, carries it as
+its build id. The results are committed as 8daa82c; results/power_loss.json holds no failure
+(`failures` is empty, 1062 trials).
+
+Two earlier runs are kept in git as records only. The first final run, on commit 28d8f7a from
+18:36:09 to 20:51:33 EST on 2026-11-23 (results 2d93e3e), is superseded: the review of phase 6
+then fixed labels, the flasher's poll for the trial and the provenance (529f1de). All seven
+benches were run with run_all on 529f1de from 09:58:01 to 12:14:30 EST on 2026-11-24, each with
+exit status 0 (results 97ec30d); that run started on battery power, on AC from 10:57:13, and
+its host times came out 2 to 4 times longer than those of the final runs on the same commit,
+also in its part on AC. The cause was not found (not the battery alone), so all seven were run
+again.
 
 ## The final runs
 
